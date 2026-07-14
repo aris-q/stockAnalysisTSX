@@ -1,0 +1,175 @@
+<script>
+  {%- raw %}
+// ── MACRO TAB ─────────────────────────────────────────────────────────────────
+let macroLoaded = false;
+
+async function updateMacroStatusBadge() {
+  try {
+    const data = await fetch('/macro').then(r => r.json());
+    const el = document.getElementById('macroStatusBadge');
+    if (!el) return;
+    const ft = data.fetchedAt;
+    if (ft) {
+      el.textContent = '📊 MACRO: ' + ft.slice(0, 16);
+      el.style.borderColor = 'rgba(74,222,128,0.4)';
+      el.style.color = 'var(--up)';
+    } else {
+      el.textContent = '📊 MACRO: never fetched';
+      el.style.borderColor = 'var(--border)';
+      el.style.color = 'var(--muted)';
+    }
+  } catch(e) {}
+}
+
+async function loadMacro(forceRefresh) {
+  const el = document.getElementById('macroContent');
+  if (!el) return;
+  if (macroLoaded && !forceRefresh) return;
+  try {
+    const res = await fetch('/macro');
+    const data = await res.json();
+    console.log('[Macro] loaded | fetchedAt:' + (data.fetchedAt || 'none'));
+    el.innerHTML = renderMacro(data);
+    macroLoaded = true;
+  } catch(e) {
+    console.error('[Macro] load FAIL:', e);
+    el.innerHTML = '<span style="color:var(--down)">Failed to load macro data.</span>';
+  }
+}
+
+async function refreshMacro(btn) {
+  const orig = btn.textContent;
+  btn.textContent = '⏳ Fetching...';
+  btn.disabled = true;
+  console.log('[Macro] refresh triggered');
+  try {
+    await fetch('/macro/refresh', {method:'POST'});
+    // Poll until done
+    const poll = setInterval(async () => {
+      const s = await fetch('/status');
+      const sd = await s.json();
+      if (!sd.running) {
+        clearInterval(poll);
+        btn.textContent = orig;
+        btn.disabled = false;
+        macroLoaded = false;
+        await loadMacro(true);
+        console.log('[Macro] refresh complete');
+      }
+    }, 1500);
+  } catch(e) {
+    console.error('[Macro] refresh FAIL:', e);
+    btn.textContent = orig;
+    btn.disabled = false;
+  }
+}
+
+async function runMacroAI(btn) {
+  const orig = btn.textContent;
+  btn.textContent = '⏳ Running AI...';
+  btn.disabled = true;
+  const el = document.getElementById('macroAiResult');
+  if (el) el.innerHTML = '<span style="color:var(--muted);font-size:12px">Generating analysis (may take 30-60s)...</span>';
+  console.log('[Macro] AI summary triggered');
+  try {
+    const res = await fetch('/macro/ai', {method:'POST'});
+    const data = await res.json();
+    if (data.error) {
+      if (el) el.innerHTML = '<span style="color:var(--down)">' + data.error + '</span>';
+    } else {
+      macroLoaded = false;
+      await loadMacro(true);
+      console.log('[Macro] AI summary done | ' + data.generatedAt);
+    }
+  } catch(e) {
+    console.error('[Macro] AI FAIL:', e);
+    if (el) el.innerHTML = '<span style="color:var(--down)">AI request failed.</span>';
+  }
+  btn.textContent = orig;
+  btn.disabled = false;
+}
+
+function showMacroAI() {
+  const el = document.getElementById('macroAiResult');
+  const btn = document.getElementById('macroViewAiBtn');
+  if (!el) return;
+  const hidden = el.style.display === 'none';
+  el.style.display = hidden ? 'block' : 'none';
+  if (btn) btn.textContent = hidden ? '▲ Hide AI Summary' : '📋 View Last AI Summary';
+}
+
+function renderMacro(data) {
+  const ind = data.indicators || {};
+  const headlines = data.headlines || [];
+  const fetchedAt = data.fetchedAt || null;
+  const aiSummary = data.aiSummary || null;
+  const aiAt = data.aiSummaryAt || null;
+
+  // Indicator color logic
+  function indColor(key, val, change) {
+    if (val === null || val === undefined) return 'macro-neutral';
+    // Higher = bad for markets: rates, inflation, unemployment, VIX
+    const higherIsBad = ['fed_rate','cpi','unemployment','vix','two_yr_yield'];
+    // Higher = good: GDP, SP500, dollar
+    const higherIsGood = ['gdp_growth','sp500','dollar_index'];
+    // Yield curve: positive = normal, negative = inverted (bad)
+    if (key === 'yield_curve') return val >= 0 ? 'macro-up' : 'macro-down';
+    if (key === 'oil_wti') return 'macro-neutral';
+    if (!change) return 'macro-neutral';
+    if (higherIsBad.includes(key)) return change > 0 ? 'macro-down' : 'macro-up';
+    if (higherIsGood.includes(key)) return change > 0 ? 'macro-up' : 'macro-down';
+    return 'macro-neutral';
+  }
+
+  // Build indicator cards
+  const CARD_ORDER = ['fed_rate','cpi','unemployment','gdp_growth','ten_yr_yield','two_yr_yield','yield_curve','vix','dollar_index','oil_wti','sp500'];
+  let cards = '';
+  for (const key of CARD_ORDER) {
+    const v = ind[key];
+    if (!v) continue;
+    const val = v.value !== null && v.value !== undefined ? v.value : '—';
+    const unit = v.unit || '';
+    const chg = v.change !== null && v.change !== undefined ? v.change : null;
+    const colorClass = indColor(key, v.value, chg);
+    const prefix = unit === '$' ? '$' : '';
+    const suffix = unit === '$' ? '' : unit;
+    const chgStr = chg !== null ? (chg >= 0 ? '+' : '') + chg + suffix : '';
+    const chgColor = colorClass === 'macro-up' ? 'var(--up)' : colorClass === 'macro-down' ? 'var(--down)' : 'var(--muted)';
+    const border = colorClass === 'macro-up' ? 'rgba(74,222,128,0.3)' : colorClass === 'macro-down' ? 'rgba(248,113,113,0.3)' : 'var(--border)';
+    cards += '<div class="macro-card" style="border-color:' + border + '">'
+      + '<div class="macro-card-label">' + v.label + '</div>'
+      + '<div class="macro-card-value ' + colorClass + '">' + prefix + val + suffix + '</div>'
+      + (chgStr ? '<div class="macro-card-change" style="color:' + chgColor + '">' + chgStr + ' change</div>' : '')
+      + (v.date ? '<div class="macro-card-date">' + v.date + '</div>' : '')
+      + '</div>';
+  }
+
+  // Headlines
+  let newsHtml = '';
+  if (headlines.length) {
+    newsHtml = headlines.map(function(h) {
+      const title = h.url ? '<a href="' + h.url + '" target="_blank">' + h.title + '</a>' : h.title;
+      const d = h.publishedAt ? h.publishedAt.substring(0,10) : '';
+      return '<div class="macro-headline">' + title + '<div class="macro-headline-meta">' + (h.source||'') + (d ? ' · ' + d : '') + '</div></div>';
+    }).join('');
+  } else {
+    newsHtml = '<span style="font-size:12px;color:var(--muted)">No headlines available. Add NEWSAPI_KEY to config.py to enable.</span>';
+  }
+
+  const tsLabel = fetchedAt ? '🕐 ' + fetchedAt : 'Never fetched';
+
+  return '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:20px">'
+    + '<button onclick="refreshMacro(this)" style="font-size:12px;padding:6px 18px;background:var(--warn);color:#0a0a0f;border:none;border-radius:5px;font-weight:700;cursor:pointer">⚡ Refresh Macro</button>'
+    + '<span style="font-size:11px;color:var(--muted)">' + tsLabel + '</span>'
+    + '</div>'
+
+    + '<div class="macro-section-title">MACRO INDICATORS</div>'
+    + '<div class="macro-grid">' + (cards || '<span style="color:var(--muted);font-size:12px">No data. Run a refresh.</span>') + '</div>'
+
+    + '<div class="macro-section-title">MARKET HEADLINES</div>'
+    + '<div style="margin-bottom:24px">' + newsHtml + '</div>';
+}
+
+
+  {%- endraw %}
+</script>

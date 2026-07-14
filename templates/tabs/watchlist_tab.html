@@ -1,0 +1,1032 @@
+<script>
+  {%- raw %}
+
+// ── LOG PANEL ─────────────────────────────────────────────────────────────────
+function toggleLogPanel() {
+  const panel = document.getElementById('logPanel');
+  if (!panel) return;
+  const opening = !panel.classList.contains('open');
+  panel.classList.toggle('open');
+  if (opening) loadLog();
+  console.log('[Log] panel ' + (opening ? 'opened' : 'closed'));
+}
+
+async function loadLog() {
+  const body = document.getElementById('logBody');
+  const countEl = document.getElementById('logLineCount');
+  if (!body) return;
+  try {
+    const res = await fetch('/logs');
+    const data = await res.json();
+    if (countEl) countEl.textContent = data.total + ' total lines';
+    if (!data.lines || !data.lines.length) {
+      body.innerHTML = '<span style="color:var(--muted)">No log entries yet.</span>';
+      return;
+    }
+    body.innerHTML = data.lines.map(function(line) {
+      const cls = line.includes('[ERROR]') ? 'log-line-error'
+                : line.includes('[WARNING]') ? 'log-line-warn'
+                : (line.includes('OK') || line.includes('complete') || line.includes('Complete')) ? 'log-line-ok'
+                : 'log-line-info';
+      return '<span class="' + cls + '">' + line.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</span>';
+    }).join('\n');
+    body.scrollTop = body.scrollHeight;
+    console.log('[Log] loaded ' + data.lines.length + ' lines');
+  } catch(e) {
+    console.error('[Log] load FAIL:', e);
+    body.innerHTML = '<span style="color:var(--down)">Failed to load log.</span>';
+  }
+}
+
+async function clearLog(btn) {
+  if (!confirm('Clear all log entries?')) return;
+  const orig = btn.textContent;
+  btn.textContent = '...';
+  btn.disabled = true;
+  try {
+    await fetch('/logs/clear', {method: 'POST'});
+    console.log('[Log] cleared');
+    await loadLog();
+  } catch(e) {
+    console.error('[Log] clear FAIL:', e);
+  }
+  btn.textContent = orig;
+  btn.disabled = false;
+}
+
+function backToWatchlist() {
+  const tab = document.querySelector('.tab[data-tab="watchlist"]');
+  showTab('watchlist', tab);
+}
+
+
+// ── TICKER DETAIL TAB RENDERER ────────────────────────────────────────────────
+function renderTickerDetail(s) {
+  const qIncome = (s.quarterlyIncome || []).slice(0, 5);
+  const aIncome = s.annualIncome || [];
+  const aCashflow = s.annualCashflow || [];
+  const cal = s.calendar || {};
+  const ev = s.events || {};
+  const qc = s.quarterlyChanges || {};
+  const ac = s.annualChanges || {};
+  const latest = qIncome[0] || {};
+  const annual = aIncome[0] || {};
+  const cashflow = aCashflow[0] || {};
+  const priceFetchedAt = s.priceFetchedAt || s.fetchedAt || '—';
+  const fetchedAt = s.fetchedAt || '—';
+
+  // Reuse the full stock card HTML from the original renderWatchlist card structure
+  // but with all sections expanded by default (add .expanded to card-section)
+  const qCashflow = (s.quarterlyCashflow || []).slice(0, 5);
+
+  let html = `
+  <div class="stock-card" style="max-width:100%">
+    <div class="card-header">
+      <div>
+        <div class="ticker-name">${s.ticker}</div>
+        <div class="ticker-meta">${s.industry || s.sector || '—'}</div>
+        ${priceFetchedAt ? `<div class="ticker-meta" style="margin-top:4px;color:var(--muted)">💰 Price updated: ${priceFetchedAt}</div>` : ''}
+        ${fetchedAt ? `<div class="ticker-meta" style="margin-top:2px;color:var(--muted)">📊 Data updated: ${fetchedAt}</div>` : ''}
+      </div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px">
+        <div class="price-block">
+          <div class="price">$${s.price != null ? s.price.toFixed(2) : '—'}</div>
+          ${s.previousClose != null ? `<div class="mktcap">Prev: $${s.previousClose.toFixed(2)}</div>` : ''}
+          <div class="mktcap">MCap: $${fmt(s.marketCap)}</div>
+        </div>
+      </div>
+    </div>`;
+
+  // Ranks row
+  const rankBadges = [];
+  if (s.marginRank) rankBadges.push(`<span class="rank-badge rank-${s.marginRank}">MARGIN #${s.marginRank}</span>`);
+  if (s.netCashRank) rankBadges.push(`<span class="rank-badge rank-${s.netCashRank}">NET CASH #${s.netCashRank}</span>`);
+  if (s.marketCapRank) rankBadges.push(`<span class="rank-badge rank-${s.marketCapRank}">MKTCAP #${s.marketCapRank}</span>`);
+  if (s.fcfRank) rankBadges.push(`<span class="rank-badge rank-${s.fcfRank}">FCF #${s.fcfRank}</span>`);
+  if (rankBadges.length) html += `<div class="ranks-row">${rankBadges.join('')}</div>`;
+
+  // TECHNICAL SIGNALS section
+  {
+    const rsi = s.rsi14;
+    const bb = s.bbPercent;
+    const rsiColor = rsi > 70 ? 'var(--down)' : rsi < 30 ? 'var(--up)' : 'var(--text)';
+    const bbColor = bb > 1 ? 'var(--down)' : bb < 0 ? 'var(--up)' : 'var(--text)';
+    const rsiLabel = rsi == null ? '—' : rsi < 30 ? 'Oversold' : rsi > 70 ? 'Overbought' : rsi < 45 ? 'Mildly Oversold' : rsi > 55 ? 'Mildly Overbought' : 'Neutral';
+    const bbLabel = bb == null ? '—' : bb < 0 ? 'Below Lower Band' : bb > 1 ? 'Above Upper Band' : bb < 0.2 ? 'Near Lower Band' : bb > 0.8 ? 'Near Upper Band' : 'Mid-Range';
+    const rsiWidth = rsi != null ? Math.min(100, rsi) : 50;
+    const bbWidth = bb != null ? Math.min(100, Math.max(0, bb * 100)) : 50;
+    const bbBorderColor = bb > 1 ? 'rgba(248,113,113,0.3)' : bb < 0 ? 'rgba(74,222,128,0.3)' : 'var(--border)';
+
+    // RSI interpretation text
+    const rsiInterp = rsi == null ? 'No data — run a price refresh.'
+      : rsi < 30 ? 'Momentum is deeply negative. Market has likely oversold this stock. Watch for a reversal candle on high volume before entering.'
+      : rsi > 70 ? 'Momentum is overextended. Elevated pullback risk. Avoid chasing — consider tightening stop-loss if holding.'
+      : rsi < 45 ? 'Mild selling pressure. Not yet oversold but leaning weak. Monitor for further dip or stabilization.'
+      : rsi > 55 ? 'Mild buying pressure. Slightly extended but not extreme. Safe to hold; avoid adding aggressively.'
+      : 'Balanced momentum. No directional edge from RSI alone. Wait for a clearer signal.';
+
+    // BB%B interpretation text
+    const bbInterp = bb == null ? 'No data — run a price refresh.'
+      : bb < 0 ? 'Price broke below the lower Bollinger Band — statistically unusual. Strong oversold signal. High-risk, high-reward entry zone.'
+      : bb > 1 ? 'Price broke above the upper Bollinger Band — statistically unusual. Strong overbought signal. Pullback likely.'
+      : bb < 0.2 ? 'Price is hugging the lower band. Within normal range but near the floor. Often precedes a bounce.'
+      : bb > 0.8 ? 'Price is near the upper band ceiling. Room to run is limited. Watch for resistance.'
+      : 'Price is in the middle of its normal range. No extreme reading — neutral positioning.';
+
+    // Combined verdict
+    const rsiSig = rsi == null ? 0 : rsi < 30 ? 2 : rsi > 70 ? -2 : rsi < 45 ? 1 : rsi > 55 ? -1 : 0;
+    const bbSig  = bb  == null ? 0 : bb  < 0  ? 2 : bb  > 1  ? -2 : bb  < 0.2 ? 1 : bb  > 0.8 ? -1 : 0;
+    const score  = rsiSig + bbSig;
+    const verdictText  = score >=  3 ? 'STRONG BUY WATCH'
+      : score >=  1 ? 'MILD BUY WATCH'
+      : score <= -3 ? 'CAUTION — OVERBOUGHT'
+      : score <= -1 ? 'MILD CAUTION'
+      : 'NEUTRAL';
+    const verdictClass = score > 0 ? 'bullish' : score < 0 ? 'bearish' : 'neutral';
+    const verdictAction = score >= 3 ? 'Both signals confirm oversold. Watch for a reversal confirmation before entering. Set a stop below the recent low.'
+      : score >= 1 ? 'Mixed signals lean bullish. Wait for momentum confirmation before committing.'
+      : score <= -3 ? 'Both signals confirm overbought. Avoid chasing. Tighten stops or take partial profits.'
+      : score <= -1 ? 'Mixed signals lean bearish. Avoid adding at current levels.'
+      : 'No strong edge. Hold current position and wait for a clearer signal.';
+
+    html += '<div class="card-section expanded">'
+      + '<div class="section-title" style="font-size:16px;font-weight:800">TECHNICAL SIGNALS</div>'
+      + '<div class="section-content">'
+      + '<div class="tech-signals-grid">'
+
+      + '<div class="tech-signal-card" style="border:1px solid ' + (rsi < 30 ? 'rgba(74,222,128,0.3)' : rsi > 70 ? 'rgba(248,113,113,0.3)' : 'var(--border)') + '">'
+      + '<div class="tech-signal-label">RSI 14</div>'
+      + '<div class="tech-signal-value" style="color:' + rsiColor + '">' + (rsi != null ? rsi : '—') + '</div>'
+      + '<div class="tech-signal-desc" style="font-weight:600">' + rsiLabel + '</div>'
+      + '<div class="rsi-bar-wrap" style="margin-top:8px;margin-bottom:8px">'
+      + '<div class="rsi-bar-label"><span>30</span><span>70</span></div>'
+      + '<div class="rsi-bar-track"><div class="rsi-bar-fill" style="width:' + rsiWidth + '%;background:' + rsiColor + '"></div></div>'
+      + '</div>'
+      + '<div style="font-size:11px;color:var(--muted);line-height:1.5;margin-top:4px">' + rsiInterp + '</div>'
+      + '</div>'
+
+      + '<div class="tech-signal-card" style="border:1px solid ' + bbBorderColor + '">'
+      + '<div class="tech-signal-label">BOLLINGER %B</div>'
+      + '<div class="tech-signal-value" style="color:' + bbColor + '">' + (bb != null ? bb.toFixed(2) : '—') + '</div>'
+      + '<div class="tech-signal-desc" style="font-weight:600">' + bbLabel + '</div>'
+      + '<div class="rsi-bar-wrap" style="margin-top:8px;margin-bottom:8px">'
+      + '<div class="rsi-bar-label"><span>0</span><span>1</span></div>'
+      + '<div class="rsi-bar-track"><div class="rsi-bar-fill" style="width:' + bbWidth + '%;background:' + bbColor + '"></div></div>'
+      + '</div>'
+      + '<div style="font-size:11px;color:var(--muted);line-height:1.5;margin-top:4px">' + bbInterp + '</div>'
+      + '</div>'
+
+      + '</div>'
+      + '<div class="tech-verdict ' + verdictClass + '">' + verdictText
+      + '<div class="tech-action">' + verdictAction + '</div>'
+      + '</div>'
+      + '</div></div>';
+  }
+
+  // Refresh Fundamentals (single control — AI Summary and News Impact removed)
+  {
+    const fundUrl = '/fetch/ticker/' + s.ticker;
+    const fetchedLabel = s.fetchedAt ? '🕐 Updated: ' + s.fetchedAt : 'Never';
+    html += '<div class="card-section expanded">'
+      + '<div class="section-content" style="padding-top:14px">'
+      + '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+      + '<a href="' + fundUrl + '" style="font-size:12px;padding:5px 14px;background:var(--warn);color:#0a0a0f;border-radius:5px;font-weight:700;text-decoration:none">⚡ Refresh Fundamentals</a>'
+      + '<span style="font-size:11px;color:var(--muted)">' + fetchedLabel + '</span>'
+      + '</div>'
+      + '</div></div>';
+  }
+
+  // Key Metrics (expanded)
+  html += `
+  <div class="card-section expanded">
+    <div class="section-title" onclick="toggleSection(this)">KEY METRICS</div>
+    <span class="section-toggle" onclick="toggleSection(this)">−</span>
+    <div class="section-content">
+      <div class="metrics-grid">
+        <div class="metric"><div class="m-label">ANNUAL MARGIN ${infoIcon('annualMargin')}</div><div class="m-value">${s.annualProfitMargin != null ? fmtPct(s.annualProfitMargin) : '—'}</div></div>
+        <div class="metric"><div class="m-label">Q MARGIN ${infoIcon('qMargin')}</div><div class="m-value">${s.quarterlyProfitMargin != null ? fmtPct(s.quarterlyProfitMargin) : '—'}</div></div>
+        <div class="metric"><div class="m-label">NET CASH ${infoIcon('netCash')}</div><div class="m-value ${s.netCash >= 0 ? 'up' : 'down'}">$${fmt(s.netCash)}</div></div>
+        <div class="metric"><div class="m-label">FCF ${infoIcon('fcf')}</div><div class="m-value">$${fmt(s.latestFCF)}</div></div>
+        <div class="metric"><div class="m-label">CAPEX ${infoIcon('capex')}</div><div class="m-value">$${fmt(s.latestCapex)}</div></div>
+        <div class="metric"><div class="m-label">OP CF ${infoIcon('ocf')}</div><div class="m-value">$${fmt(s.latestOCF)}</div></div>
+      </div>
+    </div>
+  </div>`;
+
+  // Quarterly Changes (expanded)
+  html += `
+  <div class="card-section expanded">
+    <div class="section-title" onclick="toggleSection(this)">QUARTERLY CHANGES</div>
+    <span class="section-toggle" onclick="toggleSection(this)">−</span>
+    <div class="section-content">
+      <div class="metrics-grid">
+        <div class="metric"><div class="m-label">REV QoQ ${infoIcon('revenueQoQ')}</div><div class="m-value ${pctClass(qc.revenue_qoq)}">${fmtPct(qc.revenue_qoq)}</div></div>
+        <div class="metric"><div class="m-label">REV YoY ${infoIcon('revenueYoY')}</div><div class="m-value ${pctClass(qc.revenue_yoy)}">${fmtPct(qc.revenue_yoy)}</div></div>
+        <div class="metric"><div class="m-label">NI QoQ ${infoIcon('netIncomeQoQ')}</div><div class="m-value ${pctClass(qc.netIncome_qoq)}">${fmtPct(qc.netIncome_qoq)}</div></div>
+        <div class="metric"><div class="m-label">NI YoY ${infoIcon('netIncomeYoY')}</div><div class="m-value ${pctClass(qc.netIncome_yoy)}">${fmtPct(qc.netIncome_yoy)}</div></div>
+        <div class="metric"><div class="m-label">FCF QoQ ${infoIcon('fcfQoQ')}</div><div class="m-value ${pctClass(qc.fcf_qoq)}">${fmtPct(qc.fcf_qoq)}</div></div>
+        <div class="metric"><div class="m-label">FCF YoY ${infoIcon('fcfYoY')}</div><div class="m-value ${pctClass(qc.fcf_yoy)}">${fmtPct(qc.fcf_yoy)}</div></div>
+      </div>
+    </div>
+  </div>`;
+
+  // Annual YoY (expanded)
+  html += `
+  <div class="card-section expanded">
+    <div class="section-title" onclick="toggleSection(this)">ANNUAL YoY</div>
+    <span class="section-toggle" onclick="toggleSection(this)">−</span>
+    <div class="section-content">
+      <div class="metrics-grid">
+        <div class="metric"><div class="m-label">REV Y0vsY1 ${infoIcon('annualYoY1')}</div><div class="m-value ${pctClass(ac.revenue_yoy_1)}">${fmtPct(ac.revenue_yoy_1)}</div></div>
+        <div class="metric"><div class="m-label">REV Y1vsY2 ${infoIcon('annualYoY2')}</div><div class="m-value ${pctClass(ac.revenue_yoy_2)}">${fmtPct(ac.revenue_yoy_2)}</div></div>
+        <div class="metric"><div class="m-label">NI Y0vsY1</div><div class="m-value ${pctClass(ac.netIncome_yoy_1)}">${fmtPct(ac.netIncome_yoy_1)}</div></div>
+        <div class="metric"><div class="m-label">NI Y1vsY2</div><div class="m-value ${pctClass(ac.netIncome_yoy_2)}">${fmtPct(ac.netIncome_yoy_2)}</div></div>
+        <div class="metric"><div class="m-label">FCF Y0vsY1</div><div class="m-value ${pctClass(ac.fcf_yoy_1)}">${fmtPct(ac.fcf_yoy_1)}</div></div>
+        <div class="metric"><div class="m-label">FCF Y1vsY2</div><div class="m-value ${pctClass(ac.fcf_yoy_2)}">${fmtPct(ac.fcf_yoy_2)}</div></div>
+      </div>
+    </div>
+  </div>`;
+
+  // Quarterly Income Table (expanded)
+  html += `
+  <div class="card-section expanded">
+    <div class="section-title" onclick="toggleSection(this)">QUARTERLY INCOME & CASH FLOW</div>
+    <span class="section-toggle" onclick="toggleSection(this)">−</span>
+    <div class="section-content">
+      <table class="fin-table">
+        <tr><th>METRIC</th>${qIncome.map(q=>`<th>${q.date}</th>`).join('')}</tr>
+        ${['Total Revenue','Gross Profit','Operating Income','Net Income','EBITDA'].map(field=>'<tr><td>'+field+'</td>'+qIncome.map(q=>'<td>$'+fmt(q[field])+'</td>').join('')+'</tr>').join('')}
+        ${['Operating Cash Flow','Capital Expenditure','Free Cash Flow'].map(field=>'<tr><td style="color:var(--accent2)">'+(field==='Capital Expenditure'?'CapEx':field==='Operating Cash Flow'?'Op. CF':'FCF')+'</td>'+qCashflow.map(c=>'<td>$'+fmt(c[field])+'</td>').join('')+'</tr>').join('')}
+        ${(() => {
+          const qBal = (s.quarterlyBalance||[]).slice(0,5);
+          return '<tr style="border-top:1px solid var(--border)"><td style="color:var(--warn)">Net Cash</td>'+qBal.map(b=>'<td style="color:"'+(((b['Cash And Cash Equivalents']||0)-(b['Total Debt']||0))>=0?'var(--up)':'var(--down)')+'">$'+fmt((b['Cash And Cash Equivalents']||0)-(b['Total Debt']||0))+'</td>').join('')+'</tr>';
+        })()}
+      </table>
+    </div>
+  </div>`;
+
+  // Annual Income Table (expanded)
+  html += `
+  <div class="card-section expanded">
+    <div class="section-title" onclick="toggleSection(this)">ANNUAL INCOME & CASH FLOW</div>
+    <span class="section-toggle" onclick="toggleSection(this)">−</span>
+    <div class="section-content">
+      <table class="fin-table">
+        <tr><th>METRIC</th>${aIncome.map(a=>`<th>${a.date}</th>`).join('')}</tr>
+        ${['Total Revenue','Gross Profit','Operating Income','Net Income','EBITDA'].map(field=>'<tr><td>'+field+'</td>'+aIncome.map(a=>'<td>$'+fmt(a[field])+'</td>').join('')+'</tr>').join('')}
+        ${['Operating Cash Flow','Capital Expenditure','Free Cash Flow'].map(field=>'<tr><td style="color:var(--accent2)">'+(field==='Capital Expenditure'?'CapEx':field==='Operating Cash Flow'?'Op. CF':'FCF')+'</td>'+(s.annualCashflow||[]).map(c=>'<td>$'+fmt(c[field])+'</td>').join('')+'</tr>').join('')}
+        <tr style="border-top:1px solid var(--border)"><td style="color:var(--warn)">Net Cash</td>
+        ${(s.annualBalance||[]).map(b=>'<td style="color:'+(((b['Cash And Cash Equivalents']||0)-(b['Total Debt']||0))>=0?'var(--up)':'var(--down)')+'">$'+fmt((b['Cash And Cash Equivalents']||0)-(b['Total Debt']||0))+'</td>').join('')}</tr>
+      </table>
+    </div>
+  </div>`;
+
+  // Upcoming Events (expanded)
+  if (cal.earningsDateStart || cal.exDividendDate || cal.dividendPayDate || ev.dividendRate || ev.earningsCallStart) {
+    html += `
+    <div class="card-section expanded">
+      <div class="section-title" onclick="toggleSection(this)">UPCOMING EVENTS</div>
+      <span class="section-toggle" onclick="toggleSection(this)">−</span>
+      <div class="section-content">
+        <div class="events-list">
+          ${cal.earningsDateStart ? `<div class="event-item"><div><div class="event-label">EARNINGS DATE</div><div class="event-estimate">EPS est: $${cal.earningsEPSAvg?.toFixed(2)||'—'} | Rev est: $${fmt(cal.revenueEstimateAvg)}</div></div><div class="event-value">${cal.earningsDateStart}</div></div>` : ''}
+          ${cal.exDividendDate ? `<div class="event-item"><div class="event-label">EX-DIVIDEND DATE</div><div class="event-value">${cal.exDividendDate}</div></div>` : ''}
+          ${cal.dividendPayDate ? `<div class="event-item"><div class="event-label">DIVIDEND PAY DATE</div><div class="event-value">${cal.dividendPayDate}</div></div>` : ''}
+          ${ev.dividendRate ? `<div class="event-item"><div class="event-label">DIVIDEND RATE / YIELD</div><div class="event-value">$${ev.dividendRate} / ${ev.dividendYield != null ? (ev.dividendYield).toFixed(2)+'%' : '—'}</div></div>` : ''}
+          ${ev.earningsCallStart ? `<div class="event-item"><div class="event-label">EARNINGS CALL</div><div class="event-value">${ev.earningsCallStart}</div></div>` : ''}
+        </div>
+      </div>
+    </div>`;
+  }
+
+  // Bank Health (expanded if applicable)
+  if (s.bankChecklist && s.bankChecklist.length) {
+    html += `
+    <div class="card-section expanded">
+      <div class="section-title" onclick="toggleSection(this)">🏦 BANK HEALTH CHECKLIST</div>
+      <span class="section-toggle" onclick="toggleSection(this)">−</span>
+      <div class="section-content">
+        <div class="bank-checklist">
+          ${s.bankChecklist.map(item => '<div class="bank-check-item"><div class="bank-check-left"><span class="bank-check-icon">'+(item.pass===true?'✅':item.pass===false?'❌':'⚠️')+'</span><div><div class="bank-check-name">'+item.metric+'</div><div class="bank-check-threshold">Threshold: '+item.threshold+'</div></div></div><div class="bank-check-value '+(item.pass===true?'pass':item.pass===false?'fail':'unknown')+'">'+( item.value||(item.auto?'—':'Check Annual Report'))+'</div></div>').join('')}
+        </div>
+        <span class="bank-guide-btn" onclick="showBankGuide('${s.ticker}')">📖 View Bank Metrics Guide</span>
+      </div>
+    </div>`;
+  }
+
+  // Dividends (expanded if applicable)
+  if (s.dividends && s.dividends.length) {
+    html += `
+    <div class="card-section expanded">
+      <div class="section-title" onclick="toggleSection(this)">RECENT DIVIDENDS</div>
+      <span class="section-toggle" onclick="toggleSection(this)">−</span>
+      <div class="section-content">
+        <table class="fin-table">
+          <tr><th>DATE</th><th>AMOUNT</th></tr>
+          ${s.dividends.map(d=>'<tr><td>'+d.date.split(' ')[0]+'</td><td>$'+d.amount.toFixed(3)+'</td></tr>').join('')}
+        </table>
+      </div>
+    </div>`;
+  }
+
+  html += '</div>'; // close stock-card
+  return html;
+}
+
+// ── ADMIN TAB RENDERER ──────────────────────────────────────────────────────
+const PURGE_FILES = [
+  ['transactions',      'trades_ai.json',        'TRANSACTIONS',          'Buy/sell transaction log of the AI trading simulation. Holdings and balance are kept.'],
+  ['outcomes',          'trade_outcomes.json',   'CLOSED-TRADE OUTCOMES', 'Closed-trade results (gain/loss %, SPY benchmark, buy-time factors) used for scoring feedback and validation stats.'],
+  ['shadowSnapshots',   'shadow_candidates.json','SHADOW SNAPSHOTS',      'Daily snapshots of every scored candidate, graded against 5-day forward returns to validate the composite ranking.'],
+  ['forecastSnapshots', 'signal_forecasts.json', 'SIGNAL FORECASTS',      'Daily technical price-forecast ranges and their hit/miss accuracy grades.'],
+];
+
+function renderPurgeRows() {
+  const inputStyle = "background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px";
+  return PURGE_FILES.map(([key, file, label, desc]) => `
+    <div class="admin-row">
+      <div class="admin-row-left">
+        <div class="admin-op-label" style="color:var(--warn)">🗑 PURGE ${label} <span style="color:var(--muted);font-weight:400">(${file})</span></div>
+        <div class="admin-op-ts">${desc} Removes entries dated before the chosen day. Irreversible.</div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="date" id="purgeBefore-${key}" style="${inputStyle}">
+        <button class="btn" style="border-color:var(--warn);color:var(--warn)" onclick="purgeFile('${key}', '${label}', this)">PURGE</button>
+      </div>
+    </div>`).join('');
+}
+
+function renderAdmin(opTs) {
+  const ts = opTs || {};
+  return `
+  <div style="margin-bottom:24px">
+    <div style="font-family:'Syne',sans-serif;font-size:18px;font-weight:700;margin-bottom:6px">ADMIN</div>
+    <div style="font-size:11px;color:var(--muted)">Manage data fetching and logs. All operations run in background.</div>
+  </div>
+  <div class="admin-grid">
+    <div class="admin-row">
+      <div class="admin-row-left">
+        <div class="admin-op-label">⏰ MARKET-DAY SCHEDULER</div>
+        <div class="admin-op-ts" id="schedulerInfo">Loading scheduler status...</div>
+      </div>
+      <button class="btn" id="schedulerToggleBtn" data-enabled="0" onclick="toggleScheduler(this)">…</button>
+    </div>
+    <div class="admin-row">
+      <div class="admin-row-left">
+        <div class="admin-op-label">📋 LOGS</div>
+        <div class="admin-op-ts">View last 50 lines of app.log</div>
+      </div>
+      <a href="/logs" target="_blank" class="btn">VIEW LOGS</a>
+    </div>
+    ${renderPurgeRows()}
+    <div class="admin-row">
+      <div class="admin-row-left">
+        <div class="admin-op-label" style="color:var(--down)">⚠ RESET TRADEAI SIMULATION</div>
+        <div class="admin-op-ts">Wipes all AI trades, holdings, resets balance. Irreversible.</div>
+      </div>
+      <button class="btn" style="border-color:var(--down);color:var(--down)" onclick="resetTradeAISimulation(this)">RESET</button>
+    </div>
+  </div>`;
+}
+
+// ── SCHEDULER STATUS ────────────────────────────────────────────────────────
+async function loadSchedulerStatus() {
+  const el = document.getElementById('schedulerInfo');
+  if (!el) return;
+  try {
+    const r = await fetch('/admin/scheduler');
+    const d = await r.json();
+    const cfg = d.config || {};
+    const runs = (d.state || {}).lastRuns || {};
+    const fmt = (j) => runs[j] ? `last: ${runs[j].at}${runs[j].note && runs[j].note !== 'ok' ? ' · ' + runs[j].note : ''}` : 'not run yet';
+    const inp = "background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:3px 6px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px";
+    el.innerHTML = `All times US-Eastern (24h), market days only. Comma-separate multiple values.
+      <div style="display:grid;grid-template-columns:auto auto 1fr;gap:4px 10px;align-items:center;margin-top:8px">
+        <span>Sell-only stop checks — hours</span>
+        <span><input id="schedSellHours" value="${(cfg.sellCheckHours||[]).join(',')}" style="${inp};width:70px"> at minutes <input id="schedSellMins" value="${(cfg.sellCheckMinutes||[]).join(',')}" style="${inp};width:60px"></span>
+        <span>${fmt('sellCheck')}</span>
+        <span>Full Recommend (sells + buys)</span>
+        <span><input id="schedRecTimes" value="${(cfg.recommendTimes||[]).join(', ')}" style="${inp};width:130px"></span>
+        <span>${fmt('fullRecommend')}</span>
+        <span>Price refresh + Dream scan</span>
+        <span><input id="schedDreamTime" value="${cfg.dreamTime||''}" style="${inp};width:60px"></span>
+        <span>${fmt('dreamScan')}</span>
+        <span>Identify→Fetch→Analyze→Recommend</span>
+        <span><input id="schedChainTime" value="${cfg.chainTime||''}" style="${inp};width:60px"></span>
+        <span>${fmt('afternoonChain')}</span>
+      </div>
+      <button class="btn" style="margin-top:8px" onclick="saveSchedule(this)">SAVE TIMES</button>`;
+    const btn = document.getElementById('schedulerToggleBtn');
+    if (btn) {
+      btn.textContent = cfg.enabled ? 'DISABLE' : 'ENABLE';
+      btn.dataset.enabled = cfg.enabled ? '1' : '0';
+      btn.style.borderColor = cfg.enabled ? 'var(--down)' : 'var(--up)';
+      btn.style.color = cfg.enabled ? 'var(--down)' : 'var(--up)';
+    }
+  } catch(e) {
+    el.textContent = 'Scheduler status unavailable';
+    console.error('[Scheduler] status FAIL:', e);
+  }
+}
+
+async function saveSchedule(btn) {
+  const listOf = (id) => (document.getElementById(id).value || '').split(',').map(s => s.trim()).filter(Boolean);
+  const hours    = listOf('schedSellHours').map(Number);
+  const mins     = listOf('schedSellMins').map(Number);
+  const recTimes = listOf('schedRecTimes');
+  const dream    = document.getElementById('schedDreamTime').value.trim();
+  const chain    = document.getElementById('schedChainTime').value.trim();
+  const timeRe = /^([01]?\d|2[0-3]):[0-5]\d$/;
+  if (!hours.length || hours.some(h => isNaN(h) || h < 0 || h > 23)) { alert('Sell-check hours must be numbers 0-23 (e.g. 9,10,11)'); return; }
+  if (!mins.length || mins.some(m => isNaN(m) || m < 0 || m > 59))   { alert('Sell-check minutes must be numbers 0-59 (e.g. 20,40)'); return; }
+  if (!recTimes.length || !recTimes.every(t => timeRe.test(t))) { alert('Recommend times must be HH:MM 24h (e.g. 10:00, 11:00)'); return; }
+  if (!timeRe.test(dream) || !timeRe.test(chain)) { alert('Dream/chain times must be HH:MM 24h (e.g. 13:30)'); return; }
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
+  try {
+    const r = await fetch('/admin/scheduler', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream, chainTime: chain })
+    });
+    const d = await r.json();
+    if (d.error) alert('Save failed: ' + d.error);
+  } catch(e) { alert('Save failed: ' + e.message); }
+  btn.disabled = false; btn.textContent = orig;
+  loadSchedulerStatus();
+}
+
+async function toggleScheduler(btn) {
+  const enable = btn.dataset.enabled !== '1';
+  btn.disabled = true;
+  try {
+    await fetch('/admin/scheduler', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ enabled: enable })
+    });
+  } catch(e) { console.error('[Scheduler] toggle FAIL:', e); }
+  btn.disabled = false;
+  loadSchedulerStatus();
+}
+
+async function purgeFile(target, label, btn) {
+  const inp = document.getElementById('purgeBefore-' + target);
+  const before = inp ? inp.value : '';
+  if (!before) { alert('Pick a date first — entries dated BEFORE that day will be removed.'); return; }
+  if (!confirm(`Permanently remove ${label} entries dated before ${before}?\n\nThis cannot be undone.`)) return;
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
+  try {
+    const r = await fetch('/admin/purge', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ before, targets: [target] })
+    });
+    const d = await r.json();
+    btn.disabled = false; btn.textContent = orig;
+    if (d.error) { alert('Purge failed: ' + d.error); return; }
+    alert(`Purged ${(d.removed || {})[target] || 0} ${label} entries dated before ${before}.`);
+    console.log('[AdminPurge]', d);
+  } catch(e) {
+    btn.disabled = false; btn.textContent = orig;
+    alert('Purge failed: ' + e.message);
+  }
+}
+
+// ── PER-TICKER PRICE REFRESH ────────────────────────────────────────────────
+async function refreshTickerPrice(ticker, btn) {
+  if (btn.disabled) return;
+  const orig = btn.textContent;
+  btn.textContent = '⏳';
+  btn.disabled = true;
+  console.log(`[PriceRefresh] Starting: ${ticker}`);
+  try {
+    await fetch(`/fetch/ticker/${ticker}`);
+    // Poll until done
+    let attempts = 0;
+    const poll = setInterval(async () => {
+      attempts++;
+      const res = await fetch('/status');
+      const s = await res.json();
+      if (!s.running || attempts > 60) {
+        clearInterval(poll);
+        btn.textContent = orig;
+        btn.disabled = false;
+        loadData();
+        console.log(`[PriceRefresh] Done: ${ticker}`);
+      }
+    }, 2000);
+  } catch(e) {
+    btn.textContent = orig;
+    btn.disabled = false;
+    console.error(`[PriceRefresh] FAIL: ${ticker} | ${e}`);
+  }
+}
+
+let dataLoaded = false;
+let wasRunning = false;
+let gainersMarket = "cdn";
+let pendingReload = false;
+
+async function loadData() {
+  // Remember which tab is active so we can restore after reload
+  const activeTabEl = document.querySelector('.tab.active');
+  const activeTab = activeTabEl ? activeTabEl.dataset.tab : 'watchlist';
+  try {
+    console.log('[loadData] starting fetch /data');
+    const res = await fetch('/data');
+    const data = await res.json();
+    console.log('[loadData] data received, watchlist length:', (data.watchlist||[]).length);
+    const stocks = data.watchlist || [];
+
+    console.log('[loadData] calling renderWatchlist');
+    let whtml;
+    try { whtml = renderWatchlist(data); console.log('[loadData] renderWatchlist OK, length:', whtml.length); }
+    catch(e) { console.error('[loadData] renderWatchlist CRASH:', e); throw e; }
+    document.getElementById('watchlistContent').innerHTML = whtml;
+
+    console.log('[loadData] calling renderAdmin');
+    try { document.getElementById('adminContent').innerHTML = renderAdmin(data.opTimestamps); } catch(e) { console.error('[loadData] renderAdmin CRASH:', e); }
+    try { loadSchedulerStatus(); } catch(e) { console.error('[loadData] loadSchedulerStatus CRASH:', e); }
+
+    console.log('[loadData] calling buildTickerTabs');
+    try { buildTickerTabs(stocks, data.opTimestamps); } catch(e) { console.error('[loadData] buildTickerTabs CRASH:', e); throw e; }
+
+    if (data.lastPriceRefresh) {
+      const lbl = document.getElementById('lastPriceRefreshLabel');
+      if (lbl) lbl.textContent = 'Last price refresh: ' + data.lastPriceRefresh;
+      document.getElementById('lastUpdated').textContent = 'Prices: ' + data.lastPriceRefresh;
+    } else if (data.lastUpdated) {
+      document.getElementById('lastUpdated').textContent = 'Last updated: ' + data.lastUpdated;
+    }
+
+    // Build/update ticker tabs
+
+    stocks.forEach(s => {
+      loadCachedNewsImpact(s.ticker);
+      const ai = s.aiSummary || {};
+      (ai.eventImpacts || []).forEach(e => {
+        if (e.event) checkFollowupCache(s.ticker, e.event);
+      });
+    });
+
+    // Restore previously active tab (don't navigate away)
+    if (activeTab && activeTab !== 'watchlist') {
+      const restoreTab = document.querySelector('.tab[data-tab="' + activeTab + '"]');
+      const restorePanel = document.getElementById('tab-' + activeTab);
+      if (restorePanel) {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+        if (restoreTab) restoreTab.classList.add('active');
+        restorePanel.classList.add('active');
+        console.log('[loadData] restored active tab: ' + activeTab);
+      }
+    }
+    dataLoaded = true;
+    console.log(`[LoadData] OK | tickers:${stocks.map(s=>s.ticker).join(',')}`);
+  } catch(e) {
+    console.error('[LoadData] FAIL:', e);
+    if (!dataLoaded) {
+      document.getElementById('watchlistContent').innerHTML = '<div class="loading">No data yet — click FETCH DATA to begin.</div>';
+    }
+  }
+}
+
+
+function toggleDreamHelp(btn) {
+  const panel = document.getElementById('dreamHelpPanel');
+  if (!panel) return;
+  const open = panel.classList.toggle('open');
+  btn.textContent = open ? '▲ Hide Help' : '❓ How It Works';
+}
+
+function buildDreamHelpHtml() {
+  return '<div id="dreamHelpPanel" class="dream-help-panel">'
+    + '<div class="dream-help-section">'
+    + '<div class="dream-help-h">📡 SCAN SOURCES</div>'
+    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">Watchlist</span><span class="dream-help-desc">Your current tracked stocks</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">Daily Gainer</span><span class="dream-help-desc">Top 10 US + Top 10 TSX movers from today</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">ARK ETF</span><span class="dream-help-desc">Holdings from ARKK, ARKG, ARKW, ARKQ, ARKF — Cathie Wood active picks</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">Screener</span><span class="dream-help-desc">7 yfinance screens: growth tech, undervalued growth, aggressive small caps, small cap gainers, most actives, day gainers, undervalued large caps</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">S&amp;P 500</span><span class="dream-help-desc">All ~500 S&amp;P 500 components scored to find hidden gems</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">TSX 60</span><span class="dream-help-desc">All 60 TSX blue chip components</span></div>'
+    + '</div>'
+    + '<div class="dream-help-section">'
+    + '<div class="dream-help-h">🔢 SCORE (100 pts)</div>'
+    + '<div class="dream-help-row"><span class="dream-help-pts">20pts</span><span class="dream-help-metric">Revenue Growth</span><span class="dream-help-desc">&ge;40% = 20 · &ge;20% = 10</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-pts">15pts</span><span class="dream-help-metric">Gross Margin</span><span class="dream-help-desc">&ge;60% = 15 · &ge;40% = 8</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-pts">15pts</span><span class="dream-help-metric">RSI Momentum</span><span class="dream-help-desc">45–65 = 15 · 35–45 = 10 · &gt;70 = 5</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-pts">15pts</span><span class="dream-help-metric">Price Trend</span><span class="dream-help-desc">Above MA50 = 8 · &ge;85% of 52w high = 7</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-pts">15pts</span><span class="dream-help-metric">Balance Sheet</span><span class="dream-help-desc">Net cash positive = 8 · FCF positive = 7</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-pts">10pts</span><span class="dream-help-metric">Institutional %</span><span class="dream-help-desc">&ge;50% = 10 · &ge;25% = 5</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-pts">10pts</span><span class="dream-help-metric">Market Cap</span><span class="dream-help-desc">$500M–$10B = 10 · large = 6 · micro = 5</span></div>'
+    + '</div>'
+    + '<div class="dream-help-section" style="margin-bottom:0">'
+    + '<div class="dream-help-h">🏅 BADGES &nbsp; &nbsp; ⏱️ TIMING</div>'
+    + '<div class="dream-help-row"><span style="font-size:13px;margin-right:6px">🌟</span><span class="dream-help-metric">70–100 Dream</span><span class="dream-help-desc">High conviction candidate</span></div>'
+    + '<div class="dream-help-row"><span style="font-size:13px;margin-right:6px">✅</span><span class="dream-help-metric">50–69 Watch</span><span class="dream-help-desc">Monitor for improvement</span></div>'
+    + '<div class="dream-help-row"><span style="font-size:13px;margin-right:6px">⚠️</span><span class="dream-help-metric">Below 50</span><span class="dream-help-desc">Not ready yet · Scan takes 15–20 min for ~650 tickers · Run manually via the button above</span></div>'
+    + '</div>'
+    + '</div>';
+}
+
+function buildTickerTabs(stocks, opTs) {
+  const tabsEl = document.getElementById('mainTabs');
+  const contentEl = document.querySelector('.content');
+
+  // Remove old ticker tabs and panels
+  document.querySelectorAll('.tab[data-tab^="ticker-"]').forEach(t => t.remove());
+  document.querySelectorAll('.tab-panel[id^="tab-ticker-"]').forEach(p => p.remove());
+
+  stocks.forEach(s => {
+    const tabId = 'ticker-' + s.ticker.replace('.', '_');
+
+    // Add panel (no nav tab — access via watchlist detail button)
+    const panel = document.createElement('div');
+    panel.className = 'tab-panel';
+    panel.id = 'tab-' + tabId;
+
+    const priceFetchedAt = s.priceFetchedAt || s.fetchedAt || 'Never';
+    const fetchedAt = s.fetchedAt || 'Never';
+
+    panel.innerHTML = `
+      <div class="ticker-tab-header">
+        <button class="ticker-tab-back" onclick="backToWatchlist()">← Watchlist</button>
+        <div class="ticker-tab-title">${s.ticker}</div>
+      </div>
+      <div id="ticker-detail-${s.ticker.replace('.','_')}">${renderTickerDetail(s)}</div>
+    `;
+    contentEl.appendChild(panel);
+    console.log(`[TickerTab] Built: ${s.ticker}`);
+  });
+}
+
+async function stopOperation() {
+  const btn = document.getElementById('statusStopBtn');
+  if (btn) { btn.textContent = '⏳ Stopping...'; btn.disabled = true; }
+  console.log('[Stop] Sending stop signal...');
+  try {
+    await fetch('/stop', {method: 'POST'});
+    console.log('[Stop] Stop signal sent');
+  } catch(e) {
+    console.error('[Stop] FAIL:', e);
+  }
+  if (btn) { btn.disabled = false; }
+}
+
+async function pollStatus() {
+  try {
+    const res = await fetch('/status');
+    const s = await res.json();
+    document.getElementById('statusText').textContent = s.message;
+    document.getElementById('statusPill').textContent = s.running ? 'RUNNING' : 'IDLE';
+    document.getElementById('statusPill').className = 'status-pill' + (s.running ? ' running' : '');
+    document.getElementById('statusDot').className = 'status-dot' + (s.running ? ' running' : '');
+
+    // Progress bar in status bar
+    const progressWrap = document.getElementById('statusProgressWrap');
+    const progressBar  = document.getElementById('statusProgressBar');
+    const progressLabel= document.getElementById('statusProgressLabel');
+    const stopBtn      = document.getElementById('statusStopBtn');
+    if (progressWrap && progressBar && progressLabel) {
+      const hasProgress = s.running && s.total > 0;
+      progressWrap.style.display = hasProgress ? 'flex' : 'none';
+      if (stopBtn) stopBtn.style.display = s.running ? 'inline-block' : 'none';
+      if (hasProgress) {
+        const pct = Math.min(100, Math.round((s.current / s.total) * 100));
+        progressBar.style.width = pct + '%';
+        progressLabel.textContent = s.current + ' of ' + s.total + (s.current_ticker ? ' — ' + s.current_ticker : '');
+      } else if (s.running) {
+        // Indeterminate (dream scan which is one opaque call)
+        progressBar.style.width = '100%';
+        progressBar.style.animation = 'progressIndeterminate 1.5s ease-in-out infinite';
+        progressLabel.textContent = 'Processing...';
+      }
+      if (!s.running) {
+        progressBar.style.animation = 'none';
+        if (stopBtn) stopBtn.style.display = 'none';
+      }
+    }
+
+    // Price banner: show when prices operation is running
+    const isPriceOp = s.running && (s.operation === 'prices' || s.message.toLowerCase().includes('price'));
+    const banner = document.getElementById('priceBanner');
+    const priceBar = document.getElementById('priceRefreshBar');
+    if (banner) banner.style.display = isPriceOp ? 'block' : 'none';
+    if (priceBar) priceBar.style.display = isPriceOp ? 'flex' : 'none';
+
+    // Update admin timestamps if available
+    if (s.opTimestamps) {
+      const fields = {prices:'admin-ts-prices', new:'admin-ts-new', smart:'admin-ts-smart', all:'admin-ts-all'};
+      Object.entries(fields).forEach(([k, elId]) => {
+        const el = document.getElementById(elId);
+        if (el && s.opTimestamps[k]) el.textContent = 'Last: ' + s.opTimestamps[k];
+      });
+      if (s.lastPriceRefresh) {
+        const lbl = document.getElementById('lastPriceRefreshLabel');
+        if (lbl) lbl.textContent = 'Last price refresh: ' + s.lastPriceRefresh;
+      }
+    }
+
+    if (wasRunning && !s.running) {
+      const wasDream = dreamScanning || (s.message && s.message.toLowerCase().includes('dream'));
+      console.log('[Poll] Operation complete, reloading data | wasDream:' + wasDream + ' activeTab:' + activeTab);
+      dreamScanning = false;
+      await loadData();
+      if (wasDream) {
+        dreamLoaded = false;
+        setTimeout(async () => { await loadDream(true); console.log('[Dream] post-scan reload complete'); }, 800);
+      }
+    }
+    wasRunning = s.running;
+  } catch(e) {
+    console.error('[Poll] FAIL:', e);
+  }
+}
+
+function renderFollowupPlan(plan, ticker, eventName) {
+  let html = '';
+  if (plan.savedAt) {
+    const cacheLabel = plan.cached ? '📋 Cached' : '🤖 AI Generated';
+    const safeEvent = JSON.stringify(eventName);
+    const safeTicker = JSON.stringify(ticker);
+    html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <span style="font-size:11px;color:var(--muted)">${cacheLabel} · Saved: ${plan.savedAt}</span>
+      <button class="btn" style="font-size:10px;padding:3px 10px;border-color:var(--warn);color:var(--warn)"
+        onclick="getFollowupPlan(${safeTicker},${safeEvent},this,true)">↺ REFRESH</button>
+    </div>`;
+  }
+  if (plan.steps && plan.steps.length) {
+    html += '<div style="margin-bottom:16px">';
+    plan.steps.forEach(step => {
+      html += `
+      <div class="modal-step">
+        <div class="modal-step-header">
+          <span class="modal-step-title">${step.title||''}</span>
+          <div style="display:flex;gap:6px">
+            ${step.fetchRequired ? `<span class="modal-step-fetch">↺ FETCH REQUIRED</span>` : ''}
+            <span class="modal-step-date">${step.date||''}</span>
+          </div>
+        </div>
+        <div class="modal-step-instructions">${step.instructions||''}</div>
+        ${step.sources && step.sources.length ? `
+        <div class="modal-step-sources">
+          ${step.sources.map(s=>`<span class="modal-step-source">${s}</span>`).join('')}
+        </div>` : ''}
+      </div>`;
+    });
+    html += '</div>';
+  }
+  if (plan.redFlags || plan.greenFlags) {
+    html += '<div class="modal-flags">';
+    if (plan.redFlags && plan.redFlags.length) {
+      html += `<div class="modal-flag-section">
+        <div class="modal-flag-title red">⚠ RED FLAGS</div>
+        <ul class="modal-flag-list red">${plan.redFlags.map(f=>`<li>${f}</li>`).join('')}</ul>
+      </div>`;
+    }
+    if (plan.greenFlags && plan.greenFlags.length) {
+      html += `<div class="modal-flag-section">
+        <div class="modal-flag-title green">✓ GREEN FLAGS</div>
+        <ul class="modal-flag-list green">${plan.greenFlags.map(f=>`<li>${f}</li>`).join('')}</ul>
+      </div>`;
+    }
+    html += '</div>';
+  }
+  if (plan.decisionPoint) {
+    html += `<div class="modal-decision">
+      <div class="modal-decision-label">DECISION POINT</div>
+      ${plan.decisionPoint}
+    </div>`;
+  }
+  return html;
+}
+
+async function checkFollowupCache(ticker, eventName) {
+  try {
+    const res = await fetch(`/followup/check/${ticker}/${encodeURIComponent(eventName)}`);
+    const data = await res.json();
+    const btnId = `followup-btn-${ticker}-${eventName.replace(/[^a-zA-Z0-9]/g,'_')}`;
+    const btn = document.getElementById(btnId);
+    if (btn && data.exists) {
+      btn.textContent = `📋 VIEW PLAN · ${data.savedAt || ''}`;
+      btn.style.borderColor = 'var(--up)';
+      btn.style.color = 'var(--up)';
+    }
+  } catch(e) {}
+}
+
+async function getFollowupPlan(ticker, eventName, btn, forceRefresh=false) {
+  const modal = document.getElementById('followupModal');
+  const body = document.getElementById('followupBody');
+  const title = document.getElementById('followupTitle');
+  const subtitle = document.getElementById('followupSubtitle');
+  title.textContent = ticker + ' — ' + eventName;
+  subtitle.textContent = forceRefresh ? 'Refreshing AI plan...' : 'Loading follow-up plan...';
+  body.innerHTML = `<div class="modal-loading">${forceRefresh ? '🤖 Regenerating AI plan...' : '📋 Loading plan...'}<br><span style="font-size:11px;color:var(--muted)">This may take 30-60 seconds</span></div>`;
+  modal.classList.add('visible');
+  const origText = btn.textContent;
+  btn.textContent = '⏳ Loading...';
+  btn.disabled = true;
+  try {
+    const url = `/followup/${ticker}/${encodeURIComponent(eventName)}${forceRefresh ? '?refresh=1' : ''}`;
+    const res = await fetch(url);
+    const plan = await res.json();
+    if (plan.error) {
+      body.innerHTML = `<div class="modal-loading" style="color:var(--down)">Error: ${plan.error}</div>`;
+      return;
+    }
+    subtitle.textContent = plan.summary || '';
+    body.innerHTML = renderFollowupPlan(plan, ticker, eventName);
+
+    const btnId = `followup-btn-${ticker}-${eventName.replace(/[^a-zA-Z0-9]/g,'_')}`;
+    const origBtn = document.getElementById(btnId);
+    if (origBtn) {
+      origBtn.textContent = `📋 VIEW PLAN · ${plan.savedAt || ''}`;
+      origBtn.style.borderColor = 'var(--up)';
+      origBtn.style.color = 'var(--up)';
+    }
+  } catch(e) {
+    console.error('Followup error:', e);
+    body.innerHTML = `<div class="modal-loading" style="color:var(--down)">Failed to load plan. Check logs.</div>`;
+  } finally {
+    btn.textContent = origText;
+    btn.disabled = false;
+  }
+}
+
+async function getNews(ticker, btn, todayOnly=false) {
+  const modal = document.getElementById('newsModal');
+  const body = document.getElementById('newsBody');
+  const title = document.getElementById('newsTitle');
+  const subtitle = document.getElementById('newsSubtitle');
+  title.textContent = ticker + (todayOnly ? ' — TODAY\'S NEWS' : ' — 7 DAY NEWS');
+  subtitle.textContent = todayOnly ? 'Fetching today\'s news...' : 'Fetching last 7 days of news...';
+  body.innerHTML = `<div class="modal-loading">📰 Fetching ${todayOnly ? "today's" : "7-day"} news & running AI analysis...<br><span style="font-size:11px;color:var(--muted)">This may take 30-60 seconds</span></div>`;
+  modal.classList.add('visible');
+  const origText = btn.textContent;
+  btn.textContent = '⏳ Loading...';
+  btn.disabled = true;
+  try {
+    const url = `/news/${ticker}${todayOnly ? '?today=1' : ''}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    console.log('News response:', JSON.stringify(data).slice(0, 500));
+    if (data.error && !data.items.length) {
+      body.innerHTML = `<div class="modal-loading" style="color:var(--muted)">${data.error}</div>`;
+      return;
+    }
+    const impact = data.impact || {};
+    const items = data.items || [];
+    const pc = data.priceContext || {};
+    const score = impact.sentimentScore || 0;
+    const sentiment = (impact.overallSentiment || 'neutral').toLowerCase();
+    const scoreClass = score > 0 ? 'positive' : score < 0 ? 'negative' : 'neutral-score';
+    const confirmation = (impact.marketConfirmation || 'MIXED').toUpperCase();
+    const cacheLabel = data.cached ? ' · from cache' : ' · live';
+    subtitle.textContent = `${items.length} articles${cacheLabel} · RSI ${pc.rsi14 || '—'} · Vol ${pc.volumeRatio || '—'}x avg`;
+
+    // Price context panel
+    const pctColor = v => v == null ? 'var(--muted)' : v >= 0 ? 'var(--up)' : 'var(--down)';
+    const pctFmt = v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+    const rsi = pc.rsi14;
+    const rsiColor = rsi > 70 ? 'var(--down)' : rsi < 30 ? 'var(--up)' : 'var(--accent)';
+    const rsiWidth = rsi ? Math.min(100, rsi) : 50;
+
+    let html = `
+      <div class="price-context-grid">
+        <div class="price-context-card">
+          <div class="price-context-label">1D CHANGE</div>
+          <div class="price-context-value" style="color:${pctColor(pc.change1d)}">${pctFmt(pc.change1d)}</div>
+        </div>
+        <div class="price-context-card">
+          <div class="price-context-label">7D CHANGE</div>
+          <div class="price-context-value" style="color:${pctColor(pc.change7d)}">${pctFmt(pc.change7d)}</div>
+        </div>
+        <div class="price-context-card">
+          <div class="price-context-label">30D CHANGE</div>
+          <div class="price-context-value" style="color:${pctColor(pc.change30d)}">${pctFmt(pc.change30d)}</div>
+        </div>
+        <div class="price-context-card">
+          <div class="price-context-label">VOL RATIO</div>
+          <div class="price-context-value" style="color:${pc.volumeRatio > 2 ? 'var(--warn)' : 'var(--text)'}">${pc.volumeRatio || '—'}x</div>
+        </div>
+        <div class="price-context-card">
+          <div class="price-context-label">RSI 14</div>
+          <div class="price-context-value" style="color:${rsiColor}">${rsi || '—'}</div>
+        </div>
+        <div class="price-context-card">
+          <div class="price-context-label">vs MA20</div>
+          <div class="price-context-value" style="color:${pctColor(pc.priceVsMa20)}">${pctFmt(pc.priceVsMa20)}</div>
+        </div>
+        <div class="price-context-card">
+          <div class="price-context-label">vs MA50</div>
+          <div class="price-context-value" style="color:${pctColor(pc.priceVsMa50)}">${pctFmt(pc.priceVsMa50)}</div>
+        </div>
+        <div class="price-context-card">
+          <div class="price-context-label">PRICE</div>
+          <div class="price-context-value">$${pc.currentPrice || '—'}</div>
+        </div>
+      </div>
+      ${rsi ? `<div class="rsi-bar-wrap">
+        <div class="rsi-bar-label"><span>OVERSOLD (30)</span><span>RSI ${rsi}</span><span>OVERBOUGHT (70)</span></div>
+        <div class="rsi-bar-track">
+          <div class="rsi-bar-fill" style="width:${rsiWidth}%;background:${rsiColor}"></div>
+        </div>
+      </div>` : ''}
+      <div style="margin-bottom:14px">
+        <span class="confirmation-badge ${confirmation}">
+          ${confirmation === 'CONFIRMS' ? '✓' : confirmation === 'CONTRADICTS' ? '✗' : '~'}
+          MARKET ${confirmation} NEWS SENTIMENT
+        </span>
+      </div>
+      <div class="news-sentiment-bar ${sentiment}">
+        <div class="news-score ${scoreClass}">${score > 0 ? '+' : ''}${score}</div>
+        <div class="news-sentiment-info">
+          <div class="news-sentiment-label">${sentiment.toUpperCase()} SENTIMENT</div>
+          <div class="news-summary-text">${impact.summary || ''}</div>
+        </div>
+      </div>`;
+
+    if (impact.priceImpact || impact.tradingImplication) {
+      html += `<div class="news-meta-row">
+        ${impact.priceImpact ? `<div class="news-meta-card">
+          <div class="news-meta-label">PRICE IMPACT</div>
+          <div class="news-meta-value">${impact.priceImpact}</div>
+        </div>` : ''}
+        ${impact.tradingImplication ? `<div class="news-meta-card">
+          <div class="news-meta-label">TRADING IMPLICATION</div>
+          <div class="news-meta-value">${impact.tradingImplication}</div>
+        </div>` : ''}
+      </div>`;
+    }
+    if (impact.watchFor) {
+      html += `<div class="news-meta-card" style="margin-bottom:16px">
+        <div class="news-meta-label">WATCH FOR</div>
+        <div class="news-meta-value">${impact.watchFor}</div>
+      </div>`;
+    }
+    if (impact.keyThemes && impact.keyThemes.length) {
+      html += '<div class="news-themes">'+impact.keyThemes.map(t=>'<span class="news-theme">'+t+'</span>').join('')+'</div>';
+    }
+    html += `<div class="news-divider">ARTICLES (${items.length})</div>`;
+    const aiItems = {};
+    (impact.newsItems || []).forEach(n => { aiItems[n.title] = n; });
+    items.forEach(item => {
+      const ai = aiItems[item.title] || {};
+      const impactType = (ai.impact || 'neutral').toLowerCase();
+      const sig = (ai.significance || 'low').toLowerCase();
+      const date = item.pubDate ? item.pubDate.slice(0,10) : '';
+      html += `
+      <div class="news-item">
+        <div class="news-item-header">
+          <div class="news-item-title">
+            ${item.url ? `<a href="${item.url}" target="_blank">${item.title}</a>` : item.title}
+          </div>
+          <span class="news-impact-badge ${impactType}">${impactType.toUpperCase()}</span>
+        </div>
+        <div class="news-item-meta">
+          ${item.provider || ''} · ${date}
+          ${sig !== 'low' ? `· <span class="news-sig-${sig}">${sig.toUpperCase()} SIGNIFICANCE</span>` : ''}
+        </div>
+        ${item.summary ? `<div class="news-item-summary">${item.summary.slice(0,200)}${item.summary.length>200?'...':''}</div>` : ''}
+        ${ai.oneLineSummary ? `<div class="news-item-impact">→ ${ai.oneLineSummary}</div>` : ''}
+      </div>`;
+    });
+    body.innerHTML = html;
+    const cacheKey = `${ticker}_${todayOnly ? 'today' : '7d'}`;
+    newsCache[cacheKey] = { impact, items, priceContext: pc, cached: data.cached };
+    console.log(`[NewsCache] Stored: ${cacheKey} | items:${items.length}`);
+    loadCachedNewsImpact(ticker);
+  } catch(e) {
+    console.error('News error:', e);
+    body.innerHTML = `<div class="modal-loading" style="color:var(--down)">Failed to load news: ${e.message}</div>`;
+  } finally {
+    btn.textContent = origText;
+    btn.disabled = false;
+  }
+}
+
+function showGuideTab(name, el) {
+  document.querySelectorAll('.guide-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.guide-tab-panel').forEach(p => p.classList.remove('active'));
+  if (el) el.classList.add('active');
+  const panel = document.getElementById('guide-' + name);
+  if (panel) panel.classList.add('active');
+}
+
+function closeModal() {
+  document.getElementById('followupModal').classList.remove('visible');
+  document.getElementById('newsModal').classList.remove('visible');
+  document.getElementById('bankGuideModal').classList.remove('visible');
+  if (pendingReload) loadData();
+}
+
+function showBankGuide(ticker) {
+  document.getElementById('bankGuideModal').classList.add('visible');
+  document.getElementById('bankGuideTitle').textContent = ticker + ' — BANK METRICS GUIDE';
+  showGuideTab('checklist', document.querySelector('.guide-tab'));
+}
+
+loadData();
+setInterval(pollStatus, 3000);
+updateMacroStatusBadge();
+
+  {%- endraw %}
+</script>

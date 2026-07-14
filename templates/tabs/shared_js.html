@@ -1,0 +1,560 @@
+<script>
+  {%- raw %}
+const TOOLTIPS = {
+  annualMargin: {
+    title: "ANNUAL PROFIT MARGIN",
+    desc: "How much of annual revenue becomes net income.",
+    formula: "Annual Net Income ÷ Annual Revenue"
+  },
+  qMargin: {
+    title: "QUARTERLY PROFIT MARGIN",
+    desc: "Same as annual margin but for the latest quarter.",
+    formula: "Latest Q Net Income ÷ Latest Q Revenue"
+  },
+  netCash: {
+    title: "NET CASH",
+    desc: "Cash remaining after paying off all debt. Positive = net cash positive.",
+    formula: "Total Cash − Total Debt"
+  },
+  fcf: {
+    title: "FREE CASH FLOW (FCF)",
+    desc: "Cash generated after capital expenditures. Latest quarter.",
+    formula: "Operating Cash Flow − CapEx"
+  },
+  capex: {
+    title: "CAPITAL EXPENDITURE",
+    desc: "Money spent on physical assets like mines and equipment. Latest quarter.",
+    formula: "From cash flow statement"
+  },
+  ocf: {
+    title: "OPERATING CASH FLOW",
+    desc: "Cash generated from core business operations. Latest quarter.",
+    formula: "From cash flow statement"
+  },
+  revenueQoQ: {
+    title: "REVENUE QoQ",
+    desc: "Current quarter vs previous quarter.",
+    formula: "(Q0 − Q1) ÷ |Q1|"
+  },
+  revenueYoY: {
+    title: "REVENUE YoY",
+    desc: "Current quarter vs same quarter last year (Q0 vs Q4).",
+    formula: "(Q0 − Q4) ÷ |Q4|"
+  },
+  netIncomeQoQ: {
+    title: "NET INCOME QoQ",
+    desc: "Current quarter vs previous quarter.",
+    formula: "(Q0 − Q1) ÷ |Q1|"
+  },
+  netIncomeYoY: {
+    title: "NET INCOME YoY",
+    desc: "Current quarter vs same quarter last year (Q0 vs Q4).",
+    formula: "(Q0 − Q4) ÷ |Q4|"
+  },
+  annualYoY1: {
+    title: "ANNUAL YoY (Y0 vs Y1)",
+    desc: "Most recent full year vs prior full year.",
+    formula: "(Y0 − Y1) ÷ |Y1|"
+  },
+  annualYoY2: {
+    title: "ANNUAL YoY (Y1 vs Y2)",
+    desc: "Prior full year vs two years ago.",
+    formula: "(Y1 − Y2) ÷ |Y2|"
+  },
+  fcfQoQ: {
+    title: "FCF QoQ",
+    desc: "Free cash flow: current quarter vs previous quarter.",
+    formula: "(Q0 FCF − Q1 FCF) ÷ |Q1 FCF|"
+  },
+  fcfYoY: {
+    title: "FCF YoY",
+    desc: "Free cash flow: current quarter vs same quarter last year.",
+    formula: "(Q0 FCF − Q4 FCF) ÷ |Q4 FCF|"
+  },
+  marginRank: {
+    title: "MARGIN RANK",
+    desc: "Ranked by annual profit margin across all watchlist peers.",
+    formula: "#1 = highest annual profit margin"
+  },
+  netCashRank: {
+    title: "NET CASH RANK",
+    desc: "Ranked by net cash position across all watchlist peers.",
+    formula: "#1 = highest (Cash − Debt)"
+  },
+  marketCapRank: {
+    title: "MARKET CAP RANK",
+    desc: "Ranked by market capitalization across all watchlist peers.",
+    formula: "#1 = largest market cap"
+  },
+  fcfRank: {
+    title: "FCF RANK",
+    desc: "Ranked by latest quarterly free cash flow across all watchlist peers.",
+    formula: "#1 = highest FCF"
+  },
+};
+
+const popup = document.getElementById('tooltipPopup');
+
+function showTooltip(el, key, vals) {
+  const t = TOOLTIPS[key];
+  if (!t) return;
+  document.getElementById('ttTitle').textContent = t.title;
+  document.getElementById('ttDesc').textContent = t.desc;
+  let formulaText = t.formula;
+  if (vals) formulaText += '\n\nCalculation:\n' + vals;
+  document.getElementById('ttFormula').textContent = formulaText;
+  popup.classList.add('visible');
+  positionTooltip(el);
+}
+
+function hideTooltip() {
+  popup.classList.remove('visible');
+}
+
+function positionTooltip(el) {
+  const rect = el.getBoundingClientRect();
+  const pw = 280;
+  let left = rect.right + 8;
+  let top = rect.top - 10;
+  if (left + pw > window.innerWidth) left = rect.left - pw - 8;
+  if (top + 100 > window.innerHeight) top = window.innerHeight - 120;
+  popup.style.left = left + 'px';
+  popup.style.top = top + 'px';
+}
+
+function infoIcon(key, vals) {
+  const v = vals ? `,'${String(vals).replace(/'/g, "\\'")}'` : '';
+  return `<i class="info-icon" onclick="showTooltip(this,'${key}'${v})" onmouseleave="hideTooltip()">ⓘ</i>`;
+}
+
+function fmt(n) {
+  if (n == null) return '—';
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return (n/1e9).toFixed(2) + 'B';
+  if (abs >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (abs >= 1e3) return (n/1e3).toFixed(1) + 'K';
+  return n.toFixed(2);
+}
+function fmtPct(n) {
+  if (n == null) return '—';
+  const val = (n * 100).toFixed(1);
+  return (n >= 0 ? '+' : '') + val + '%';
+}
+function pctClass(n) {
+  if (n == null) return 'neutral';
+  return n >= 0 ? 'up' : 'down';
+}
+function sentimentClass(s) {
+  if (!s) return 'sentiment-neutral';
+  if (s.toLowerCase().includes('bull')) return 'sentiment-bullish';
+  if (s.toLowerCase().includes('bear')) return 'sentiment-bearish';
+  return 'sentiment-neutral';
+}
+
+// Collapsible Helper
+function toggleSection(el) {
+  const section = el.closest('.card-section');
+  section.classList.toggle('expanded');
+  const btn = section.querySelector('.section-toggle');
+  if (section.classList.contains('expanded')) {
+    btn.textContent = '−';
+  } else {
+    btn.textContent = '+';
+  }
+}
+
+function sentimentBadgeClass(s) {
+  if (!s) return 'neutral';
+  s = s.toLowerCase();
+  if (s === 'bullish' || s === 'positive') return 'positive';
+  if (s === 'bearish' || s === 'negative') return 'negative';
+  return 'neutral';
+}
+
+function renderNewsImpactInline(ticker, data) {
+  const el = document.getElementById(`news-impact-${ticker}`);
+  if (!el) return;
+
+  function buildBlock(label, entry, todayOnly) {
+    const imp = entry && entry.impact;
+    const ts = entry && entry.fetchedAt;
+    if (!imp) {
+      const safeT2 = "'" + ticker + "'";
+      return '<div class="ni-block">'
+        +'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">'
+        +'<div class="ni-label" style="margin-bottom:0">'+label+'</div>'
+        +'<span style="font-size:10px;color:var(--muted)">🕐 No analysis yet</span>'
+        +'<button onclick="getNews('+safeT2+', this, '+todayOnly+')" style="font-size:10px;padding:2px 10px;background:var(--warn);color:#0a0a0f;border:none;border-radius:4px;font-weight:700;cursor:pointer">⚡ Refresh</button>'
+        +'</div>'
+        +'<div class="ni-summary" style="color:var(--muted);font-style:italic">No analysis cached yet.</div>'
+        +'</div>';
+    }
+    const safeT  = "'" + ticker + "'";
+    return '<div class="ni-block">'
+      +'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">'
+      +'<div class="ni-label" style="margin-bottom:0">'+label+'</div>'
+      +'<span style="font-size:10px;color:var(--muted)">🕐 '+(ts||'unknown')+'</span>'
+      +'<button onclick="getNews('+safeT+', this, '+todayOnly+')" style="font-size:10px;padding:2px 10px;background:var(--warn);color:#0a0a0f;border:none;border-radius:4px;font-weight:700;cursor:pointer">⚡ Refresh</button>'
+      +'<button onclick="showCachedNews('+safeT+', '+todayOnly+')" style="font-size:10px;padding:2px 10px;background:var(--warn);color:#0a0a0f;border:none;border-radius:4px;font-weight:700;cursor:pointer">📰 View All</button>'
+      +'</div>'
+      +'<div class="ni-meta">'
+      +'<span class="news-impact-badge '+(imp.sentimentScore >= 2 ? 'positive' : imp.sentimentScore <= -2 ? 'negative' : 'neutral')+'">'+(imp.overallSentiment||'neutral').toUpperCase()+'</span>'
+      +(imp.sentimentScore != null ? '<span style="font-size:10px;color:var(--muted)">Score: '+(imp.sentimentScore > 0 ? '+' : '')+imp.sentimentScore+'</span>' : '')
+      +'</div>'
+      +'<div class="ni-summary">'+(imp.summary||'—')+'</div>'
+      +'<div style="font-size:11px;color:var(--text);margin-bottom:4px">→ '+(imp.tradingImplication||'—')+'</div>'
+      +'</div>';
+  }
+
+  el.innerHTML = buildBlock('7-DAY NEWS', data.sevenDay, false) + buildBlock('TODAY\'S NEWS', data.today, true);
+}
+
+const newsCache = {};
+
+function buildNewsModalHtml(ticker, data, todayOnly) {
+  const impact = data.impact || {};
+  const items = data.items || [];
+  const pc = data.priceContext || {};
+  const score = impact.sentimentScore || 0;
+  const sentiment = (impact.overallSentiment || 'neutral').toLowerCase();
+  const scoreClass = score > 0 ? 'positive' : score < 0 ? 'negative' : 'neutral-score';
+  const confirmation = (impact.marketConfirmation || 'MIXED').toUpperCase();
+  const cacheLabel = data.cached ? ' · from cache' : ' · live';
+
+  const modal = document.getElementById('newsModal');
+  const title = document.getElementById('newsTitle');
+  const subtitle = document.getElementById('newsSubtitle');
+  title.textContent = ticker + (todayOnly ? ' — TODAY\'S NEWS' : ' — 7 DAY NEWS');
+  subtitle.textContent = items.length
+    ? `${items.length} articles${cacheLabel} · RSI ${pc.rsi14 || '—'} · Vol ${pc.volumeRatio || '—'}x avg`
+    : `Cached impact · ${todayOnly ? 'today' : '7-day'}`;
+  modal.classList.add('visible');
+
+  const pctColor = v => v == null ? 'var(--muted)' : v >= 0 ? 'var(--up)' : 'var(--down)';
+  const pctFmt = v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+  const rsi = pc.rsi14;
+  const rsiColor = rsi > 70 ? 'var(--down)' : rsi < 30 ? 'var(--up)' : 'var(--accent)';
+  const rsiWidth = rsi ? Math.min(100, rsi) : 50;
+
+  let html = '';
+  if (Object.keys(pc).length) {
+    html += `
+      <div class="price-context-grid">
+        <div class="price-context-card"><div class="price-context-label">1D CHANGE</div><div class="price-context-value" style="color:${pctColor(pc.change1d)}">${pctFmt(pc.change1d)}</div></div>
+        <div class="price-context-card"><div class="price-context-label">7D CHANGE</div><div class="price-context-value" style="color:${pctColor(pc.change7d)}">${pctFmt(pc.change7d)}</div></div>
+        <div class="price-context-card"><div class="price-context-label">30D CHANGE</div><div class="price-context-value" style="color:${pctColor(pc.change30d)}">${pctFmt(pc.change30d)}</div></div>
+        <div class="price-context-card"><div class="price-context-label">VOL RATIO</div><div class="price-context-value" style="color:${pc.volumeRatio > 2 ? 'var(--warn)' : 'var(--text)'}">${pc.volumeRatio || '—'}x</div></div>
+        <div class="price-context-card"><div class="price-context-label">RSI 14</div><div class="price-context-value" style="color:${rsiColor}">${rsi || '—'}</div></div>
+        <div class="price-context-card"><div class="price-context-label">vs MA20</div><div class="price-context-value" style="color:${pctColor(pc.priceVsMa20)}">${pctFmt(pc.priceVsMa20)}</div></div>
+        <div class="price-context-card"><div class="price-context-label">vs MA50</div><div class="price-context-value" style="color:${pctColor(pc.priceVsMa50)}">${pctFmt(pc.priceVsMa50)}</div></div>
+        <div class="price-context-card"><div class="price-context-label">PRICE</div><div class="price-context-value">$${pc.currentPrice || '—'}</div></div>
+      </div>
+      ${ rsi ? '<div class="rsi-bar-wrap"><div class="rsi-bar-label"><span>OVERSOLD (30)</span><span>RSI '+rsi+'</span><span>OVERBOUGHT (70)</span></div><div class="rsi-bar-track"><div class="rsi-bar-fill" style="width:'+rsiWidth+'%;background:'+rsiColor+'"></div></div></div>' : ''}` ;
+  }
+
+  html += `
+    <div style="margin-bottom:14px">
+      <span class="confirmation-badge ${confirmation}">
+        ${confirmation === 'CONFIRMS' ? '✓' : confirmation === 'CONTRADICTS' ? '✗' : '~'}
+        MARKET ${confirmation} NEWS SENTIMENT
+      </span>
+    </div>
+    <div class="news-sentiment-bar ${sentiment}">
+      <div class="news-score ${scoreClass}">${score > 0 ? '+' : ''}${score}</div>
+      <div class="news-sentiment-info">
+        <div class="news-sentiment-label">${sentiment.toUpperCase()} SENTIMENT</div>
+        <div class="news-summary-text">${impact.summary || ''}</div>
+      </div>
+    </div>`;
+
+  if (impact.priceImpact) html += `<div style="font-size:12px;color:var(--text);margin:10px 0;padding:8px;background:rgba(42,42,58,0.4);border-radius:6px">📈 ${impact.priceImpact}</div>`;
+  if (impact.tradingImplication) html += `<div style="font-size:12px;color:var(--accent2);margin-bottom:10px">→ ${impact.tradingImplication}</div>`;
+  if (impact.watchFor) html += `<div style="font-size:11px;color:var(--muted);margin-bottom:14px">👁 Watch for: ${impact.watchFor}</div>`;
+
+  if (impact.keyThemes && impact.keyThemes.length) {
+    html += '<div style="margin-bottom:14px"><div style="font-size:10px;color:var(--muted);letter-spacing:0.5px;margin-bottom:6px">KEY THEMES</div><div style="display:flex;flex-wrap:wrap;gap:6px">'+impact.keyThemes.map(t=>'<span style="font-size:11px;padding:2px 8px;border-radius:4px;background:rgba(42,42,58,0.6);color:var(--text);border:1px solid var(--border)">'+t+'</span>').join('')+ '</div></div>';
+  }
+
+  if (items.length) {
+    html += `<div style="font-size:10px;color:var(--muted);letter-spacing:0.5px;margin-bottom:10px">NEWS ARTICLES (${items.length})</div>`;
+    items.forEach(n => {
+      const ni = (impact.newsItems || []).find(x => x.title === n.title) || {};
+      const impClass = ni.impact === 'positive' ? 'positive' : ni.impact === 'negative' ? 'negative' : 'neutral';
+      html += `<div class="news-item">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
+          <div class="news-item-title"><a href="${n.link||'#'}" target="_blank" style="color:var(--text);text-decoration:none">${n.title||''}</a></div>
+          ${ni.impact ? `<span class="news-impact-badge ${impClass}">${(ni.impact||'').toUpperCase()}</span>` : ''}
+        </div>
+        <div class="news-item-meta">${(n.pubDate||'').slice(0,16)} · ${n.provider||''} ${ni.significance ? `· ${ni.significance.toUpperCase()} significance` : ''}</div>
+        ${n.summary ? `<div class="news-item-summary">${n.summary.slice(0,200)}...</div>` : ''}
+        ${ni.oneLineSummary ? `<div class="news-item-impact">💡 ${ni.oneLineSummary}</div>` : ''}
+      </div>`;
+    });
+  } else if (impact.summary) {
+    html += `<div style="font-size:11px;color:var(--muted);font-style:italic;margin-top:8px">Full article list not cached — click ↺ Refresh to reload with articles.</div>`;
+  }
+
+  return html;
+}
+
+function showCachedNews(ticker, todayOnly) {
+  const key = `${ticker}_${todayOnly ? 'today' : '7d'}`;
+  const cached = newsCache[key];
+  if (!cached) {
+    console.warn(`[NewsCache] No cache for ${key}, falling back to fetch`);
+    getNews(ticker, document.createElement('button'), todayOnly);
+    return;
+  }
+  const body = document.getElementById('newsBody');
+  body.innerHTML = buildNewsModalHtml(ticker, cached, todayOnly);
+  console.log(`[NewsCache] showCachedNews: ${key} | items:${(cached.items||[]).length}`);
+}
+
+async function loadCachedNewsImpact(ticker) {
+  try {
+    const res = await fetch(`/news/cached-impact/${ticker}`);
+    const data = await res.json();
+    if (data.sevenDay && data.sevenDay.impact) {
+      const key7 = `${ticker}_7d`;
+      newsCache[key7] = newsCache[key7] || {};
+      newsCache[key7].impact = data.sevenDay.impact;
+      newsCache[key7].cached = true;
+    }
+    if (data.today && data.today.impact) {
+      const keyT = `${ticker}_today`;
+      newsCache[keyT] = newsCache[keyT] || {};
+      newsCache[keyT].impact = data.today.impact;
+      newsCache[keyT].cached = true;
+    }
+    renderNewsImpactInline(ticker, data);
+    console.log(`[NewsImpact] ${ticker} | 7d:${!!(data.sevenDay && data.sevenDay.impact)} today:${!!(data.today && data.today.impact)}`);
+  } catch(e) {
+    const el = document.getElementById(`news-impact-${ticker}`);
+    if (el) el.innerHTML = `<div style="font-size:11px;color:var(--muted)">Failed to load cached analysis.</div>`;
+    console.error(`[NewsImpact] FAIL ${ticker} | ${e}`);
+  }
+}
+
+function renderWatchlist(data) {
+  const stocks = data.watchlist || [];
+  if (!stocks.length) return '<div class="loading">No data yet. Click FETCH DATA.</div>';
+
+  const summaryHTML = `
+    <div class="summary-row">
+      <div class="summary-card">
+        <div class="label">STOCKS TRACKED</div>
+        <div class="value">${stocks.length}</div>
+        <div class="sub">in watchlist</div>
+      </div>
+      <div class="summary-card">
+        <div class="label">TOTAL MARKET CAP</div>
+        <div class="value">$${fmt(stocks.reduce((a,s)=>a+(s.marketCap||0),0))}</div>
+        <div class="sub">combined</div>
+      </div>
+      <div class="summary-card">
+        <div class="label">BEST MARGIN</div>
+        <div class="value">${(() => { const s = stocks.find(s=>s.marginRank===1); return s ? s.ticker : '—'; })()}</div>
+        <div class="sub">${(() => { const s = stocks.find(s=>s.marginRank===1); return s ? fmtPct(s.annualProfitMargin) : '—'; })()} annual</div>
+      </div>
+      <div class="summary-card">
+        <div class="label">BEST NET CASH</div>
+        <div class="value">${(() => { const s = stocks.find(s=>s.netCashRank===1); return s ? s.ticker : '—'; })()}</div>
+        <div class="sub">$${(() => { const s = stocks.find(s=>s.netCashRank===1); return s ? fmt(s.netCash) : '—'; })()} net</div>
+      </div>
+    </div>`;
+
+  const cardsHTML = stocks.map(s => {
+    const priceFetchedAt = s.priceFetchedAt || s.fetchedAt || '—';
+    const prevClose = s.previousClose != null ? `$${s.previousClose.toFixed(2)}` : '—';
+    const todayPrice = s.price != null ? s.price.toFixed(2) : '—';
+    const priceDiff = (s.price != null && s.previousClose != null) ? s.price - s.previousClose : null;
+    const priceDiffPct = (priceDiff != null && s.previousClose) ? (priceDiff / s.previousClose * 100) : null;
+    const priceColor = priceDiff == null ? 'var(--text)' : priceDiff >= 0 ? 'var(--up)' : 'var(--down)';
+    const diffLabel = priceDiffPct != null ? ` (${priceDiffPct >= 0 ? '+' : ''}${priceDiffPct.toFixed(2)}%)` : '';
+    const tabId = 'ticker-' + s.ticker.replace('.', '_');
+    const rsiBg = s.rsi14 < 30 ? 'rgba(74,222,128,0.15);color:var(--up);border:1px solid rgba(74,222,128,0.3)' : s.rsi14 > 70 ? 'rgba(248,113,113,0.15);color:var(--down);border:1px solid rgba(248,113,113,0.3)' : 'var(--surface2);color:var(--muted);border:1px solid var(--border)';
+    const bbBg  = s.bbPercent < 0 ? 'rgba(74,222,128,0.15);color:var(--up);border:1px solid rgba(74,222,128,0.3)' : s.bbPercent > 1 ? 'rgba(248,113,113,0.15);color:var(--down);border:1px solid rgba(248,113,113,0.3)' : 'var(--surface2);color:var(--muted);border:1px solid var(--border)';
+    const rsiBadge = s.rsi14 != null ? '<span style="font-size:10px;font-family:monospace;padding:2px 8px;border-radius:4px;font-weight:700;background:' + rsiBg + '">RSI ' + s.rsi14 + '</span>' : '';
+    const bbBadge  = s.bbPercent != null ? '<span style="font-size:10px;font-family:monospace;padding:2px 8px;border-radius:4px;font-weight:700;background:' + bbBg + '">BB% ' + s.bbPercent.toFixed(2) + '</span>' : '';
+
+    const insiderBg = s.insiderNet === 'Net Buyer' ? 'rgba(74,222,128,0.15);color:var(--up);border:1px solid rgba(74,222,128,0.3)' : s.insiderNet === 'Net Seller' ? 'rgba(248,113,113,0.15);color:var(--down);border:1px solid rgba(248,113,113,0.3)' : 'var(--surface2);color:var(--muted);border:1px solid var(--border)';
+    const insiderBadge = s.insiderNet ? '<span style="font-size:10px;font-family:monospace;padding:2px 8px;border-radius:4px;font-weight:700;background:' + insiderBg + '">👤 ' + s.insiderNet + '</span>' : '';
+    const shortBg = s.shortFloat != null && s.shortFloat > 20 ? 'rgba(248,113,113,0.15);color:var(--down);border:1px solid rgba(248,113,113,0.3)' : 'var(--surface2);color:var(--muted);border:1px solid var(--border)';
+    const shortBadge = s.shortFloat != null ? '<span style="font-size:10px;font-family:monospace;padding:2px 8px;border-radius:4px;font-weight:700;background:' + shortBg + '">Short ' + s.shortFloat + '%</span>' : '';
+    const instBadge = s.institutionalPct != null ? '<span style="font-size:10px;font-family:monospace;padding:2px 8px;border-radius:4px;font-weight:700;background:var(--surface2);color:var(--muted);border:1px solid var(--border)">🏦 ' + s.institutionalPct + '%</span>' : '';
+
+    return `
+    <div class="slim-card" onclick="showTickerTab('${s.ticker}')">
+      <div class="slim-card-header">
+        <div>
+          <div class="slim-ticker">${s.ticker}</div>
+          <div class="slim-industry">${s.industry || s.sector || '—'}</div>
+          <div class="slim-mcap">MCap: $${fmt(s.marketCap)}</div>
+        </div>
+      </div>
+      <div class="slim-prices">
+        <div class="slim-price-block">
+          <div class="slim-price-label">PREV CLOSE</div>
+          <div class="slim-price-value" style="color:var(--muted)">${prevClose}</div>
+        </div>
+        <div class="slim-price-block">
+          <div class="slim-price-label">TODAY${diffLabel}</div>
+          <div class="slim-price-value" style="color:${priceColor}">$${todayPrice}</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;margin:8px 0 4px 0;flex-wrap:wrap">
+        ${rsiBadge}${bbBadge}${insiderBadge}${shortBadge}${instBadge}
+      </div>
+      <div class="slim-actions">
+        <span class="slim-fetch-ts">🕐 ${priceFetchedAt}</span>
+        <div style="display:flex;gap:6px">
+          <button class="btn-refresh-price" onclick="event.stopPropagation();refreshTickerPrice('${s.ticker}', this)">↺ Price</button>
+          <button class="btn-detail" onclick="event.stopPropagation();showTickerTab('${s.ticker}')">Detail →</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+
+  return summaryHTML + `<div class="watchlist-grid-4">${cardsHTML}</div>`;
+}
+
+
+function renderGainersTable(gainers) {
+  if (!gainers.length) return '<div class="loading" style="padding:40px">No gainers data available for this market.</div>';
+  return `
+    <table class="gainers-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>TICKER</th>
+          <th>% GAIN</th>
+          <th>PRICE</th>
+          <th>VOLUME</th>
+          <th>ACTION</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${gainers.map((g,i)=>`
+        <tr>
+          <td class="rank-num">${i+1}</td>
+          <td><strong>${g.ticker}</strong></td>
+          <td class="gain-pct">+${g.percentGain?.toFixed(2)||'—'}%</td>
+          <td>$${g.price?.toFixed(2)||'—'}</td>
+          <td>${fmt(g.volume)}</td>
+          <td>
+            <form method="POST" action="/add" style="display:inline">
+              <input type="hidden" name="ticker" value="${g.ticker}">
+              <button type="submit" class="btn" style="padding: 2px 8px; font-size: 10px;">+ WATCH</button>
+            </form>
+          </td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+function switchGainersMarket(market, btn) {
+  gainersMarket = market;
+  document.querySelectorAll('.gainers-toggle-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const data = window._lastGainersData;
+  if (!data) return;
+  const gainers = market === 'cdn' ? (data.dailyGainersCDN || []) : (data.dailyGainers || []);
+  document.getElementById('gainersTableContainer').innerHTML = renderGainersTable(gainers);
+}
+
+function renderGainers(data) {
+  window._lastGainersData = data;
+  const cdnGainers = data.dailyGainersCDN || [];
+  const usGainers = data.dailyGainers || [];
+  const active = gainersMarket === 'cdn' ? cdnGainers : usGainers;
+  return `
+    <div class="gainers-toggle">
+      <button class="gainers-toggle-btn ${gainersMarket === 'cdn' ? 'active' : ''}"
+        onclick="switchGainersMarket('cdn', this)">🍁 TSX (Canada)</button>
+      <button class="gainers-toggle-btn ${gainersMarket === 'us' ? 'active' : ''}"
+        onclick="switchGainersMarket('us', this)">🇺🇸 US Market</button>
+      <span style="font-size:11px;color:var(--muted);align-self:center;margin-left:4px">
+        CDN: ${cdnGainers.length} · US: ${usGainers.length}
+      </span>
+    </div>
+    <div id="gainersTableContainer">${renderGainersTable(active)}</div>`;
+}
+
+function renderRecommendations(data) {
+  const rec = data.recommendations || {};
+  const list = rec.recommendations || [];
+  if (!list.length) return '<div class="loading">No recommendations yet — click FETCH ALL to generate.</div>';
+  return `
+    <div class="market-context"><strong>MARKET CONTEXT:</strong> ${rec.marketContext || '—'}</div>
+    <div class="rec-grid">
+      ${list.map(r => `
+      <div class="rec-card">
+        <div class="rec-header">
+          <div>
+            <div class="rec-ticker">${r.ticker}</div>
+            <div class="rec-company">${r.companyName || ''}</div>
+          </div>
+          <form method="POST" action="/add" style="display:inline">
+            <input type="hidden" name="ticker" value="${r.ticker}">
+            <button type="submit" class="btn" style="padding:4px 10px;font-size:10px">+ WATCH</button>
+          </form>
+        </div>
+        <div class="rec-badges">
+          <span class="rec-badge risk-${(r.riskLevel||'medium').toLowerCase()}">${(r.riskLevel||'').toUpperCase()} RISK</span>
+          <span class="rec-badge">${r.sector || ''}</span>
+          <span class="rec-badge">${r.timeHorizon || ''}</span>
+        </div>
+        <div class="rec-reason">${r.reason || ''}</div>
+        ${r.catalysts && r.catalysts.length ? `
+        <ul class="rec-catalysts">
+          ${r.catalysts.map(c=>`<li>${c}</li>`).join('')}
+        </ul>` : ''}
+      </div>`).join('')}
+    </div>`;
+}
+
+function renderPeers(data) {
+  const stocks = data.watchlist || [];
+  if (!stocks.length) return '<div class="loading">No data yet.</div>';
+
+  const categories = [
+    { key: 'annualProfitMargin', rankKey: 'marginRank', label: 'PROFIT MARGIN', fmt: v => v != null ? (v*100).toFixed(1)+'%' : '—' },
+    { key: 'netCash', rankKey: 'netCashRank', label: 'NET CASH', fmt: v => '$'+fmt(v) },
+    { key: 'marketCap', rankKey: 'marketCapRank', label: 'MARKET CAP', fmt: v => '$'+fmt(v) },
+    { key: 'latestFCF', rankKey: 'fcfRank', label: 'FREE CASH FLOW', fmt: v => '$'+fmt(v) },
+  ];
+
+  return `<div class="peer-grid">${categories.map(cat => {
+    const sorted = [...stocks].filter(s=>s[cat.key]!=null).sort((a,b)=>b[cat.key]-a[cat.key]);
+    return `
+    <div class="peer-card">
+      <div class="peer-title">${cat.label}</div>
+      ${sorted.map((s,i)=>`
+      <div class="peer-row">
+        <span class="peer-rank r${i+1}">${i+1}</span>
+        <span class="peer-ticker">${s.ticker}</span>
+        <span class="peer-val">${cat.fmt(s[cat.key])}</span>
+      </div>`).join('')}
+    </div>`;
+  }).join('')}</div>`;
+}
+
+function showTab(name, el) {
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+  if (el) el.classList.add('active');
+  const panel = document.getElementById('tab-'+name);
+  if (panel) panel.classList.add('active');
+  console.log(`[Tab] switched to: ${name}`);
+}
+
+function showTickerTab(ticker) {
+  const tabId = 'ticker-' + ticker.replace('.', '_');
+  const tab = document.querySelector(`.tab[data-tab="${tabId}"]`);
+  showTab(tabId, tab);
+  console.log(`[TickerTab] navigating to: ${ticker}`);
+}
+
+
+  {%- endraw %}
+</script>

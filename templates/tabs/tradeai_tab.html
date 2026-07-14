@@ -1,0 +1,1992 @@
+<script>
+{%- raw %}
+// ── TRADE SIMULATION ──────────────────────────────────────────────────────────
+
+let tradeLoaded = false;
+
+async function loadTrade(force) {
+  if (tradeLoaded && !force) return;
+  const el = document.getElementById('tradeContent');
+  el.innerHTML = '<div class="loading">Loading trade simulation...</div>';
+  try {
+    const res = await fetch('/trade');
+    const data = await res.json();
+    el.innerHTML = renderTrade(data);
+    tradeLoaded = true;
+    console.log('[Trade] loaded | balance:' + data.balance + ' holdings:' + (data.holdings||[]).length);
+  } catch(e) {
+    el.innerHTML = '<span style="color:var(--down)">Failed to load trade data.</span>';
+    console.error('[Trade] load FAIL:', e);
+  }
+}
+
+function fmt$(v) {
+  if (v == null) return '—';
+  return '$' + Number(v).toLocaleString('en-CA', {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+function fmtPct(v) {
+  if (v == null) return '—';
+  return (v >= 0 ? '+' : '') + v + '%';
+}
+function fmtNum(v) {
+  if (v == null) return '—';
+  return Number(v).toLocaleString('en-CA');
+}
+
+// ── SELF-LEARNING ROLLBACK — proposal banner, shown in the account area ────
+// The engine only ever DETECTS underperformance; a config change requires
+// this explicit approval. Shared by the TradeAI account tab and the
+// Validation tab (both fetch a rollbackProposal field).
+function buildRollbackBanner(proposal) {
+  if (!proposal || proposal.status !== 'pending') return '';
+  const upDown = v => v >= 0 ? 'var(--up)' : 'var(--down)';
+  const signed = v => (v >= 0 ? '+' : '') + v + '%';
+  return `<div id="rollbackBanner" style="border:1px solid var(--warn);border-radius:10px;padding:14px 16px;margin-bottom:16px;background:rgba(251,191,36,0.08)">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+      <span style="font-size:16px">⚠️</span>
+      <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:13px">ROLLBACK RECOMMENDED — your approval needed</span>
+    </div>
+    <div style="font-size:12px;color:var(--text);line-height:1.7;margin-bottom:10px">
+      Current <b style="color:var(--accent)">v${proposal.currentVersion}</b>${proposal.currentLabel ? ' (' + proposal.currentLabel + ')' : ''} is returning
+      <b style="color:${upDown(proposal.currentReturnPct)}">${signed(proposal.currentReturnPct)}</b> on capital deployed over ${proposal.currentN} buys —
+      champion <b style="color:#fbbf24">v${proposal.championVersion}</b>${proposal.championLabel ? ' (' + proposal.championLabel + ')' : ''} returned
+      <b style="color:${upDown(proposal.championReturnPct)}">${signed(proposal.championReturnPct)}</b> over ${proposal.championN} buys —
+      a gap of <b style="color:var(--down)">${signed(proposal.gapPct)}</b>, past the ${proposal.thresholdPct}% threshold.
+      <span style="color:var(--muted)">Detected ${proposal.detectedAt || ''}.</span>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button onclick="approveRollback(this)" style="font-size:11px;padding:7px 16px;background:var(--warn);border:none;border-radius:6px;color:#1a1400;cursor:pointer;font-family:'DM Mono',monospace;font-weight:700">✅ APPROVE ROLLBACK TO v${proposal.championVersion}</button>
+      <button onclick="dismissRollback(this)" style="font-size:11px;padding:7px 16px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">DISMISS</button>
+    </div>
+  </div>`;
+}
+
+// Re-fetches every tab that shows account-derived numbers (holdings P&L,
+// version asset/account returns) — called after anything that refreshes
+// prices, so those numbers never sit stale until a tab is manually reopened.
+async function _refreshTradeViews() {
+  if (typeof loadTradeAI === 'function') await loadTradeAI(true);
+  if (typeof renderValidation === 'function') await renderValidation();
+  if (typeof loadValSummary === 'function') await loadValSummary(true);
+}
+
+async function approveRollback(btn) {
+  if (!confirm('Roll back the live scoring config to the champion version? This creates a new version — history is kept — and takes effect on the next Recommend cycle.')) return;
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
+  try {
+    const r = await fetch('/tradeai/rollback/approve', { method: 'POST' }).then(res => res.json());
+    if (r.error) { alert('Rollback failed: ' + r.error); btn.disabled = false; btn.textContent = orig; return; }
+    alert(`Rolled back to v${r.restoredFrom}'s config as new v${r.newVersion}.`);
+    await _refreshTradeViews();
+  } catch(e) {
+    alert('Rollback failed: ' + e.message);
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
+async function dismissRollback(btn) {
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
+  try {
+    const r = await fetch('/tradeai/rollback/dismiss', { method: 'POST' }).then(res => res.json());
+    if (r.error) { alert('Dismiss failed: ' + r.error); btn.disabled = false; btn.textContent = orig; return; }
+    await _refreshTradeViews();
+  } catch(e) {
+    alert('Dismiss failed: ' + e.message);
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
+function renderTrade(data) {
+  const holdings = data.holdings || [];
+  const transactions = data.transactions || [];
+  const identified = data.identified || [];
+  const details = data.details || {};
+  const lastRec = data.lastRecommend || null;
+  const balance = data.balance ?? 100000;
+
+  // Total P&L
+  let totalCost = 0, totalValue = 0;
+  holdings.forEach(h => {
+    totalCost += (h.purchasePrice||0) * (h.shares||0);
+    totalValue += (h.currentPrice||h.purchasePrice||0) * (h.shares||0);
+  });
+  const totalGL = totalValue - totalCost;
+  const glClass = totalGL >= 0 ? 'up' : 'down';
+
+  // Month/year options for transaction filter
+  const months = [...new Set(transactions.map(t => t.date ? t.date.slice(0,7) : null).filter(Boolean))].sort().reverse();
+  const monthOptions = months.map(m => `<option value="${m}">${m}</option>`).join('');
+
+  // Holdings table
+  const holdingsRows = holdings.length === 0
+    ? `<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:20px">No holdings yet. Run Identify → Fetch Info → Recommend to start.</td></tr>`
+    : holdings.map(h => {
+        const gl = h.gainLoss;
+        const glPct = h.gainLossPct;
+        const glCls = (gl||0) >= 0 ? 'up' : 'down';
+        return `<tr>
+          <td><span style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px">${h.ticker}</span></td>
+          <td>${h.shares}</td>
+          <td>${fmt$(h.purchasePrice)}</td>
+          <td>${fmt$(h.currentPrice)}</td>
+          <td class="${glCls}">${fmt$(gl)}</td>
+          <td class="${glCls}">${fmtPct(glPct)}</td>
+        </tr>`;
+      }).join('');
+
+  // Identified candidates list
+  const identifiedHtml = identified.length === 0
+    ? `<div style="color:var(--muted);padding:16px">No candidates yet. Click Identify.</div>`
+    : `<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden">` +
+      identified.map((item, i) => {
+        const d = details[item.ticker];
+        const hasDetail = !!d;
+        return `
+        <div class="trade-candidate-row" onclick="toggleTradeDetail('td-${i}')">
+          <div>
+            <div class="trade-candidate-ticker">${item.ticker}</div>
+            ${hasDetail ? `<div style="font-size:10px;color:var(--accent);margin-top:2px">● data loaded</div>` : ''}
+          </div>
+          <div class="trade-candidate-reason">${item.reason || '—'}</div>
+          <span class="trade-candidate-source">${item.source || ''}</span>
+        </div>
+        <div class="trade-detail-expand" id="td-${i}">
+          ${hasDetail ? renderTradeDetailExpand(d) : '<div style="color:var(--muted);font-size:11px">No detail fetched yet. Run Fetch Info.</div>'}
+        </div>`;
+      }).join('') + `</div>`;
+
+  // Recommendation section
+  const recHtml = lastRec
+    ? renderTradeRecommend(lastRec)
+    : `<div style="color:var(--muted);padding:16px">No recommendation yet. Complete Identify → Fetch Info first, then click Recommend.</div>`;
+
+  return `
+  <!-- ACCOUNT SECTION -->
+  <div class="trade-section">
+    <div class="trade-section-header">
+      <div>
+        <div class="trade-section-title">ACCOUNT</div>
+        <div class="trade-section-sub">Current holdings & performance</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <select id="txnMonthSelect" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:5px 10px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px">
+          <option value="">— Month —</option>
+          ${monthOptions}
+        </select>
+        <button class="btn" onclick="showTransactions()">TRANSACTIONS</button>
+      </div>
+    </div>
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden">
+      <table class="trade-account-table">
+        <thead><tr>
+          <th>TICKER</th><th>SHARES</th><th>PURCHASE</th><th>CURRENT</th><th>GAIN/LOSS</th><th>%</th>
+        </tr></thead>
+        <tbody>${holdingsRows}</tbody>
+      </table>
+    </div>
+    <div class="trade-summary-bar">
+      <div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">CASH BALANCE</div>
+        <div class="trade-balance-big">${fmt$(balance)}</div>
+      </div>
+      <div style="text-align:center">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">PORTFOLIO VALUE</div>
+        <div class="trade-balance-big">${fmt$(totalValue)}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">TOTAL P&L</div>
+        <div class="trade-balance-big ${glClass}">${fmt$(totalGL)}</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- IDENTIFY SECTION -->
+  <div class="trade-section">
+    <div class="trade-section-header">
+      <div>
+        <div class="trade-section-title">IDENTIFY</div>
+        <div class="trade-section-sub">Top dream candidates + current holdings · max 15 tickers${data.identifiedAt ? ' · ' + data.identifiedAt : ''}</div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn" id="tradeIdentifyBtn" onclick="runTradeOp('identify', this)">IDENTIFY</button>
+        <button class="btn btn-primary" id="tradeFetchBtn" onclick="runTradeOp('fetch', this)">FETCH INFO</button>
+      </div>
+    </div>
+    ${identifiedHtml}
+  </div>
+
+  <!-- RECOMMEND SECTION -->
+  <div class="trade-section">
+    <div class="trade-section-header">
+      <div>
+        <div class="trade-section-title">RECOMMEND</div>
+        <div class="trade-section-sub">Scores all candidates · suggests ≤5 buys + sells · auto-executes${lastRec ? ' · ' + lastRec.scoredAt : ''}</div>
+      </div>
+      <button class="btn btn-primary" id="tradeRecommendBtn" onclick="runTradeOp('recommend', this)">RECOMMEND</button>
+    </div>
+    ${recHtml}
+  </div>
+
+  <!-- TRANSACTIONS MODAL -->
+  <div class="modal-overlay" id="txnModal">
+    <div class="modal" style="width:720px">
+      <div class="modal-header">
+        <div>
+          <div class="modal-title">TRANSACTIONS</div>
+          <div class="modal-subtitle" id="txnModalSub">All transactions</div>
+        </div>
+        <button class="modal-close" onclick="document.getElementById('txnModal').classList.remove('visible')">✕</button>
+      </div>
+      <div id="txnModalBody"></div>
+    </div>
+  </div>
+  `;
+}
+
+function renderTradeDetailExpand(d) {
+  const metrics = [
+    ['Price', fmt$(d.price)],
+    ['RSI 14', d.rsi14 != null ? d.rsi14 : '—'],
+    ['MA50', fmt$(d.ma50)],
+    ['BB%B', d.bbPercent != null ? d.bbPercent : '—'],
+    ['1d Chg', fmtPct(d.change1d)],
+    ['7d Chg', fmtPct(d.change7d)],
+    ['30d Chg', fmtPct(d.change30d)],
+    ['Rev Growth', d.revenueGrowth != null ? d.revenueGrowth + '%' : '—'],
+    ['Gross Margin', d.grossMargin != null ? d.grossMargin + '%' : '—'],
+    ['FCF', d.fcf != null ? fmtNum(d.fcf) : '—'],
+    ['P/E', d.peRatio != null ? d.peRatio : '—'],
+    ['Fwd P/E', d.forwardPE != null ? d.forwardPE : '—'],
+    ['ROE', d.returnOnEquity != null ? d.returnOnEquity + '%' : '—'],
+    ['D/E', d.debtToEquity != null ? d.debtToEquity : '—'],
+    ['Analyst Target', fmt$(d.analystTarget)],
+    ['Upside', d.analystUpside != null ? fmtPct(d.analystUpside) : '—'],
+    ['Inst. %', d.institutionalPct != null ? d.institutionalPct + '%' : '—'],
+    ['Insider %', d.insiderPct != null ? d.insiderPct + '%' : '—'],
+    ['Short Float', d.shortFloat != null ? d.shortFloat + '%' : '—'],
+    ['Insider 90d', d.insiderNet || '—'],
+    ['Analyst Rec', d.recommendation || '—'],
+  ];
+  const grid = metrics.map(([label, val]) => `
+    <div class="trade-detail-metric">
+      <div class="tdm-label">${label}</div>
+      <div class="tdm-value">${val}</div>
+    </div>`).join('');
+  return `
+    <div style="font-size:11px;color:var(--muted);margin-bottom:8px">${d.name || ''} · ${d.sector || ''} · ${d.industry || ''}</div>
+    <div class="trade-detail-grid" style="grid-template-columns:repeat(6,1fr)">${grid}</div>
+    ${d.description ? `<div style="font-size:11px;color:var(--muted);font-style:italic;margin-top:8px;line-height:1.5">${d.description}</div>` : ''}
+  `;
+}
+
+function renderTradeRecommend(rec) {
+  const buys = rec.buys || [];
+  const sells = rec.sells || [];
+  const scored = rec.scored || [];
+
+  const buyCards = buys.length === 0
+    ? `<div style="color:var(--muted);font-size:11px">No buys executed.</div>`
+    : buys.map(b => `
+      <div class="trade-recommend-card buy">
+        <div style="display:flex;align-items:center;margin-bottom:6px">
+          <span class="trade-action-badge buy">BUY</span>
+          <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:16px">${b.ticker}</span>
+        </div>
+        <div style="font-size:12px;color:var(--muted)">${b.shares} shares @ ${fmt$(b.price)} · Cost: ${fmt$(b.amount)} · Balance after: ${fmt$(b.balance)}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">${b.reason}</div>
+      </div>`).join('');
+
+  const sellCards = sells.length === 0
+    ? `<div style="color:var(--muted);font-size:11px">No sells executed.</div>`
+    : sells.map(s => `
+      <div class="trade-recommend-card sell">
+        <div style="display:flex;align-items:center;margin-bottom:6px">
+          <span class="trade-action-badge sell">SELL</span>
+          <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:16px">${s.ticker}</span>
+        </div>
+        <div style="font-size:12px;color:var(--muted)">${s.shares} shares @ ${fmt$(s.price)} · Proceeds: ${fmt$(s.amount)} · Balance after: ${fmt$(s.balance)}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">${s.reason}</div>
+      </div>`).join('');
+
+  const scoreRows = scored.map((s, i) => `
+    <tr>
+      <td>${i+1}</td>
+      <td style="font-family:'Syne',sans-serif;font-weight:700">${s.ticker}</td>
+      <td>${s.dreamScore}</td>
+      <td>${s.techScore}</td>
+      <td style="font-weight:700;color:var(--accent)">${s.composite}</td>
+      <td>${s.isHeld ? '<span style="color:var(--up)">✓ held</span>' : '—'}</td>
+    </tr>`).join('');
+
+  return `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
+      <div>
+        <div style="font-size:10px;letter-spacing:1px;color:var(--up);margin-bottom:10px">BUYS EXECUTED</div>
+        ${buyCards}
+      </div>
+      <div>
+        <div style="font-size:10px;letter-spacing:1px;color:var(--down);margin-bottom:10px">SELLS EXECUTED</div>
+        ${sellCards}
+      </div>
+    </div>
+    <div style="font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:10px">COMPOSITE SCORES</div>
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+      <table class="trade-txn-table">
+        <thead><tr><th>#</th><th>TICKER</th><th>DREAM</th><th>TECH</th><th>COMPOSITE</th><th>STATUS</th></tr></thead>
+        <tbody>${scoreRows}</tbody>
+      </table>
+    </div>`;
+}
+
+function toggleTradeDetail(id) {
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle('open');
+}
+
+function showTransactions() {
+  const month = document.getElementById('txnMonthSelect').value;
+  const modal = document.getElementById('txnModal');
+  const body = document.getElementById('txnModalBody');
+  const sub = document.getElementById('txnModalSub');
+
+  fetch('/trade').then(r => r.json()).then(data => {
+    let txns = data.transactions || [];
+    if (month) {
+      txns = txns.filter(t => t.date && t.date.startsWith(month));
+      sub.textContent = 'Transactions for ' + month;
+    } else {
+      sub.textContent = 'All transactions (' + txns.length + ')';
+    }
+    txns = [...txns].reverse();
+
+    if (txns.length === 0) {
+      body.innerHTML = '<div style="color:var(--muted);padding:20px;text-align:center">No transactions found.</div>';
+    } else {
+      const rows = txns.map(t => {
+        const isBuy = t.action === 'BUY';
+        const cls = isBuy ? 'up' : 'down';
+        return `<tr>
+          <td>${t.date || '—'}</td>
+          <td><span class="trade-action-badge ${isBuy?'buy':'sell'}">${t.action}</span></td>
+          <td style="font-family:'Syne',sans-serif;font-weight:700">${t.ticker}</td>
+          <td>${t.shares}</td>
+          <td>${fmt$(t.price)}</td>
+          <td class="${cls}">${fmt$(t.amount)}</td>
+          <td>${fmt$(t.balance)}</td>
+        </tr>`;
+      }).join('');
+      body.innerHTML = `
+        <table class="trade-txn-table">
+          <thead><tr><th>DATE</th><th>ACTION</th><th>TICKER</th><th>SHARES</th><th>PRICE</th><th>AMOUNT</th><th>BALANCE</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+    modal.classList.add('visible');
+    console.log('[Trade] transactions modal opened | month:' + (month||'all') + ' count:' + txns.length);
+  }).catch(e => {
+    body.innerHTML = '<div style="color:var(--down)">Failed to load transactions.</div>';
+    console.error('[Trade] transactions FAIL:', e);
+  });
+}
+
+async function runTradeOp(op, btn) {
+  if (btn.disabled) return;
+  const orig = btn.textContent;
+  btn.textContent = '⏳';
+  btn.disabled = true;
+  console.log('[Trade] op started:', op);
+  try {
+    const res = await fetch('/trade/' + op, {method: 'POST'});
+    if (!res.ok) {
+      const err = await res.json();
+      console.error('[Trade] op rejected:', op, err);
+      btn.textContent = orig;
+      btn.disabled = false;
+      return;
+    }
+    // Poll until done
+    let attempts = 0;
+    const poll = setInterval(async () => {
+      attempts++;
+      try {
+        const s = await fetch('/status').then(r => r.json());
+        console.log('[Trade] poll:', op, '| running:', s.running, '| msg:', s.message);
+        if (!s.running || attempts > 120) {
+          clearInterval(poll);
+          btn.textContent = orig;
+          btn.disabled = false;
+          loadTrade(true);
+          console.log('[Trade] op complete:', op);
+        }
+      } catch(e) {
+        clearInterval(poll);
+        btn.textContent = orig;
+        btn.disabled = false;
+        console.error('[Trade] poll FAIL:', e);
+      }
+    }, 3000);
+  } catch(e) {
+    btn.textContent = orig;
+    btn.disabled = false;
+    console.error('[Trade] op FAIL:', op, e);
+  }
+}
+
+async function resetTradeSimulation(btn) {
+  if (!confirm('Reset trade simulation? This wipes all holdings, trades, and resets balance to $100,000.')) return;
+  btn.disabled = true;
+  btn.textContent = '⏳';
+  try {
+    const res = await fetch('/trade/reset', {method: 'POST'});
+    const data = await res.json();
+    console.log('[Trade] reset complete | balance:', data.balance);
+    btn.textContent = 'RESET';
+    btn.disabled = false;
+    if (tradeLoaded) loadTrade(true);
+  } catch(e) {
+    btn.textContent = 'RESET';
+    btn.disabled = false;
+    console.error('[Trade] reset FAIL:', e);
+  }
+}
+
+// ── TRADEAI SIMULATION ────────────────────────────────────────────────────────
+
+let tradeAILoaded = false;
+
+async function loadTradeAI(force) {
+  if (tradeAILoaded && !force) return null;
+  const el = document.getElementById('tradeaiContent');
+  el.innerHTML = '<div class="loading">Loading TradeAI simulation...</div>';
+  try {
+    const res = await fetch('/tradeai');
+    const data = await res.json();
+    el.innerHTML = renderTradeAI(data);
+    tradeAILoaded = true;
+    console.log('[TradeAI] loaded | balance:' + data.balance + ' holdings:' + (data.holdings||[]).length + ' assessed:' + Object.keys(data.aiAssessments||{}).length);
+    return data;
+  } catch(e) {
+    el.innerHTML = '<span style="color:var(--down)">Failed to load TradeAI data.</span>';
+    console.error('[TradeAI] load FAIL:', e);
+    return null;
+  }
+}
+
+async function refreshAccountPrices(btn) {
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳ REFRESHING';
+  try {
+    const r = await fetch('/tradeai/refresh_prices', { method: 'POST' });
+    const d = await r.json();
+    if (d.error) { alert('Price refresh failed: ' + d.error); }
+    else { await _refreshTradeViews(); return; } // re-render replaces this button
+  } catch(e) { alert('Price refresh failed: ' + e.message); }
+  btn.disabled = false; btn.textContent = orig;
+}
+
+function renderTradeAI(data) {
+  const holdings = data.holdings || [];
+  const transactions = data.transactions || [];
+  const identified = data.identified || [];
+  const details = data.details || {};
+  const aiAssessments = data.aiAssessments || {};
+  const lastRec = data.lastRecommend || null;
+  const balance = data.balance ?? 100000;
+  const newsTsMap = data.newsTsMap || {};
+
+  let totalCost = 0, totalValue = 0;
+  holdings.forEach(h => {
+    totalCost += (h.purchasePrice||0) * (h.shares||0);
+    totalValue += (h.currentPrice||h.purchasePrice||0) * (h.shares||0);
+  });
+  const totalGL = totalValue - totalCost;
+  const glClass = totalGL >= 0 ? 'up' : 'down';
+
+  const months = [...new Set(transactions.map(t => t.date ? t.date.slice(0,7) : null).filter(Boolean))].sort().reverse();
+  const monthOptions = months.map(m => `<option value="${m}">${m}</option>`).join('');
+
+  const holdingsRows = holdings.length === 0
+    ? `<tr><td colspan="14" style="color:var(--muted);text-align:center;padding:20px">No holdings yet. Run Identify → Fetch Info → AI Analyze → Recommend.</td></tr>`
+    : holdings.map(h => {
+        const gl = h.gainLoss;
+        const glPct = h.gainLossPct;
+        const glCls = (gl||0) >= 0 ? 'up' : 'down';
+        function dayPct(val) {
+          if (val == null) return '<td style="color:var(--muted);text-align:right">—</td>';
+          const cls = val >= 0 ? 'var(--up)' : 'var(--down)';
+          return '<td style="color:' + cls + ';text-align:right;font-family:\'DM Mono\',monospace;font-size:11px">' + (val >= 0 ? '+' : '') + val.toFixed(2) + '%</td>';
+        }
+        const tickerSafe = h.ticker.replace(/'/g, "\\'");
+        return `<tr>
+          <td><span style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px">${h.ticker}</span></td>
+          <td>${h.shares}</td>
+          <td>${fmt$(h.purchasePrice)}</td>
+          <td>${fmt$(h.previousClose)}</td>
+          <td>${fmt$(h.currentPrice)}</td>
+          ` + dayPct(h.dayChangePct) + `
+          <td class="${glCls}">${fmt$(gl)}</td>
+          <td class="${glCls}">${fmtPct(glPct)}</td>
+          ` + dayPct(h.change5d) + dayPct(h.change4d) + dayPct(h.change3d) + dayPct(h.change2d) + dayPct(h.change1d) + `
+          <td><button onclick="event.stopPropagation();editHolding('${tickerSafe}',${h.shares},${h.purchasePrice})" style="font-size:10px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer">✏️</button></td>
+        </tr>`;
+      }).join('');
+
+  // Signal badge helper
+  function signalBadge(sig) {
+    const colors = {
+      'Strong Buy': '#4ade80', 'Buy': '#86efac',
+      'Hold': '#fbbf24', 'Avoid': '#f87171', 'Unknown': '#6b7280'
+    };
+    const c = colors[sig] || '#6b7280';
+    return `<span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${c}22;color:${c};border:1px solid ${c}44;font-weight:700">${sig||'—'}</span>`;
+  }
+
+  function trajectoryIcon(t) {
+    if (t === 'Accelerating') return '🚀';
+    if (t === 'Stable') return '➡️';
+    if (t === 'Decelerating') return '📉';
+    return '—';
+  }
+
+  const signalFcMap = data.signalFcMap || {};
+
+  const identifiedHtml = identified.length === 0
+    ? `<div style="color:var(--muted);padding:16px">No candidates yet. Click Identify.</div>`
+    : `<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden">` +
+      identified.map((item, i) => {
+        const d = details[item.ticker];
+        const ai = aiAssessments[item.ticker];
+        const newsTs = newsTsMap[item.ticker];
+        const hasDetail = !!d;
+        const hasAI = !!ai;
+        const fetchTs = d ? d.fetchCompletedAt : null;
+        const recBuys  = (lastRec && lastRec.buys)  ? lastRec.buys.map(b => b.ticker || b)  : [];
+        const recSells = (lastRec && lastRec.sells) ? lastRec.sells.map(s => s.ticker || s) : [];
+        const inAccount = holdings.some(h => h.ticker === item.ticker);
+        const recAction = recBuys.includes(item.ticker) ? 'BUY' : recSells.includes(item.ticker) ? 'SELL' : null;
+        const recColor  = recAction === 'BUY' ? 'var(--up)' : recAction === 'SELL' ? 'var(--down)' : 'var(--muted)';
+        const recExtra = recAction
+          ? '<span style="font-size:9px;font-weight:700;color:' + recColor + '">' + recAction + '</span>' + (inAccount ? ' <span style="font-size:9px;color:var(--up)">★ held</span>' : '')
+          : (inAccount ? '<span style="font-size:9px;color:var(--up)">★ held</span>' : '');
+        function pipeRow(icon, label, tsVal, extra) {
+          return '<div style="display:flex;align-items:center;gap:5px;font-size:9px;line-height:1.8">'
+            + '<span style="color:var(--muted);min-width:10px">' + icon + '</span>'
+            + '<span style="color:var(--muted);min-width:62px;letter-spacing:0.3px">' + label + '</span>'
+            + '<span style="color:var(--accent);font-family:\'DM Mono\',monospace">' + (tsVal ? tsVal.slice(0,16) : '—') + '</span>'
+            + (extra ? '<span style="margin-left:4px">' + extra + '</span>' : '')
+            + '</div>';
+        }
+        return `
+        <div class="trade-candidate-row" onclick="toggleTradeDetail('tai-${i}')">
+          <div style="min-width:175px">
+            <div class="trade-candidate-ticker" style="margin-bottom:4px">${item.ticker}</div>
+            ` + pipeRow('①','IDENTIFY', data.identifiedAt, '') + `
+            ` + pipeRow('②','FETCH INFO', data.detailsFetchedAt, '') + `
+            ` + pipeRow('③','MACRO', data.macroFetchedAt, '') + `
+            ` + pipeRow('④','AI ANALYZE', data.aiAnalyzedAt, '') + `
+            ` + pipeRow('⑤','RECOMMEND', lastRec ? lastRec.scoredAt : null, recExtra) + `
+          </div>
+          <div style="flex:1">
+            <div class="trade-candidate-reason">${item.reason || '—'}</div>
+            ${hasAI ? `<div style="display:flex;gap:6px;align-items:center;margin-top:4px">${signalBadge(ai.buySignal)}<span style="font-size:10px;color:var(--muted)">${trajectoryIcon(ai.trajectory)} ${ai.trajectory||''} · ${ai.stage||''}</span></div>` : ''}
+          </div>
+          <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
+            ${(()=>{const bkt=item.bucket||'';const bktColors={'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','Insider':'#f97316','Account':'#4ade80','Dream':'#6b7280'};const bc=bktColors[bkt]||'#6b7280';return bkt?`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt.toUpperCase()}</span>`:''})()}
+            ${hasAI && ai.aiScore != null ? `<span style="font-size:12px;font-weight:800;color:var(--accent);font-family:'DM Mono',monospace">${ai.aiScore}<span style="font-size:9px;color:var(--muted)">/100</span></span>` : ''}
+            <span class="trade-candidate-source">${item.source || ''}</span>
+            <button onclick="event.stopPropagation();refreshTickerNews('${item.ticker}', this)" style="font-size:9px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">🔄 NEWS</button>
+            <span id="news-ts-${item.ticker}" style="font-size:9px;color:var(--muted)">${newsTs ? newsTs.slice(0,16) : 'no news'}</span>
+          </div>
+        </div>
+        <div class="trade-detail-expand" id="tai-${i}">
+          ${hasDetail ? renderTradeDetailExpand(d) : '<div style="color:var(--muted);font-size:11px;margin-bottom:8px">No detail fetched yet. Run Fetch Info.</div>'}
+          ${hasAI ? `<div style="margin-top:12px;padding:12px 14px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:6px">📋 PROMPT SENT TO AI</div><pre style="font-size:10px;color:var(--muted);white-space:pre-wrap;line-height:1.5;margin:0;font-family:'DM Mono',monospace">${ai.promptSent ? ai.promptSent.replace(/</g,'&lt;').replace(/>/g,'&gt;') : '(prompt not saved — backend did not return promptSent)'}</pre></div>` : ''}
+          ${hasAI ? renderAIAssessment(ai) : '<div style="color:var(--muted);font-size:11px">No AI analysis yet. Run AI Analyze.</div>'}
+        </div>`;
+      }).join('') + `</div>`;
+
+  const recHtml = lastRec
+    ? renderTradeAIRecommend(lastRec, identified)
+    : `<div style="color:var(--muted);padding:16px">No recommendation yet. Complete all steps then click Recommend.</div>`;
+
+  // Signal forecast today snapshot
+  const todayFc = (() => { try { const d = new Date().toISOString().slice(0,10); return null; } catch(e){ return null; } })();
+
+  return `
+  <!-- TRADEAI TOP CONTROL BAR -->
+  <div style="display:grid;grid-template-columns:repeat(5,1fr) auto;gap:12px;margin-bottom:28px;align-items:start">
+    ${['identify','fetch','macro','analyze','recommend'].map((op, i) => {
+      const labels  = ['IDENTIFY','FETCH INFO','REFRESH MACRO','AI ANALYZE','RECOMMEND'];
+      const ops     = ['identify','fetch','macro','analyze','recommend'];
+      const tsKeys  = ['identifiedAt','detailsFetchedAt','macroFetchedAt','aiAnalyzedAt','lastRecommendAt'];
+      const tsVals  = [data.identifiedAt, data.detailsFetchedAt, data.macroFetchedAt, data.aiAnalyzedAt, (data.lastRecommend||{}).scoredAt];
+      const lastTs  = tsVals[i] || null;
+      return `
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <button
+          id="tai-btn-${ops[i]}"
+          onclick="runTradeAIOp('${ops[i]}', this)"
+          style="font-family:'DM Mono',monospace;font-size:12px;font-weight:700;padding:10px 0;border-radius:8px;cursor:pointer;border:2px solid var(--warn);background:rgba(251,191,36,0.08);color:var(--warn);letter-spacing:0.5px;transition:all 0.3s;width:100%">
+          ${labels[i]}
+        </button>
+        <div style="font-size:10px;color:var(--muted);text-align:center" id="tai-ts-${ops[i]}">
+          ${lastTs ? '✓ ' + lastTs : '— not run —'}
+        </div>
+      </div>`;
+    }).join('')}
+    <div style="display:flex;flex-direction:column;gap:6px;justify-content:flex-start">
+      <button id="taiStopBtn" onclick="stopOperation()" style="display:none;font-family:'DM Mono',monospace;font-size:12px;font-weight:700;padding:10px 14px;border-radius:8px;cursor:pointer;border:2px solid var(--down);background:rgba(239,68,68,0.12);color:var(--down);letter-spacing:0.5px;white-space:nowrap">🛑 STOP</button>
+      <div style="font-size:10px;color:var(--muted);text-align:center" id="taiStopLabel"></div>
+    </div>
+  </div>
+
+
+  <!-- SCORING MATRIX PANEL -->
+  <div id="scoringMatrixPanel" style="margin-bottom:24px;border:1px solid var(--border);border-radius:12px;overflow:hidden">
+    <div onclick="toggleScoringMatrix()" style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;cursor:pointer;background:var(--surface);user-select:none">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:14px">⚙️</span>
+        <div>
+          <div style="font-family:'Syne',sans-serif;font-weight:700;font-size:13px">SCORING MATRIX</div>
+          <div style="font-size:10px;color:var(--muted);margin-top:1px">Tweak all weights, bonuses & thresholds used in Recommend scoring</div>
+        </div>
+      </div>
+      <span id="scoringMatrixArrow" style="color:var(--muted);font-size:12px">▸ expand</span>
+    </div>
+    <div id="scoringMatrixBody" style="display:none;padding:20px;background:var(--surface2)">
+      <div style="color:var(--muted);font-size:12px">Loading scoring config...</div>
+    </div>
+  </div>
+
+  ${buildRollbackBanner(data.rollbackProposal)}
+
+  <!-- ACCOUNT SECTION -->
+  <div class="trade-section">
+    <div class="trade-section-header">
+      <div>
+        <div class="trade-section-title">🤖 TRADEAI ACCOUNT</div>
+        <div class="trade-section-sub">AI-driven simulation · separate $100k account</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <select id="aiTxnMonthSelect" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:5px 10px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px">
+          <option value="">— Month —</option>
+          ${monthOptions}
+        </select>
+        <button class="btn" onclick="refreshAccountPrices(this)">↻ REFRESH PRICES</button>
+        <button class="btn" onclick="showAITransactions()">TRANSACTIONS</button>
+        <button class="btn" onclick="showAIReport()">📊 REPORT</button>
+        <button class="btn" onclick="showAIInsights()">🧠 INSIGHTS</button>
+        <button class="btn" style="color:var(--warn);border-color:var(--warn)" onclick="showReportReset()">🗑 REPORT RESET</button>
+        <button class="btn" style="color:var(--down);border-color:var(--down)" onclick="resetTradeAISimulation(this)">RESET</button>
+      </div>
+    </div>
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden">
+      <table class="trade-account-table">
+        <thead><tr><th>TICKER</th><th>SHARES</th><th>PURCHASE</th><th>YEST CLOSE</th><th>CURRENT</th><th style="text-align:right">TODAY %</th><th>GAIN/LOSS</th><th>%</th><th style="text-align:right">D-5</th><th style="text-align:right">D-4</th><th style="text-align:right">D-3</th><th style="text-align:right">D-2</th><th style="text-align:right">D-1</th><th></th></tr></thead>
+        <tbody>${holdingsRows}</tbody>
+      </table>
+    </div>
+    <div class="trade-summary-bar">
+      <div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">CASH BALANCE</div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <div class="trade-balance-big">${fmt$(balance)}</div>
+          <button onclick="editBalance(${balance})" style="font-size:10px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer">✏️</button>
+        </div>
+      </div>
+      <div style="text-align:center">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">COST BASIS</div>
+        <div class="trade-balance-big">${fmt$(totalCost)}</div>
+      </div>
+      <div style="text-align:center">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">PORTFOLIO VALUE</div>
+        <div class="trade-balance-big">${fmt$(totalValue)}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">TOTAL P&L</div>
+        <div class="trade-balance-big ${glClass}">${fmt$(totalGL)}</div>
+        <div style="font-size:11px;color:var(--${glClass});font-family:'DM Mono',monospace;margin-top:2px">${totalValue > 0 ? ((totalGL/totalValue)*100).toFixed(2) + '% of portfolio' : '—'}</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- IDENTIFY / CANDIDATES SECTION -->
+  <div class="trade-section">
+    <div class="trade-section-header">
+      <div>
+        <div class="trade-section-title">CANDIDATES</div>
+        <div class="trade-section-sub">Holdings + top dream scorers · max 15${data.identifiedAt ? ' · last run: ' + data.identifiedAt : ''}</div>
+      </div>
+    </div>
+    ${identifiedHtml}
+  </div>
+
+  <!-- RECOMMEND SUMMARY SECTION -->
+  <div class="trade-section">
+    <div class="trade-section-header">
+      <div>
+        <div class="trade-section-title">📋 LAST RECOMMENDATION</div>
+        <div class="trade-section-sub">What was bought and sold — and why${lastRec && lastRec.scoredAt ? ' · ' + lastRec.scoredAt : ''}</div>
+      </div>
+    </div>
+    ${recHtml}
+  </div>
+
+  <!-- TRANSACTIONS MODAL -->
+  <div class="modal-overlay" id="aiTxnModal">
+    <div class="modal" style="width:720px">
+      <div class="modal-header">
+        <div>
+          <div class="modal-title">TRADEAI TRANSACTIONS</div>
+          <div class="modal-subtitle" id="aiTxnModalSub">All transactions</div>
+        </div>
+        <button class="modal-close" onclick="document.getElementById('aiTxnModal').classList.remove('visible')">✕</button>
+      </div>
+      <div id="aiTxnModalBody"></div>
+    </div>
+  </div>
+  `;
+}
+
+function renderAIAssessment(ai) {
+  if (!ai) return '';
+  const sigColors = {'Strong Buy':'#4ade80','Buy':'#86efac','Hold':'#fbbf24','Avoid':'#f87171','Unknown':'#6b7280'};
+  const c = sigColors[ai.buySignal] || '#6b7280';
+  return `
+  <div style="margin-top:12px;padding:12px 14px;background:rgba(139,92,246,0.05);border:1px solid rgba(139,92,246,0.2);border-radius:8px">
+    <div style="font-size:10px;letter-spacing:1px;color:#a78bfa;margin-bottom:8px">🤖 AI ASSESSMENT</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+      <div class="trade-detail-metric" style="flex:none">
+        <div class="tdm-label">BUY SIGNAL</div>
+        <div class="tdm-value" style="color:${c}">${ai.buySignal||'—'}</div>
+      </div>
+      <div class="trade-detail-metric" style="flex:none">
+        <div class="tdm-label">AI SCORE</div>
+        <div class="tdm-value">${ai.aiScore != null ? ai.aiScore + '/100' : '—'}</div>
+      </div>
+      <div class="trade-detail-metric" style="flex:none">
+        <div class="tdm-label">TRAJECTORY</div>
+        <div class="tdm-value">${ai.trajectory||'—'}</div>
+      </div>
+      <div class="trade-detail-metric" style="flex:none">
+        <div class="tdm-label">STAGE</div>
+        <div class="tdm-value">${ai.stage||'—'}</div>
+      </div>
+      <div class="trade-detail-metric" style="flex:none">
+        <div class="tdm-label">SENTIMENT</div>
+        <div class="tdm-value">${ai.sentiment||'—'}</div>
+      </div>
+      <div class="trade-detail-metric" style="flex:none">
+        <div class="tdm-label">NEWS SENTIMENT</div>
+        <div class="tdm-value">${ai.newsSentiment||'—'}</div>
+      </div>
+      <div class="trade-detail-metric" style="flex:none">
+        <div class="tdm-label">CONFIDENCE</div>
+        <div class="tdm-value">${ai.confidence||'—'}</div>
+      </div>
+    </div>
+    ${ai.reasoning ? `<div style="font-size:11px;color:var(--muted);line-height:1.6;font-style:italic">${ai.reasoning}</div>` : ''}
+  </div>`;
+}
+
+function showRecommendSummary(rec) {
+  const buys = rec.buys || [];
+  const sells = rec.sells || [];
+  const skips = rec.skipReasons || [];
+
+  const fmtC = v => v == null ? '—' : Number(v).toFixed(1);
+  const skipRows = skips.map(sk => `
+    <div style="padding:10px 14px;border-radius:8px;background:rgba(107,114,128,0.05);border:1px solid rgba(107,114,128,0.2);margin-bottom:6px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:2px">
+        <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:13px">${sk.ticker}</span>
+        ${sk.bucket ? `<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:rgba(139,92,246,0.1);color:#a78bfa">${sk.bucket}</span>` : ''}
+        <span style="font-size:11px;color:var(--muted)">composite: ${fmtC(sk.composite)}</span>
+      </div>
+      <div style="font-size:11px;color:var(--muted)">${sk.reason}</div>
+    </div>`).join('');
+
+  if (!buys.length && !sells.length) {
+    const modal = document.getElementById('recommendSummaryModal');
+    const body = document.getElementById('recommendSummaryBody');
+    body.innerHTML = skips.length
+      ? `<div style="font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:10px">NO TRADES — ${skips.length} CANDIDATES SKIPPED</div>${skipRows}`
+      : '<div style="color:var(--muted);padding:20px;text-align:center">No trades were executed this cycle. No candidate data available.</div>';
+    modal.classList.add('visible');
+    return;
+  }
+
+  const fmt$ = v => v == null ? '—' : '$' + Number(v).toLocaleString('en-CA', {minimumFractionDigits:2, maximumFractionDigits:2});
+
+  const buyRows = buys.map(b => `
+    <div style="padding:12px 14px;border-radius:8px;background:rgba(74,222,128,0.05);border:1px solid rgba(74,222,128,0.2);margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+        <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(74,222,128,0.15);color:#4ade80;font-weight:700">BUY</span>
+        <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:15px">${b.ticker}</span>
+        <span style="font-size:11px;color:var(--muted)">${b.shares} shares @ ${fmt$(b.price)} · Cost: ${fmt$(b.amount)}</span>
+      </div>
+      <div style="font-size:11px;color:var(--muted);line-height:1.6;font-style:italic">${b.reason || '—'}</div>
+    </div>`).join('');
+
+  const sellRows = sells.map(s => `
+    <div style="padding:12px 14px;border-radius:8px;background:rgba(248,113,113,0.05);border:1px solid rgba(248,113,113,0.2);margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+        <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(248,113,113,0.15);color:#f87171;font-weight:700">SELL</span>
+        <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:15px">${s.ticker}</span>
+        <span style="font-size:11px;color:var(--muted)">${s.shares} shares @ ${fmt$(s.price)} · Proceeds: ${fmt$(s.amount)}</span>
+      </div>
+      <div style="font-size:11px;color:var(--muted);line-height:1.6;font-style:italic">${s.reason || '—'}</div>
+    </div>`).join('');
+
+  const skipSection = skips.length ? `
+    <div style="font-size:10px;letter-spacing:1px;color:var(--muted);margin-top:16px;margin-bottom:10px">⏭️ SKIPPED (${skips.length})</div>${skipRows}` : '';
+
+  const modal = document.getElementById('recommendSummaryModal');
+  const body = document.getElementById('recommendSummaryBody');
+  body.innerHTML = `
+    ${buys.length ? `<div style="font-size:10px;letter-spacing:1px;color:#4ade80;margin-bottom:10px">✅ BOUGHT (${buys.length})</div>${buyRows}` : '<div style="color:var(--muted);font-size:11px;margin-bottom:16px">No buys executed.</div>'}
+    ${sells.length ? `<div style="font-size:10px;letter-spacing:1px;color:#f87171;margin-top:16px;margin-bottom:10px">🔴 SOLD (${sells.length})</div>${sellRows}` : '<div style="color:var(--muted);font-size:11px">No sells executed.</div>'}
+    ${skipSection}
+  `;
+  modal.classList.add('visible');
+}
+
+function renderTradeAIRecommend(rec, identified) {
+  const buys = rec.buys || [];
+  const sells = rec.sells || [];
+  const scored = rec.scored || [];
+
+  // Build lookup: ticker → {bucket, source} from identified candidates
+  const candMap = {};
+  (identified || []).forEach(item => { candMap[item.ticker] = item; });
+
+  const bktColors = {'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','Insider':'#f97316','Account':'#4ade80','Dream':'#6b7280'};
+  function strategyBadge(ticker) {
+    const cand = candMap[ticker];
+    if (!cand) return '';
+    const parts = [];
+    if (cand.bucket) {
+      const bc = bktColors[cand.bucket] || '#6b7280';
+      parts.push(`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${cand.bucket.toUpperCase()}</span>`);
+    }
+    if (cand.source) {
+      parts.push(`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">${cand.source}</span>`);
+    }
+    return parts.join(' ');
+  }
+
+  const buyCards = buys.length === 0
+    ? `<div style="color:var(--muted);font-size:11px">No buys executed.</div>`
+    : buys.map(b => `
+      <div class="trade-recommend-card buy">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">
+          <span class="trade-action-badge buy">BUY</span>
+          <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:16px">${b.ticker}</span>
+          ${strategyBadge(b.ticker)}
+        </div>
+        <div style="font-size:12px;color:var(--muted)">${b.shares} shares @ ${fmt$(b.price)} · Cost: ${fmt$(b.amount)} · Balance after: ${fmt$(b.balance)}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;font-style:italic">${b.reason}</div>
+      </div>`).join('');
+
+  const sellCards = sells.length === 0
+    ? `<div style="color:var(--muted);font-size:11px">No sells executed.</div>`
+    : sells.map(s => `
+      <div class="trade-recommend-card sell">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">
+          <span class="trade-action-badge sell">SELL</span>
+          <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:16px">${s.ticker}</span>
+          ${strategyBadge(s.ticker)}
+        </div>
+        <div style="font-size:12px;color:var(--muted)">${s.shares} shares @ ${fmt$(s.price)} · Proceeds: ${fmt$(s.amount)} · Balance after: ${fmt$(s.balance)}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;font-style:italic">${s.reason}</div>
+      </div>`).join('');
+
+  const sigColors = {'Strong Buy':'#4ade80','Buy':'#86efac','Hold':'#fbbf24','Avoid':'#f87171','Unknown':'#6b7280'};
+  const scoreRows = scored.map((s, i) => {
+    const c = sigColors[s.buySignal] || '#6b7280';
+    const cand = candMap[s.ticker];
+    const bkt = cand && cand.bucket ? cand.bucket : '—';
+    const src = cand && cand.source ? cand.source : '—';
+    const bc = bktColors[bkt] || '#6b7280';
+    return `<tr>
+      <td>${i+1}</td>
+      <td style="font-family:'Syne',sans-serif;font-weight:700">${s.ticker}</td>
+      <td><span style="font-size:9px;padding:2px 6px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt !== '—' ? bkt.toUpperCase() : '—'}</span></td>
+      <td style="font-size:10px;color:var(--muted)">${src}</td>
+      <td>${s.dreamScore}</td>
+      <td>${s.aiScore != null ? s.aiScore : '—'}</td>
+      <td><span style="color:${c};font-size:10px;font-weight:700">${s.buySignal||'—'}</span></td>
+      <td>${s.trajectory||'—'}</td>
+      <td>${s.stage||'—'}</td>
+      <td style="font-weight:700;color:var(--accent)">${s.composite}</td>
+      <td>${s.isHeld ? '<span style="color:var(--up)">✓ held</span>' : '—'}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
+      <div>
+        <div style="font-size:10px;letter-spacing:1px;color:var(--up);margin-bottom:10px">BUYS EXECUTED</div>
+        ${buyCards}
+      </div>
+      <div>
+        <div style="font-size:10px;letter-spacing:1px;color:var(--down);margin-bottom:10px">SELLS EXECUTED</div>
+        ${sellCards}
+      </div>
+    </div>
+    <div style="font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:10px">AI COMPOSITE SCORES</div>
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+      <table class="trade-txn-table">
+        <thead><tr><th>#</th><th>TICKER</th><th>STRATEGY</th><th>SOURCE</th><th>DREAM</th><th>AI</th><th>SIGNAL</th><th>TRAJECTORY</th><th>STAGE</th><th>COMPOSITE</th><th>STATUS</th></tr></thead>
+        <tbody>${scoreRows}</tbody>
+      </table>
+    </div>`;
+}
+
+async function runTradeAIOp(op, btn) {
+  if (btn.disabled) return;
+  const orig = btn.textContent;
+  const stopBtn  = document.getElementById('taiStopBtn');
+  const stopLbl  = document.getElementById('taiStopLabel');
+
+  // ── Macro refresh — calls /macro/refresh and polls status ───────────────
+  if (op === 'macro') {
+    btn.disabled = true;
+    btn.textContent = '⏳ ' + orig;
+    btn.style.animation = 'tai-flash 0.8s ease-in-out infinite';
+    btn.style.borderColor = 'var(--warn)';
+    btn.style.color = 'var(--warn)';
+    btn.style.background = 'rgba(251,191,36,0.12)';
+    try {
+      await fetch('/macro/refresh', {method: 'POST'});
+      const pollMacro = setInterval(async () => {
+        try {
+          const s = await fetch('/status').then(r => r.json());
+          if (!s.running || s.operation !== 'macro') {
+            clearInterval(pollMacro);
+            btn.disabled = false;
+            btn.textContent = orig;
+            btn.style.animation = 'none';
+            btn.style.borderColor = 'var(--border)';
+            btn.style.color = 'var(--muted)';
+            btn.style.background = 'var(--surface2)';
+            const now = new Date().toLocaleString('en-CA', {timeZone:'America/Toronto', hour12:false}).replace(',','');
+            const tsEl = document.getElementById('tai-ts-macro');
+            if (tsEl) tsEl.textContent = '✓ ' + now;
+            updateMacroStatusBadge();
+          }
+        } catch(e) { clearInterval(pollMacro); _resetTradeAIBtn(btn, orig); }
+      }, 2000);
+    } catch(e) {
+      _resetTradeAIBtn(btn, orig);
+      console.error('[TradeAI] macro refresh FAIL:', e);
+    }
+    return;
+  }
+
+  // ── Running state: flashing border ──────────────────────────────────────
+  btn.disabled = true;
+  btn.textContent = '⏳ ' + orig;
+  btn.style.animation = 'tai-flash 0.8s ease-in-out infinite';
+  btn.style.borderColor = 'var(--warn)';
+  btn.style.color = 'var(--warn)';
+  btn.style.background = 'rgba(251,191,36,0.12)';
+  if (stopBtn) { stopBtn.style.display = 'inline-block'; stopBtn.disabled = false; stopBtn.textContent = '🛑 STOP'; }
+  if (stopLbl) stopLbl.textContent = '';
+
+  console.log('[TradeAI] op started:', op);
+  try {
+    const res = await fetch('/tradeai/' + op, {method: 'POST'});
+    if (!res.ok) {
+      const err = await res.json();
+      console.error('[TradeAI] op rejected:', op, err);
+      _resetTradeAIBtn(btn, orig);
+      return;
+    }
+    let attempts = 0;
+    const poll = setInterval(async () => {
+      attempts++;
+      try {
+        const s = await fetch('/status').then(r => r.json());
+        console.log('[TradeAI] poll:', op, '| running:', s.running, '| msg:', s.message, '| progress:', s.current, '/', s.total);
+        // Update inline progress label on the stop button col
+        if (s.running && s.total > 0 && stopLbl) {
+          stopLbl.textContent = s.current + ' / ' + s.total + (s.current_ticker ? ' — ' + s.current_ticker : '');
+        }
+        if (s.running && op === 'identify') { loadTradeAI(true); }
+        if (s.running && op === 'fetch') { loadTradeAI(true); }
+        // analyze: only update progress counter, NOT full reload (avoids baking in partial AI data)
+        if (s.running && op === 'analyze') {
+          const newCount = s.current || 0;
+          window._lastAnalyzeCount = newCount;
+        }
+        if (!s.running || attempts > 180) {
+          clearInterval(poll);
+          // ── Done state: grey ─────────────────────────────────────────────
+          btn.disabled = false;
+          btn.textContent = orig;
+          btn.style.animation = 'none';
+          btn.style.borderColor = 'var(--border)';
+          btn.style.color = 'var(--muted)';
+          btn.style.background = 'var(--surface2)';
+          if (stopBtn) stopBtn.style.display = 'none';
+          if (stopLbl) stopLbl.textContent = '';
+          // Update timestamp label
+          const now = new Date().toLocaleString('en-CA', {timeZone:'America/Toronto', hour12:false}).replace(',','');
+          const tsEl = document.getElementById('tai-ts-' + op);
+          if (tsEl) tsEl.textContent = '✓ ' + now;
+          const reloadedData = await loadTradeAI(true);
+          if (op === 'recommend') {
+            const rec = (reloadedData && reloadedData.lastRecommend) || {};
+            console.log('[TradeAI] recommend summary | buys:', (rec.buys||[]).length, 'sells:', (rec.sells||[]).length);
+            showRecommendSummary(rec);
+          }
+          console.log('[TradeAI] op complete:', op);
+        }
+      } catch(e) {
+        clearInterval(poll);
+        _resetTradeAIBtn(btn, orig);
+        console.error('[TradeAI] poll FAIL:', e);
+      }
+    }, 3000);
+  } catch(e) {
+    _resetTradeAIBtn(btn, orig);
+    console.error('[TradeAI] op FAIL:', op, e);
+  }
+}
+
+function _resetTradeAIBtn(btn, orig) {
+  btn.disabled = false;
+  btn.textContent = orig;
+  btn.style.animation = 'none';
+  btn.style.borderColor = 'var(--warn)';
+  btn.style.color = 'var(--warn)';
+  btn.style.background = 'rgba(251,191,36,0.08)';
+  const stopBtn = document.getElementById('taiStopBtn');
+  const stopLbl = document.getElementById('taiStopLabel');
+  if (stopBtn) stopBtn.style.display = 'none';
+  if (stopLbl) stopLbl.textContent = '';
+}
+
+async function refreshTickerNews(ticker, btn) {
+  const orig = btn.textContent;
+  btn.textContent = '⏳';
+  btn.disabled = true;
+  console.log('[News] refresh started:', ticker);
+  try {
+    const res = await fetch('/news/refresh/' + ticker, {method: 'POST'});
+    const data = await res.json();
+    const tsEl = document.getElementById('news-ts-' + ticker);
+    if (tsEl && data.fetchedAt) tsEl.textContent = data.fetchedAt.slice(0,16);
+    console.log('[News] refresh OK:', ticker, '| count:', data.count, '| ts:', data.fetchedAt);
+  } catch(e) {
+    console.error('[News] refresh FAIL:', ticker, e);
+  }
+  btn.textContent = orig;
+  btn.disabled = false;
+}
+
+async function showAITransactions() {
+  const month = document.getElementById('aiTxnMonthSelect').value;
+  const modal = document.getElementById('aiTxnModal');
+  const body = document.getElementById('aiTxnModalBody');
+  const sub = document.getElementById('aiTxnModalSub');
+  fetch('/tradeai').then(r => r.json()).then(data => {
+    let txns = data.transactions || [];
+    if (month) {
+      txns = txns.filter(t => t.date && t.date.startsWith(month));
+      sub.textContent = 'Transactions for ' + month;
+    } else {
+      sub.textContent = 'All transactions (' + txns.length + ')';
+    }
+    txns = [...txns].reverse();
+    if (txns.length === 0) {
+      body.innerHTML = '<div style="color:var(--muted);padding:20px;text-align:center">No transactions found.</div>';
+    } else {
+      const rows = txns.map((t, origIdx) => {
+        const isBuy = t.action === 'BUY';
+        const cls = isBuy ? 'up' : 'down';
+        const realIdx = (data.transactions || []).length - 1 - origIdx; // reverse index
+        const editBtn = !isBuy
+          ? `<button onclick="editTransaction(${realIdx},'${t.ticker}',${t.price})" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✏️</button>`
+          : '';
+        return `<tr>
+          <td>${t.date||'—'}</td>
+          <td><span class="trade-action-badge ${isBuy?'buy':'sell'}">${t.action}</span></td>
+          <td style="font-family:'Syne',sans-serif;font-weight:700">${t.ticker}</td>
+          <td>${t.shares}</td>
+          <td>${fmt$(t.price)}</td>
+          <td class="${cls}">${fmt$(t.amount)}</td>
+          <td>${fmt$(t.balance)}</td>
+          <td>${editBtn}</td>
+        </tr>`;
+      }).join('');
+      body.innerHTML = `
+        <table class="trade-txn-table">
+          <thead><tr><th>DATE</th><th>ACTION</th><th>TICKER</th><th>SHARES</th><th>PRICE</th><th>AMOUNT</th><th>BALANCE</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+    modal.classList.add('visible');
+    console.log('[TradeAI] transactions modal | month:' + (month||'all') + ' count:' + txns.length);
+  }).catch(e => {
+    body.innerHTML = '<div style="color:var(--down)">Failed to load transactions.</div>';
+    console.error('[TradeAI] transactions FAIL:', e);
+  });
+}
+
+async function editHolding(ticker, currentShares, currentPrice) {
+  const shares = prompt(`Edit shares for ${ticker}:`, currentShares);
+  if (shares === null) return;
+  const price = prompt(`Edit purchase price for ${ticker}:`, currentPrice);
+  if (price === null) return;
+  try {
+    const r = await fetch('/tradeai/edit_holding', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ ticker, shares: parseFloat(shares), purchasePrice: parseFloat(price) })
+    });
+    const d = await r.json();
+    if (d.error) { alert('Error: ' + d.error); return; }
+    console.log('[TradeAI] holding edited:', ticker, shares, price);
+    await loadTradeAI(true);
+  } catch(e) { console.error('[TradeAI] editHolding FAIL:', e); }
+}
+
+async function editBalance(currentBalance) {
+  const val = prompt('Set new cash balance:', currentBalance);
+  if (val === null) return;
+  try {
+    const r = await fetch('/tradeai/edit_balance', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ balance: parseFloat(val) })
+    });
+    const d = await r.json();
+    if (d.error) { alert('Error: ' + d.error); return; }
+    console.log('[TradeAI] balance edited:', d.balance);
+    await loadTradeAI(true);
+  } catch(e) { console.error('[TradeAI] editBalance FAIL:', e); }
+}
+
+async function editTransaction(index, ticker, currentPrice) {
+  const val = prompt(`Edit sell price for ${ticker} (transaction #${index}):`, currentPrice);
+  if (val === null) return;
+  try {
+    const r = await fetch('/tradeai/edit_transaction', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ index, price: parseFloat(val) })
+    });
+    const d = await r.json();
+    if (d.error) { alert('Error: ' + d.error); return; }
+    console.log('[TradeAI] transaction edited: idx', index, 'price', val);
+    await showAITransactions();
+  } catch(e) { console.error('[TradeAI] editTransaction FAIL:', e); }
+}
+
+async function resetTradeAISimulation(btn) {
+  const balStr = prompt('Reset TradeAI simulation.\n\nEnter starting cash balance:', '100000');
+  if (balStr === null) return;
+  const balance = parseFloat(balStr);
+  if (isNaN(balance) || balance < 0) { alert('Invalid balance amount.'); return; }
+  if (!confirm('This will wipe ALL AI holdings, trades and history. Irreversible. Continue?')) return;
+  btn.disabled = true;
+  btn.textContent = '⏳';
+  try {
+    const res = await fetch('/tradeai/reset', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ balance })
+    });
+    const data = await res.json();
+    console.log('[TradeAI] reset complete | balance:', data.balance);
+    btn.textContent = 'RESET';
+    btn.disabled = false;
+    if (tradeAILoaded) loadTradeAI(true);
+  } catch(e) {
+    btn.textContent = 'RESET';
+    btn.disabled = false;
+    console.error('[TradeAI] reset FAIL:', e);
+  }
+}
+
+async function showReportReset() {
+  // Build list of available months from transactions
+  let months = [];
+  try {
+    const data = await fetch('/tradeai').then(r => r.json());
+    const txns = data.transactions || [];
+    const monthSet = new Set(txns.map(t => (t.date || '').slice(0, 7)).filter(Boolean));
+    months = [...monthSet].sort().reverse();
+  } catch(e) {}
+
+  const opts = months.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+  const html = '<div style="padding:24px;min-width:340px">'
+    + '<div style="font-family:\'Syne\',sans-serif;font-size:16px;font-weight:700;margin-bottom:16px;color:var(--warn)">🗑 REPORT RESET</div>'
+    + '<div style="font-size:12px;color:var(--muted);margin-bottom:16px">Delete transactions by month or clear all history. Holdings and balance are not affected.</div>'
+    + (months.length === 0 ? '<div style="color:var(--muted);font-size:12px;margin-bottom:16px">No transactions found.</div>' :
+      '<div style="margin-bottom:12px">'
+      + '<label style="font-size:11px;color:var(--muted);display:block;margin-bottom:6px">SELECT MONTH TO DELETE</label>'
+      + '<select id="reportResetMonth" style="width:100%;padding:8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px">'
+      + opts
+      + '</select></div>'
+      + '<button onclick="doReportReset(false)" style="width:100%;padding:9px;margin-bottom:8px;background:transparent;border:1px solid var(--warn);border-radius:6px;color:var(--warn);font-weight:700;cursor:pointer;font-size:12px">DELETE SELECTED MONTH</button>')
+    + '<button onclick="doReportReset(true)" style="width:100%;padding:9px;margin-bottom:12px;background:transparent;border:1px solid var(--down);border-radius:6px;color:var(--down);font-weight:700;cursor:pointer;font-size:12px">DELETE ALL HISTORY</button>'
+    + '<button onclick="document.getElementById(\'reportResetModal\').remove()" style="width:100%;padding:8px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-size:12px">CANCEL</button>'
+    + '</div>';
+
+  let modal = document.getElementById('reportResetModal');
+  if (modal) modal.remove();
+  modal = document.createElement('div');
+  modal.id = 'reportResetModal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML = '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden">' + html + '</div>';
+  modal.onclick = e => { if (e.target === modal) modal.remove(); };
+  document.body.appendChild(modal);
+}
+
+async function doReportReset(all) {
+  const month = all ? 'all' : (document.getElementById('reportResetMonth')?.value);
+  if (!month) { alert('No month selected.'); return; }
+  const msg = all ? 'Delete ALL transaction history?' : 'Delete all transactions for ' + month + '?';
+  if (!confirm(msg + ' Holdings and balance are not affected.')) return;
+  try {
+    const r = await fetch('/tradeai/delete_transactions', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ month })
+    });
+    const d = await r.json();
+    if (d.error) { alert('Error: ' + d.error); return; }
+    document.getElementById('reportResetModal')?.remove();
+    alert('Removed ' + d.removed + ' transaction(s). ' + d.remaining + ' remaining.');
+    if (tradeAILoaded) loadTradeAI(true);
+  } catch(e) { console.error('[ReportReset] FAIL:', e); }
+}
+
+{%- endraw %}
+</script>
+
+
+<div class="modal-overlay" id="recommendSummaryModal" onclick="if(event.target===this)this.classList.remove('visible')">
+  <div class="modal" style="width:680px;max-height:80vh;overflow-y:auto">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">RECOMMEND SUMMARY</div>
+        <div class="modal-subtitle">What was bought and sold — and why</div>
+      </div>
+      <button class="modal-close" onclick="document.getElementById('recommendSummaryModal').classList.remove('visible')">✕</button>
+    </div>
+    <div id="recommendSummaryBody" style="padding:0 4px 8px"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="followupModal" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title" id="followupTitle"></div>
+        <div class="modal-subtitle" id="followupSubtitle"></div>
+      </div>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div id="followupBody"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="newsModal" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title" id="newsTitle"></div>
+        <div class="modal-subtitle" id="newsSubtitle"></div>
+      </div>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div id="newsBody"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="bankGuideModal" onclick="if(event.target===this)closeModal()">
+  <div class="modal" style="max-width:780px">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title" id="bankGuideTitle">BANK METRICS GUIDE</div>
+        <div class="modal-subtitle">5-step health checklist with benchmarks</div>
+      </div>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="guide-tabs">
+      <div class="guide-tab active" onclick="showGuideTab('checklist', this)">CHECKLIST</div>
+      <div class="guide-tab" onclick="showGuideTab('explained', this)">EXPLAINED</div>
+      <div class="guide-tab" onclick="showGuideTab('benchmarks', this)">BENCHMARKS</div>
+      <div class="guide-tab" onclick="showGuideTab('howto', this)">HOW TO READ</div>
+    </div>
+
+    <div class="guide-tab-panel active" id="guide-checklist">
+      <table class="guide-table">
+        <tr><th>METRIC</th><th>THRESHOLD</th><th>WHY IT MATTERS</th><th>DATA SOURCE</th></tr>
+        <tr>
+          <td>ROE</td>
+          <td><span class="guide-pass">> 12%</span></td>
+          <td>Measures how efficiently the bank generates profit from shareholders' equity. Below 12% = destroying value.</td>
+          <td>Auto-computed</td>
+        </tr>
+        <tr>
+          <td>Loan-to-Deposit (proxy)</td>
+          <td><span class="guide-pass">< 90%</span></td>
+          <td>How much of deposits are lent out. Too high = liquidity risk. Too low = inefficient capital use.</td>
+          <td>Auto-computed</td>
+        </tr>
+        <tr>
+          <td>CET1 Ratio</td>
+          <td><span class="guide-pass">> 10%</span></td>
+          <td>Core capital buffer vs risk-weighted assets. Regulatory minimum. Canadian banks typically 11-13%.</td>
+          <td>Annual Report / Earnings Release</td>
+        </tr>
+        <tr>
+          <td>LCR</td>
+          <td><span class="guide-pass">> 100%</span></td>
+          <td>Liquidity Coverage Ratio — can the bank survive 30 days of stress? Regulatory minimum is 100%.</td>
+          <td>Annual Report (Liquidity section)</td>
+        </tr>
+        <tr>
+          <td>NPL Ratio</td>
+          <td><span class="guide-pass">< 2%</span></td>
+          <td>Non-performing loans as % of total loans. Rising NPL = credit quality deteriorating.</td>
+          <td>Annual Report (Credit Risk section)</td>
+        </tr>
+      </table>
+    </div>
+
+    <div class="guide-tab-panel" id="guide-explained">
+      <table class="guide-table">
+        <tr><th>METRIC</th><th>FULL NAME</th><th>FORMULA</th></tr>
+        <tr>
+          <td>ROE</td>
+          <td>Return on Equity</td>
+          <td>Net Income ÷ Average Shareholders Equity × 100</td>
+        </tr>
+        <tr>
+          <td>Loan-to-Deposit</td>
+          <td>Loan-to-Deposit Ratio (proxy)</td>
+          <td>Total Debt ÷ Total Assets × 100 (proxy — true L/D requires internal data)</td>
+        </tr>
+        <tr>
+          <td>CET1</td>
+          <td>Common Equity Tier 1 Ratio</td>
+          <td>CET1 Capital ÷ Risk-Weighted Assets × 100 (Basel III standard)</td>
+        </tr>
+        <tr>
+          <td>LCR</td>
+          <td>Liquidity Coverage Ratio</td>
+          <td>High-Quality Liquid Assets ÷ Net Cash Outflows over 30 days × 100</td>
+        </tr>
+        <tr>
+          <td>NPL</td>
+          <td>Non-Performing Loan Ratio</td>
+          <td>Non-Performing Loans ÷ Total Loans × 100</td>
+        </tr>
+      </table>
+    </div>
+
+    <div class="guide-tab-panel" id="guide-benchmarks">
+      <table class="guide-table">
+        <tr><th>METRIC</th><th><span class="guide-pass">STRONG</span></th><th><span class="guide-warn">ACCEPTABLE</span></th><th><span class="guide-fail">WEAK</span></th></tr>
+        <tr>
+          <td>ROE</td>
+          <td class="guide-pass">> 15%</td>
+          <td class="guide-warn">12–15%</td>
+          <td class="guide-fail">< 12%</td>
+        </tr>
+        <tr>
+          <td>Loan-to-Deposit</td>
+          <td class="guide-pass">< 75%</td>
+          <td class="guide-warn">75–90%</td>
+          <td class="guide-fail">> 90%</td>
+        </tr>
+        <tr>
+          <td>CET1</td>
+          <td class="guide-pass">> 13%</td>
+          <td class="guide-warn">10–13%</td>
+          <td class="guide-fail">< 10%</td>
+        </tr>
+        <tr>
+          <td>LCR</td>
+          <td class="guide-pass">> 130%</td>
+          <td class="guide-warn">100–130%</td>
+          <td class="guide-fail">< 100%</td>
+        </tr>
+        <tr>
+          <td>NPL Ratio</td>
+          <td class="guide-pass">< 1%</td>
+          <td class="guide-warn">1–2%</td>
+          <td class="guide-fail">> 2%</td>
+        </tr>
+      </table>
+      <div style="margin-top:14px;font-size:11px;color:var(--muted);line-height:1.7">
+        <strong style="color:var(--text)">Canadian Big 6 context:</strong> BMO, RBC, TD, BNS, CM, NA typically maintain CET1 > 12%, LCR > 130%, NPL < 0.5% due to OSFI oversight. Use these as peer benchmarks.
+      </div>
+    </div>
+
+    <div class="guide-tab-panel" id="guide-howto">
+      <div style="font-size:12px;line-height:1.8;color:var(--text)">
+        <div style="margin-bottom:14px">
+          <strong style="color:var(--accent)">Step 1 — Find the Annual Report</strong><br>
+          Go to the bank's Investor Relations page → Annual Reports → Most Recent PDF
+        </div>
+        <div style="margin-bottom:14px">
+          <strong style="color:var(--accent)">Step 2 — Find CET1</strong><br>
+          Search PDF for "CET1" or "Common Equity Tier 1". Usually in Capital Management section. Canadian banks report quarterly via earnings releases too.
+        </div>
+        <div style="margin-bottom:14px">
+          <strong style="color:var(--accent)">Step 3 — Find LCR</strong><br>
+          Search for "Liquidity Coverage Ratio" or "LCR". In Liquidity Risk Management section. Also disclosed in quarterly supplemental packages.
+        </div>
+        <div style="margin-bottom:14px">
+          <strong style="color:var(--accent)">Step 4 — Find NPL</strong><br>
+          Search for "Non-performing" or "Impaired Loans". In Credit Risk section. Usually shown as $ amount — divide by total loans disclosed nearby.
+        </div>
+        <div>
+          <strong style="color:var(--accent)">Step 5 — Quick links for Canadian banks</strong><br>
+          BMO: bmo.com/investor-relations &nbsp;|&nbsp; BNS: scotiabank.com/investors<br>
+          RBC: rbc.com/investorrelations &nbsp;|&nbsp; TD: td.com/investor-relations
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<script>
+{%- raw %}
+// ── MARKET ALERT POLLING ───────────────────────────────────────────────────
+(function() {
+  const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+  const MARKET_OPEN_ET  = { h: 9,  m: 30 };
+  const MARKET_CLOSE_ET = { h: 16, m: 0  };
+  let alertDismissed = false;
+  let pollTimer = null;
+
+  const LEVEL_STYLES = {
+    severe:  { bg: '#7f1d1d', border: '#ef4444', color: '#fecaca', icon: '🚨' },
+    warning: { bg: '#78350f', border: '#f59e0b', color: '#fde68a', icon: '⚠️' },
+    watch:   { bg: '#1e3a5f', border: '#3b82f6', color: '#bfdbfe', icon: '👁️' },
+    normal:  { bg: '#14532d', border: '#22c55e', color: '#bbf7d0', icon: '✅' },
+  };
+
+  function isMarketHours() {
+    const now = new Date();
+    const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const day = et.getDay();
+    if (day === 0 || day === 6) return false;
+    const mins = et.getHours() * 60 + et.getMinutes();
+    const open  = MARKET_OPEN_ET.h  * 60 + MARKET_OPEN_ET.m;
+    const close = MARKET_CLOSE_ET.h * 60 + MARKET_CLOSE_ET.m;
+    return mins >= open && mins < close;
+  }
+
+  function renderBanner(d) {
+    const banner = document.getElementById('marketAlertBanner');
+    if (!banner) return;
+
+    if (!d.alert && d.level !== 'watch') {
+      banner.style.display = 'none';
+      console.log('[MarketAlert] no alert | spxChange:' + (d.spxChange * 100).toFixed(2) + '% | cached:' + d.cached);
+      return;
+    }
+
+    if (alertDismissed && d.level === 'normal') return;
+
+    const style = LEVEL_STYLES[d.level] || LEVEL_STYLES.normal;
+    const chgPct = (d.spxChange * 100).toFixed(2);
+    const sign = d.spxChange >= 0 ? '+' : '';
+
+    banner.style.display = 'block';
+    banner.style.background = style.bg;
+    banner.style.borderBottomColor = style.border;
+    banner.style.color = style.color;
+
+    document.getElementById('alertIcon').textContent = style.icon;
+    document.getElementById('alertHeadline').textContent =
+      `S&P 500 ${sign}${chgPct}% · $${d.spxPrice.toLocaleString()}`;
+
+    const vixEl = document.getElementById('alertVix');
+    if (d.vix) {
+      vixEl.textContent = `VIX ${d.vix.toFixed(1)}${d.vixFear ? ' ⚡ FEAR' : ''}`;
+      vixEl.style.background = d.vixFear ? 'rgba(239,68,68,0.25)' : 'rgba(0,0,0,0.2)';
+    } else {
+      vixEl.textContent = '';
+    }
+
+    document.getElementById('alertCause').textContent = d.cause || '';
+    document.getElementById('alertCheckedAt').textContent = d.checkedAt ? '⏱ ' + d.checkedAt : '';
+
+    console.log('[MarketAlert] banner shown | level:' + d.level + ' spxChange:' + sign + chgPct + '% vix:' + d.vix + ' cause:' + (d.cause ? d.cause.substring(0,60) : 'none') + ' cached:' + d.cached + ' stale:' + (d.stale||false));
+  }
+
+  async function checkMarketAlert() {
+    if (!isMarketHours()) {
+      console.log('[MarketAlert] outside market hours — skip poll');
+      schedulePoll();
+      return;
+    }
+    console.log('[MarketAlert] polling /api/market-alert ...');
+    try {
+      const resp = await fetch('/api/market-alert');
+      if (!resp.ok) {
+        console.warn('[MarketAlert] HTTP ' + resp.status);
+        schedulePoll();
+        return;
+      }
+      const d = await resp.json();
+      if (d.error) {
+        console.error('[MarketAlert] server error: ' + d.error);
+      } else {
+        renderBanner(d);
+      }
+    } catch (e) {
+      console.error('[MarketAlert] fetch FAIL:', e);
+    }
+    schedulePoll();
+  }
+
+  function schedulePoll() {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(checkMarketAlert, POLL_INTERVAL_MS);
+  }
+
+  window.dismissMarketAlert = function() {
+    alertDismissed = true;
+    const banner = document.getElementById('marketAlertBanner');
+    if (banner) banner.style.display = 'none';
+    console.log('[MarketAlert] dismissed by user');
+  };
+
+  // Run immediately on load, then every 5 min
+  checkMarketAlert();
+})();
+// ── END MARKET ALERT ───────────────────────────────────────────────────────
+{%- endraw %}
+</script>
+
+
+<!-- TRADEAI INSIGHTS MODAL -->
+<div class="modal-overlay" id="aiInsightsModal" onclick="if(event.target===this)document.getElementById('aiInsightsModal').classList.remove('visible')">
+  <div class="modal" style="max-width:900px;width:95vw">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">🧠 SCORING INSIGHTS</div>
+        <div class="modal-subtitle" id="aiInsightsSubtitle">Which factors actually predict wins</div>
+      </div>
+      <button class="modal-close" onclick="document.getElementById('aiInsightsModal').classList.remove('visible')">✕</button>
+    </div>
+    <div id="aiInsightsBody" style="max-height:70vh;overflow-y:auto"></div>
+  </div>
+</div>
+
+<script>
+{%- raw %}
+// ── TRADEAI SCORING INSIGHTS ────────────────────────────────────────────────
+async function showAIInsights() {
+  const modal = document.getElementById('aiInsightsModal');
+  const body  = document.getElementById('aiInsightsBody');
+  body.innerHTML = '<div style="color:var(--muted);padding:20px">Loading outcome stats...</div>';
+  modal.classList.add('visible');
+  try {
+    const d = await fetch('/tradeai/stats').then(r => r.json());
+    body.innerHTML = _renderInsights(d);
+    document.getElementById('aiInsightsSubtitle').textContent =
+      `${d.outcomesLogged} closed trades logged · ${d.outcomesWithFactors} with factor data`;
+  } catch(e) {
+    body.innerHTML = '<div style="color:var(--down)">Failed to load stats.</div>';
+    console.error('[Insights] load FAIL:', e);
+  }
+}
+
+function _insightStatCell(label, val, color) {
+  return `<div style="text-align:center"><div style="font-size:9px;color:var(--muted);letter-spacing:0.5px">${label}</div>
+    <div style="font-size:14px;font-weight:700;font-family:'DM Mono',monospace;${color?'color:'+color:''}">${val != null ? val : '—'}</div></div>`;
+}
+
+function _insightGroupTable(title, groups) {
+  const keys = Object.keys(groups || {});
+  if (!keys.length) return '';
+  const rows = keys.map(k => {
+    const s = groups[k];
+    if (!s) return '';
+    const expColor = s.expectancyPct > 0 ? 'var(--up)' : (s.expectancyPct < 0 ? 'var(--down)' : 'var(--muted)');
+    return `<tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:6px 10px;font-weight:700">${k}</td>
+      <td style="padding:6px 10px;text-align:right">${s.n}</td>
+      <td style="padding:6px 10px;text-align:right">${s.winRate != null ? s.winRate + '%' : '—'}</td>
+      <td style="padding:6px 10px;text-align:right;color:var(--up)">${s.avgWinPct != null ? '+' + s.avgWinPct + '%' : '—'}</td>
+      <td style="padding:6px 10px;text-align:right;color:var(--down)">${s.avgLossPct != null ? s.avgLossPct + '%' : '—'}</td>
+      <td style="padding:6px 10px;text-align:right;font-weight:700;color:${expColor}">${s.expectancyPct != null ? (s.expectancyPct > 0 ? '+' : '') + s.expectancyPct + '%' : '—'}</td>
+      <td style="padding:6px 10px;text-align:right">${s.avgDaysHeld != null ? s.avgDaysHeld + 'd' : '—'}</td>
+    </tr>`;
+  }).join('');
+  return `<div style="margin-bottom:18px">
+    <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">${title}</div>
+    <table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+      <thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">
+        <th style="padding:6px 10px;text-align:left">GROUP</th><th style="padding:6px 10px;text-align:right">N</th>
+        <th style="padding:6px 10px;text-align:right">WIN%</th><th style="padding:6px 10px;text-align:right">AVG WIN</th>
+        <th style="padding:6px 10px;text-align:right">AVG LOSS</th><th style="padding:6px 10px;text-align:right">EXPECT/TRADE</th>
+        <th style="padding:6px 10px;text-align:right">HELD</th>
+      </tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function _renderInsights(d) {
+  let html = '';
+  // Suggestions first — this is the feedback loop
+  if (d.suggestions && d.suggestions.length) {
+    html += `<div style="margin-bottom:18px">
+      <div style="font-size:10px;letter-spacing:1px;color:#a78bfa;margin-bottom:6px">💡 TUNING SUGGESTIONS</div>` +
+      d.suggestions.map(s => `<div style="padding:9px 12px;margin-bottom:6px;background:rgba(139,92,246,0.06);border:1px solid rgba(139,92,246,0.25);border-radius:8px;font-size:12px;line-height:1.5">${s}</div>`).join('') +
+      `</div>`;
+  }
+  const o = d.overall;
+  if (o) {
+    const expColor = o.expectancyPct > 0 ? 'var(--up)' : 'var(--down)';
+    const hasExcess = o.excessExpectancyPct != null;
+    const exColor = o.excessExpectancyPct > 0 ? 'var(--up)' : 'var(--down)';
+    html += `<div style="display:grid;grid-template-columns:repeat(${hasExcess ? 7 : 6},1fr);gap:8px;padding:12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:18px">` +
+      _insightStatCell('TRADES', o.n) +
+      _insightStatCell('WIN RATE', o.winRate != null ? o.winRate + '%' : null) +
+      _insightStatCell('AVG WIN', o.avgWinPct != null ? '+' + o.avgWinPct + '%' : null, 'var(--up)') +
+      _insightStatCell('AVG LOSS', o.avgLossPct != null ? o.avgLossPct + '%' : null, 'var(--down)') +
+      _insightStatCell('EXPECT/TRADE', o.expectancyPct != null ? (o.expectancyPct > 0 ? '+' : '') + o.expectancyPct + '%' : null, expColor) +
+      (hasExcess ? _insightStatCell('VS SPY', (o.excessExpectancyPct > 0 ? '+' : '') + o.excessExpectancyPct + '%', exColor) : '') +
+      _insightStatCell('PROFIT FACTOR', o.profitFactor) +
+      `</div>`;
+  } else {
+    html += '<div style="color:var(--muted);padding:10px 0 20px">No closed trades logged yet. Outcomes are recorded automatically on every TradeAI sell from now on.</div>';
+  }
+  html += _insightGroupTable('BY BUCKET', d.byBucket);
+  html += _insightGroupTable('BY COMPOSITE SCORE AT BUY', d.byCompositeBand);
+  html += _insightGroupTable('BY AI BUY SIGNAL', d.byBuySignal);
+  html += _insightGroupTable('BY EXIT TRIGGER', d.byTrigger);
+  html += _insightGroupTable('BY TRAJECTORY', d.byTrajectory);
+  // Factor discrimination table
+  const fc = d.factorComparison || {};
+  const fkeys = Object.keys(fc);
+  if (fkeys.length) {
+    const rows = fkeys.map(f => {
+      const c = fc[f];
+      const discriminates = c.winnersAvg != null && c.losersAvg != null && c.winnersAvg > c.losersAvg;
+      return `<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:6px 10px;font-weight:700">${f}</td>
+        <td style="padding:6px 10px;text-align:right;color:var(--up)">${c.winnersAvg != null ? c.winnersAvg : '—'} (n=${c.winnersN})</td>
+        <td style="padding:6px 10px;text-align:right;color:var(--down)">${c.losersAvg != null ? c.losersAvg : '—'} (n=${c.losersN})</td>
+        <td style="padding:6px 10px;text-align:right">${c.winnersAvg == null || c.losersAvg == null ? '—' : (discriminates ? '<span style="color:var(--up)">✓ predictive</span>' : '<span style="color:var(--warn)">✗ not predictive</span>')}</td>
+      </tr>`;
+    }).join('');
+    html += `<div style="margin-bottom:18px">
+      <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">FACTOR DISCRIMINATION — AVG VALUE AT BUY TIME</div>
+      <table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+        <thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">
+          <th style="padding:6px 10px;text-align:left">FACTOR</th><th style="padding:6px 10px;text-align:right">IN WINNERS</th>
+          <th style="padding:6px 10px;text-align:right">IN LOSERS</th><th style="padding:6px 10px;text-align:right">VERDICT</th>
+        </tr></thead><tbody>${rows}</tbody></table>
+      <div style="font-size:10px;color:var(--muted);margin-top:6px">A factor is only useful if its average is meaningfully higher in winning trades than losing ones.</div></div>`;
+  }
+  return html;
+}
+{%- endraw %}
+</script>
+
+<!-- TRADEAI REPORT MODAL -->
+<div class="modal-overlay" id="aiReportModal" onclick="if(event.target===this)closeAIReport()">
+  <div class="modal" style="max-width:900px;width:95vw">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">📊 PERFORMANCE REPORT</div>
+        <div class="modal-subtitle" id="aiReportSubtitle">Loading...</div>
+      </div>
+      <button class="modal-close" onclick="closeAIReport()">✕</button>
+    </div>
+    <div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:16px">
+      <button class="report-period-btn active" onclick="switchReportPeriod('monthly',this)">MONTHLY</button>
+      <button class="report-period-btn" onclick="switchReportPeriod('quarterly',this)">QUARTERLY</button>
+      <button class="report-period-btn" onclick="switchReportPeriod('yearly',this)">YEARLY</button>
+    </div>
+    <div id="aiReportBody" style="max-height:65vh;overflow-y:auto"></div>
+  </div>
+</div>
+
+
+<style>
+.report-period-btn {
+  font-family:'DM Mono',monospace;font-size:11px;font-weight:700;
+  padding:8px 20px;border:none;background:transparent;
+  color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;
+  letter-spacing:0.5px;transition:all 0.2s;
+}
+.report-period-btn.active { color:var(--accent);border-bottom-color:var(--accent); }
+.report-period-btn:hover { color:var(--text); }
+.report-ticker-row {
+  border:1px solid var(--border);border-radius:8px;margin-bottom:8px;overflow:hidden;
+}
+.report-ticker-header {
+  display:grid;grid-template-columns:90px 80px 80px 90px 90px 80px 80px 1fr;
+  gap:8px;padding:10px 14px;background:var(--surface);cursor:pointer;
+  font-size:11px;align-items:center;transition:background 0.15s;
+}
+.report-ticker-header:hover { background:var(--surface2); }
+.report-ticker-detail {
+  display:none;padding:12px 14px;background:var(--surface2);
+  border-top:1px solid var(--border);
+}
+.report-ticker-detail.open { display:block; }
+.report-trade-pair {
+  display:grid;grid-template-columns:110px 80px 80px 80px 80px 80px 1fr;
+  gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(42,42,58,0.5);
+  align-items:center;
+}
+.report-trade-pair:last-child { border-bottom:none; }
+.report-summary-row {
+  display:grid;grid-template-columns:90px 80px 80px 90px 90px 80px 80px 1fr;
+  gap:8px;padding:10px 14px;background:rgba(200,241,53,0.04);
+  border:1px solid rgba(200,241,53,0.15);border-radius:8px;
+  font-size:11px;font-weight:700;margin-bottom:12px;
+}
+</style>
+
+<script>
+{%- raw %}
+// ── TRADEAI REPORT ──────────────────────────────────────────────────────────
+let _reportAllTxns = [];
+let _reportPeriod  = 'monthly';
+
+function closeAIReport() {
+  document.getElementById('aiReportModal').classList.remove('visible');
+}
+
+async function showAIReport() {
+  const modal = document.getElementById('aiReportModal');
+  const body  = document.getElementById('aiReportBody');
+  const sub   = document.getElementById('aiReportSubtitle');
+  body.innerHTML = '<div style="color:var(--muted);padding:20px">Loading transactions...</div>';
+  modal.classList.add('visible');
+
+  try {
+    const data = await fetch('/tradeai').then(r => r.json());
+    _reportAllTxns = data.transactions || [];
+    console.log('[Report] loaded | txns:', _reportAllTxns.length);
+    _reportPeriod = 'monthly';
+    document.querySelectorAll('.report-period-btn').forEach((b,i) => b.classList.toggle('active', i===0));
+    _renderReport();
+  } catch(e) {
+    body.innerHTML = '<div style="color:var(--down)">Failed to load transactions.</div>';
+    console.error('[Report] load FAIL:', e);
+  }
+}
+
+function switchReportPeriod(period, btn) {
+  _reportPeriod = period;
+  document.querySelectorAll('.report-period-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  _renderReport();
+  console.log('[Report] period switched to:', period);
+}
+
+function _periodKey(dateStr, period) {
+  if (!dateStr) return 'Unknown';
+  const d = new Date(dateStr);
+  if (isNaN(d)) return 'Unknown';
+  const y = d.getFullYear();
+  const m = d.getMonth() + 1;
+  if (period === 'monthly')   return `${y}-${String(m).padStart(2,'0')}`;
+  if (period === 'quarterly') return `${y}-Q${Math.ceil(m/3)}`;
+  if (period === 'yearly')    return `${y}`;
+  return 'Unknown';
+}
+
+function _buildReportData(txns, period) {
+  // Group transactions by period → ticker
+  // Match BUY→SELL pairs per ticker (FIFO)
+  const periods = {};
+
+  // First pass: collect all buys and sells per ticker globally (FIFO pairing)
+  const buyQueues = {}; // ticker → [{date,shares,price,amount}]
+  const pairs = [];    // [{ticker,buyDate,sellDate,shares,buyPrice,sellPrice,pnl,holdDays}]
+
+  const sorted = [...txns].sort((a,b) => new Date(a.date) - new Date(b.date));
+
+  for (const t of sorted) {
+    if (t.action === 'BUY') {
+      if (!buyQueues[t.ticker]) buyQueues[t.ticker] = [];
+      buyQueues[t.ticker].push({date: t.date, shares: t.shares, price: t.price});
+    } else if (t.action === 'SELL') {
+      const q = buyQueues[t.ticker] || [];
+      if (q.length > 0) {
+        const buy = q.shift();
+        const holdDays = buy.date && t.date
+          ? Math.round((new Date(t.date) - new Date(buy.date)) / 86400000)
+          : null;
+        const pnl = (t.price - buy.price) * t.shares;
+        pairs.push({
+          ticker:    t.ticker,
+          buyDate:   buy.date,
+          sellDate:  t.date,
+          shares:    t.shares,
+          buyPrice:  buy.price,
+          sellPrice: t.price,
+          pnl:       pnl,
+          holdDays:  holdDays,
+          period:    _periodKey(t.sellDate || t.date, period),
+        });
+      }
+    }
+  }
+
+  // Group pairs by period → ticker
+  for (const p of pairs) {
+    const pk = _periodKey(p.sellDate, period);
+    if (!periods[pk]) periods[pk] = {};
+    if (!periods[pk][p.ticker]) periods[pk][p.ticker] = {trades:[], totalPnl:0, totalShares:0, buyPrices:[], sellPrices:[], holdDays:[]};
+    const entry = periods[pk][p.ticker];
+    entry.trades.push(p);
+    entry.totalPnl    += p.pnl;
+    entry.totalShares += p.shares;
+    entry.buyPrices.push(p.buyPrice);
+    entry.sellPrices.push(p.sellPrice);
+    if (p.holdDays !== null) entry.holdDays.push(p.holdDays);
+  }
+
+  // Also track open buys (no matching sell yet) per period
+  for (const ticker in buyQueues) {
+    for (const buy of buyQueues[ticker]) {
+      const pk = _periodKey(buy.date, period);
+      if (!periods[pk]) periods[pk] = {};
+      if (!periods[pk][ticker]) periods[pk][ticker] = {trades:[], totalPnl:0, totalShares:0, buyPrices:[], sellPrices:[], holdDays:[], openBuys:[]};
+      if (!periods[pk][ticker].openBuys) periods[pk][ticker].openBuys = [];
+      periods[pk][ticker].openBuys.push(buy);
+    }
+  }
+
+  return periods;
+}
+
+function _renderReport() {
+  const body = document.getElementById('aiReportBody');
+  const sub  = document.getElementById('aiReportSubtitle');
+  const data = _buildReportData(_reportAllTxns, _reportPeriod);
+  const periodKeys = Object.keys(data).sort().reverse();
+
+  if (!periodKeys.length) {
+    body.innerHTML = '<div style="color:var(--muted);padding:20px;text-align:center">No closed trades to report yet.</div>';
+    sub.textContent = 'No data';
+    console.log('[Report] no data for period:', _reportPeriod);
+    return;
+  }
+
+  const avg = arr => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : null;
+  const fmtD = n => n != null ? `${n}d` : '—';
+
+  let html = '';
+
+  for (const pk of periodKeys) {
+    const tickers = data[pk];
+    const tickerKeys = Object.keys(tickers).sort();
+    const periodTotal = tickerKeys.reduce((s,t) => s + (tickers[t].totalPnl||0), 0);
+    const periodTrades = tickerKeys.reduce((s,t) => s + (tickers[t].trades||[]).length, 0);
+    const periodColor = periodTotal >= 0 ? 'var(--up)' : 'var(--down)';
+
+    html += `<div style="margin-bottom:24px">`;
+
+    // Period header
+    html += `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border)">
+      <div style="font-family:'Syne',sans-serif;font-size:16px;font-weight:800;letter-spacing:-0.3px">${pk}</div>
+      <div style="display:flex;gap:20px;font-size:11px">
+        <span style="color:var(--muted)">${periodTrades} closed trade${periodTrades!==1?'s':''} · ${tickerKeys.length} ticker${tickerKeys.length!==1?'s':''}</span>
+        <span style="font-weight:700;color:${periodColor}">${periodTotal >= 0 ? '+' : ''}${fmt$(periodTotal)} realized P&L</span>
+      </div>
+    </div>`;
+
+    // Column headers
+    html += `<div style="display:grid;grid-template-columns:90px 60px 80px 80px 90px 80px 80px 1fr;gap:8px;padding:4px 14px;margin-bottom:4px">
+      ${['TICKER','TRADES','AVG BUY','AVG SELL','REALIZED','RETURN','AVG HOLD',''].map(h =>
+        `<div style="font-size:9px;color:var(--muted);letter-spacing:0.8px;text-transform:uppercase">${h}</div>`
+      ).join('')}
+    </div>`;
+
+    // Per-ticker rows
+    for (const ticker of tickerKeys) {
+      const td = tickers[ticker];
+      const trades      = td.trades || [];
+      const openBuys    = td.openBuys || [];
+      const avgBuy      = avg(td.buyPrices);
+      const avgSell     = avg(td.sellPrices);
+      const ret         = avgBuy && avgSell ? ((avgSell - avgBuy) / avgBuy) * 100 : null;
+      const avgHold     = avg(td.holdDays);
+      const pnlColor    = td.totalPnl >= 0 ? 'var(--up)' : 'var(--down)';
+      const retColor    = ret != null ? (ret >= 0 ? 'var(--up)' : 'var(--down)') : 'var(--muted)';
+      const rowId       = `report-detail-${pk}-${ticker}`.replace(/[^a-zA-Z0-9-]/g,'_');
+
+      html += `<div class="report-ticker-row">
+        <div class="report-ticker-header" onclick="toggleReportDetail('${rowId}')">
+          <div style="font-family:'Syne',sans-serif;font-weight:800;font-size:14px">${ticker}</div>
+          <div style="color:var(--muted)">${trades.length}${openBuys.length ? `<span style="color:var(--warn);font-size:9px"> +${openBuys.length} open</span>` : ''}</div>
+          <div>${avgBuy != null ? fmt$(avgBuy) : '—'}</div>
+          <div>${avgSell != null ? fmt$(avgSell) : '—'}</div>
+          <div style="color:${pnlColor};font-weight:700">${td.totalPnl >= 0?'+':''}${fmt$(td.totalPnl)}</div>
+          <div style="color:${retColor};font-weight:700">${ret != null ? (ret>=0?'+':'')+ret.toFixed(1)+'%' : '—'}</div>
+          <div style="color:var(--muted)">${fmtD(avgHold ? Math.round(avgHold) : null)}</div>
+          <div style="text-align:right;font-size:10px;color:var(--muted)">▸ detail</div>
+        </div>
+        <div class="report-ticker-detail" id="${rowId}">
+          <div style="font-size:9px;color:var(--muted);letter-spacing:0.8px;margin-bottom:8px">CLOSED TRADE PAIRS</div>
+          <div style="display:grid;grid-template-columns:110px 70px 80px 80px 80px 70px 1fr;gap:8px;padding:4px 0;margin-bottom:4px">
+            ${['BUY DATE','SELL DATE','SHARES','BUY $','SELL $','HOLD','P&L'].map(h =>
+              `<div style="font-size:9px;color:var(--muted);letter-spacing:0.8px">${h}</div>`
+            ).join('')}
+          </div>
+          ${trades.length === 0 ? '<div style="color:var(--muted);font-size:11px;padding:4px 0">No closed pairs this period.</div>' :
+            trades.map(p => {
+              const pc = p.pnl >= 0 ? 'var(--up)' : 'var(--down)';
+              return `<div class="report-trade-pair">
+                <div style="color:var(--muted)">${(p.buyDate||'—').slice(0,10)}</div>
+                <div style="color:var(--muted)">${(p.sellDate||'—').slice(0,10)}</div>
+                <div>${p.shares}</div>
+                <div>${fmt$(p.buyPrice)}</div>
+                <div>${fmt$(p.sellPrice)}</div>
+                <div style="color:var(--muted)">${fmtD(p.holdDays)}</div>
+                <div style="color:${pc};font-weight:700">${p.pnl>=0?'+':''}${fmt$(p.pnl)}</div>
+              </div>`;
+            }).join('')
+          }
+          ${openBuys.length ? `
+            <div style="font-size:9px;color:var(--warn);letter-spacing:0.8px;margin:10px 0 6px">OPEN BUYS (no matching sell yet)</div>
+            ${openBuys.map(b => `
+              <div class="report-trade-pair">
+                <div style="color:var(--warn)">${(b.date||'—').slice(0,10)}</div>
+                <div style="color:var(--muted)">—</div>
+                <div>${b.shares}</div>
+                <div>${fmt$(b.price)}</div>
+                <div style="color:var(--muted)">—</div>
+                <div style="color:var(--muted)">—</div>
+                <div style="color:var(--warn);font-size:10px">OPEN</div>
+              </div>`).join('')}` : ''}
+        </div>
+      </div>`;
+    }
+
+    html += `</div>`;
+  }
+
+  body.innerHTML = html;
+  sub.textContent = `${_reportPeriod.charAt(0).toUpperCase()+_reportPeriod.slice(1)} · ${periodKeys.length} period${periodKeys.length!==1?'s':''} · ${_reportAllTxns.length} total transactions`;
+  console.log('[Report] rendered | period:', _reportPeriod, '| periods:', periodKeys.length, '| txns:', _reportAllTxns.length);
+}
+
+function toggleReportDetail(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.toggle('open');
+  const header = el.previousElementSibling;
+  if (header) {
+    const arrow = header.querySelector('div:last-child');
+    if (arrow) arrow.textContent = el.classList.contains('open') ? '▾ hide' : '▸ detail';
+  }
+  console.log('[Report] ticker detail toggled:', id, '| open:', el.classList.contains('open'));
+}
+// ── END TRADEAI REPORT ──────────────────────────────────────────────────────
+
+{%- endraw %}
+</script>

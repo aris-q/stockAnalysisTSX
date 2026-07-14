@@ -1,0 +1,327 @@
+<script>
+  {%- raw %}
+// ── DREAM STOCK TAB ───────────────────────────────────────────────────────────
+let dreamLoaded = false;
+let dreamFilter = 'all';
+
+async function loadDream(force) {
+  const el = document.getElementById('dreamContent');
+  if (!el) return;
+  if (dreamLoaded && !force) return;
+  try {
+    const res = await fetch('/dream');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const count = (data.candidates || []).length;
+    console.log('[Dream] loaded | candidates:' + count + ' scannedAt:' + (data.scannedAt || 'none'));
+    el.innerHTML = renderDream(data);
+    dreamLoaded = count > 0;  // only mark loaded if we have real data
+  } catch(e) {
+    console.error('[Dream] load FAIL:', e);
+    el.innerHTML = '<span style="color:var(--down)">Failed to load dream data: ' + (e && e.message ? e.message : e) + '</span>';
+  }
+}
+
+async function refreshDreamTickers(btn) {
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ REFRESHING...';
+  console.log('[Dream] ticker refresh triggered');
+  try {
+    const res = await fetch('/dream/refresh-tickers', {method: 'POST'});
+    const data = await res.json();
+    if (data.error) { alert('Error: ' + data.error); btn.textContent = orig; btn.disabled = false; return; }
+    let attempts = 0;
+    const poll = setInterval(async () => {
+      attempts++;
+      try {
+        const s = await fetch('/status');
+        const st = await s.json();
+        if (!st.running || attempts > 60) {
+          clearInterval(poll);
+          btn.textContent = orig;
+          btn.disabled = false;
+          console.log('[Dream] ticker refresh complete:', st.message);
+        }
+      } catch(e) { clearInterval(poll); btn.textContent = orig; btn.disabled = false; }
+    }, 2000);
+  } catch(e) {
+    console.error('[Dream] ticker refresh FAIL:', e);
+    btn.textContent = orig;
+    btn.disabled = false;
+  }
+}
+
+async function runDreamScan(btn) {
+  const orig = btn.textContent;
+  btn.textContent = '⏳ Scanning...';
+  btn.disabled = true;
+  const stopBtn = document.getElementById('dreamStopBtn');
+  if (stopBtn) stopBtn.style.display = 'inline-block';
+  const tsEl = document.getElementById('dreamScanTs');
+  if (tsEl) tsEl.textContent = '🕐 Running...';
+  console.log('[Dream] scan triggered');
+  const _resetDreamBtn = () => {
+    btn.textContent = orig;
+    btn.disabled = false;
+    if (stopBtn) stopBtn.style.display = 'none';
+  };
+  try {
+    await fetch('/dream/scan', {method: 'POST'});
+    const poll = setInterval(async () => {
+      try {
+        const s = await fetch('/status');
+        const sd = await s.json();
+        if (!sd.running) {
+          clearInterval(poll);
+          _resetDreamBtn();
+          if (sd.message && (sd.message.includes('dream') || sd.message.includes('Dream'))) {
+            dreamLoaded = false;
+            setTimeout(async () => {
+              await loadDream(true);
+              console.log('[Dream] scan complete, data loaded');
+            }, 500);
+          }
+        }
+      } catch(e) { clearInterval(poll); _resetDreamBtn(); }
+    }, 2000);
+  } catch(e) {
+    console.error('[Dream] scan FAIL:', e);
+    _resetDreamBtn();
+  }
+}
+
+function setDreamFilter(f, btn) {
+  dreamFilter = f;
+  document.querySelectorAll('.dream-filter-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  const rows = document.querySelectorAll('.dream-row');
+  rows.forEach(function(row) {
+    const score = parseInt(row.dataset.score || '0');
+    const source = row.dataset.source || '';
+    let show = true;
+    if (f === 'dream') show = score >= 70;
+    else if (f === 'watch') show = score >= 50 && score < 70;
+    else if (f === 'new') show = source !== 'Watchlist';
+    row.style.display = show ? '' : 'none';
+  });
+}
+
+function toggleDreamDetail(id) {
+  const detailEl = document.getElementById('dream-detail-' + id);
+  if (!detailEl) return;
+  const isOpen = detailEl.style.display !== 'none';
+  // Close all open details first
+  document.querySelectorAll('[id^="dream-detail-"]').forEach(function(el) {
+    el.style.display = 'none';
+  });
+  document.querySelectorAll('.dream-row').forEach(function(r) {
+    r.classList.remove('dream-row-active');
+  });
+  if (!isOpen) {
+    detailEl.style.display = 'table-row';
+    const row = document.querySelector('.dream-row[data-id="' + id + '"]');
+    if (row) row.classList.add('dream-row-active');
+  }
+}
+
+function fmtMcap(v) {
+  if (!v) return '—';
+  if (v >= 1e12) return '$' + (v/1e12).toFixed(1) + 'T';
+  if (v >= 1e9)  return '$' + (v/1e9).toFixed(1) + 'B';
+  if (v >= 1e6)  return '$' + (v/1e6).toFixed(0) + 'M';
+  return '$' + v;
+}
+
+function renderDream(data) {
+  const candidates = data.candidates || [];
+  const scannedAt = data.scannedAt || null;
+  const tsLabel = scannedAt ? '🕐 ' + scannedAt : 'Never scanned';
+
+  let html = '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px;padding:16px 20px;background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.25);border-radius:10px;">'
+    + '<div>'
+    + '<div style="font-family:\'Syne\',sans-serif;font-size:15px;font-weight:800;color:var(--warn);margin-bottom:3px">🌟 DREAM SCAN</div>'
+    + '<div id="dreamScanTs" style="font-size:11px;color:var(--muted)">' + tsLabel + '</div>'
+    + '</div>'
+    + '<div style="display:flex;gap:8px;align-items:center">'
+    + '<button onclick="toggleDreamHelp(this)" style="font-size:12px;padding:8px 14px;background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;font-weight:700;cursor:pointer;font-family:\'DM Mono\',monospace">❓ HOW IT WORKS</button>'
+    + '<button onclick="refreshDreamTickers(this)" style="font-size:12px;padding:8px 16px;background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:6px;font-weight:700;cursor:pointer;font-family:\'DM Mono\',monospace;letter-spacing:0.5px">🔄 REFRESH TICKERS</button>'
+    + '<button onclick="runDreamScan(this)" style="font-size:13px;padding:9px 22px;background:var(--warn);color:#0a0a0f;border:none;border-radius:6px;font-weight:800;cursor:pointer;font-family:\'DM Mono\',monospace;letter-spacing:0.5px">⚡ RUN DREAM SCAN</button>'
+    + '<button id="dreamStopBtn" onclick="stopOperation()" style="display:none;font-size:12px;padding:9px 16px;background:rgba(239,68,68,0.12);color:var(--down);border:1px solid var(--down);border-radius:6px;font-weight:700;cursor:pointer;font-family:\'DM Mono\',monospace;letter-spacing:0.5px">🛑 STOP</button>'
+    + '</div>'
+    + '</div>'
+    + buildDreamHelpHtml();
+
+  if (!candidates.length) {
+    return html + '<div style="color:var(--muted);font-size:13px;padding:20px 0">No results yet. Click ⚡ Run Dream Scan to start.</div>';
+  }
+
+  // Summary bar
+  const dreamCount = candidates.filter(function(c) { return c.score >= 70; }).length;
+  const watchCount = candidates.filter(function(c) { return c.score >= 50 && c.score < 70; }).length;
+  const newCount   = candidates.filter(function(c) { return c.source !== 'Watchlist'; }).length;
+
+  html += '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px">'
+    + '<div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);border-radius:8px;padding:10px 16px;text-align:center"><div style="font-size:22px;font-weight:800;color:#fbbf24">' + dreamCount + '</div><div style="font-size:10px;color:var(--muted)">🌟 DREAM</div></div>'
+    + '<div style="background:rgba(74,222,128,0.1);border:1px solid rgba(74,222,128,0.3);border-radius:8px;padding:10px 16px;text-align:center"><div style="font-size:22px;font-weight:800;color:var(--up)">' + watchCount + '</div><div style="font-size:10px;color:var(--muted)">✅ WATCH</div></div>'
+    + '<div style="background:rgba(139,92,246,0.1);border:1px solid rgba(139,92,246,0.3);border-radius:8px;padding:10px 16px;text-align:center"><div style="font-size:22px;font-weight:800;color:#a78bfa">' + newCount + '</div><div style="font-size:10px;color:var(--muted)">NEW FINDS</div></div>'
+    + '<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 16px;text-align:center"><div style="font-size:22px;font-weight:800;color:var(--text)">' + candidates.length + '</div><div style="font-size:10px;color:var(--muted)">TOTAL SCANNED</div></div>'
+    + '</div>';
+
+  // Filter bar
+  html += '<div class="dream-filter-bar">'
+    + '<button class="dream-filter-btn active" onclick="setDreamFilter(\'all\',this)">All</button>'
+    + '<button class="dream-filter-btn" onclick="setDreamFilter(\'dream\',this)">🌟 Dream Only</button>'
+    + '<button class="dream-filter-btn" onclick="setDreamFilter(\'watch\',this)">✅ Watch</button>'
+    + '<button class="dream-filter-btn" onclick="setDreamFilter(\'new\',this)">🔍 New Finds</button>'
+    + '</div>';
+
+  // Table
+  html += '<div style="overflow-x:auto"><table class="dream-table">'
+    + '<thead><tr>'
+    + '<th>#</th><th>SCORE</th><th>STOCK</th><th>SOURCE</th>'
+    + '<th>REV GROWTH</th><th>MARGIN</th><th>RSI</th>'
+    + '<th>INST %</th><th>MCAP</th><th>TREND</th>'
+    + '</tr></thead><tbody>';
+
+  candidates.forEach(function(c, i) {
+    if (!c || !c.ticker) { console.warn('[Dream] skipping malformed candidate at index ' + i, c); return; }
+    const scoreClass = c.score >= 70 ? 'dream-score-star' : c.score >= 50 ? 'dream-score-good' : 'dream-score-warn';
+    const scoreBadge = c.score >= 70 ? '🌟' : c.score >= 50 ? '✅' : '⚠️';
+    const bd = c.breakdown || {};
+    const revStr = bd.revenueGrowth != null ? (bd.revenueGrowth >= 0 ? '+' : '') + bd.revenueGrowth + '%' : '—';
+    const gmStr  = bd.grossMargin  != null ? bd.grossMargin + '%' : '—';
+    const rsiStr = bd.rsi          != null ? bd.rsi : '—';
+    const instStr= bd.institutionalPct != null ? bd.institutionalPct + '%' : '—';
+    const trendStr = bd.priceVs52wHigh != null ? bd.priceVs52wHigh + '% of 52wH' : '—';
+    const safeId = c.ticker.replace(/[^a-zA-Z0-9]/g, '_');
+
+    const instNames = (c.institutions || []).map(function(inst) { return inst.name + (inst.pct ? ' ' + inst.pct : ''); }).join(', ');
+
+    const flagsGoodHtml = (c.flagsGood || []).map(function(f) { return '<div class="dream-flag-good">✅ ' + f + '</div>'; }).join('');
+    const flagsWarnHtml = (c.flagsWarn || []).map(function(f) { return '<div class="dream-flag-warn">⚠️ ' + f + '</div>'; }).join('');
+
+    const addBtn = c.source === 'Watchlist'
+      ? '<span style="font-size:11px;color:var(--muted)">✓ In Watchlist</span>'
+      : '<a href="/add?ticker=' + c.ticker + '" onclick="event.stopPropagation()" style="font-size:11px;padding:3px 10px;background:rgba(74,222,128,0.12);border:1px solid rgba(74,222,128,0.35);border-radius:4px;color:var(--up);text-decoration:none;font-weight:700">+ Add to Watchlist</a>';
+
+    html += '<tr class="dream-row" data-id="' + safeId + '" data-score="' + c.score + '" data-source="' + c.source + '" onclick="toggleDreamDetail(\'' + safeId + '\')">'
+      + '<td style="color:var(--muted)">' + (i+1) + '</td>'
+      + '<td><span class="dream-score ' + scoreClass + '">' + scoreBadge + ' ' + c.score + '</span></td>'
+      + '<td><div style="font-weight:700">' + c.ticker + '</div><div style="font-size:11px;color:var(--muted)">' + (c.name || '') + '</div></td>'
+      + '<td><span class="dream-badge dream-badge-source">' + c.source + '</span></td>'
+      + '<td style="font-family:\'DM Mono\',monospace;color:' + (bd.revenueGrowth >= 40 ? 'var(--up)' : bd.revenueGrowth >= 20 ? 'var(--text)' : 'var(--down)') + '">' + revStr + '</td>'
+      + '<td style="font-family:\'DM Mono\',monospace;color:' + (bd.grossMargin >= 60 ? 'var(--up)' : bd.grossMargin >= 40 ? 'var(--text)' : 'var(--muted)') + '">' + gmStr + '</td>'
+      + '<td style="font-family:\'DM Mono\',monospace">' + rsiStr + '</td>'
+      + '<td style="font-family:\'DM Mono\',monospace">' + instStr + '</td>'
+      + '<td style="font-size:11px;color:var(--muted)">' + fmtMcap(c.marketCap) + '</td>'
+      + '<td style="font-size:11px">' + trendStr + '</td>'
+      + '</tr>'
+      + '<tr id="dream-detail-' + safeId + '" style="display:none"><td colspan="10" style="padding:0">'
+      + '<div class="dream-detail">'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px">'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+      + '<span style="font-weight:800;font-size:15px">' + c.ticker + '</span>'
+      + '<span class="dream-badge dream-badge-source">' + c.source + '</span>'
+      + '<span class="dream-badge dream-badge-sector">' + (c.sector || 'Unknown') + '</span>'
+      + '<span class="dream-badge dream-badge-sector">' + (c.industry || '') + '</span>'
+      + (c.price ? '<span style="font-size:13px;font-family:\'DM Mono\',monospace;color:var(--text)">$' + c.price + '</span>' : '')
+      + '</div>'
+      + addBtn
+      + '</div>'
+      + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:10px">'
+      + '<div>' + flagsGoodHtml + '</div>'
+      + '<div>' + flagsWarnHtml + '</div>'
+      + '</div>'
+      + (instNames ? '<div class="dream-inst" style="margin-bottom:8px">🏦 <strong>Top Institutions:</strong> ' + instNames + '</div>' : '')
+      + (c.insiderNet ? '<div style="font-size:11px;margin-bottom:6px">👤 <strong>Insider Activity (90d):</strong> <span style="color:' + (c.insiderNet === 'Net Buyer' ? 'var(--up)' : c.insiderNet === 'Net Seller' ? 'var(--down)' : 'var(--muted)') + ';font-weight:700">' + c.insiderNet + '</span>' + (c.insiderBuys90d || c.insiderSells90d ? ' · Buys: ' + (c.insiderBuys90d||0).toLocaleString() + ' · Sells: ' + (c.insiderSells90d||0).toLocaleString() + ' shares' : '') + '</div>' : '')
+      + (c.shortFloat != null ? '<div style="font-size:11px;margin-bottom:6px">📉 <strong>Short Float:</strong> <span style="color:' + (c.shortFloat > 20 ? 'var(--down)' : 'var(--muted)') + ';font-weight:700">' + c.shortFloat + '%</span>' + (c.shortFloat > 20 ? ' — high short interest' : '') + '</div>' : '')
+      + (c.description ? '<div class="dream-desc">' + c.description + '</div>' : '')
+      + buildDreamFinancials(c)
+      + '</div>'
+      + '</td></tr>';
+  });
+
+  html += '</tbody></table></div>';
+  return html;
+}
+
+// Build Key Metrics + Quarterly/Annual Income & Cash Flow tables for a dream candidate,
+// reusing data already stored in c.enriched by the dream scan (no extra fetch cost).
+function buildDreamFinancials(c) {
+  const en = c.enriched || {};
+  const qIncome   = (en.quarterlyIncome   || []).slice(0, 5);
+  const aIncome   = (en.annualIncome      || []);
+  const qCashflow = (en.quarterlyCashflow || []).slice(0, 5);
+  const aCashflow = (en.annualCashflow    || []);
+  const qBalance  = (en.quarterlyBalance  || []).slice(0, 5);
+  const aBalance  = (en.annualBalance     || []);
+
+  if (!qIncome.length && !aIncome.length) return '';
+
+  const latestQ  = qIncome[0]   || {};
+  const latestQC = qCashflow[0] || {};
+  const netCash  = qBalance[0] ? (qBalance[0]['Cash And Cash Equivalents'] || 0) - (qBalance[0]['Total Debt'] || 0) : null;
+  const grossMargin = (latestQ['Total Revenue'] && latestQ['Gross Profit'] != null)
+    ? (latestQ['Gross Profit'] / latestQ['Total Revenue'] * 100).toFixed(1) + '%' : '—';
+  const netMargin = (latestQ['Total Revenue'] && latestQ['Net Income'] != null)
+    ? (latestQ['Net Income'] / latestQ['Total Revenue'] * 100).toFixed(1) + '%' : '—';
+
+  let html = '<div style="margin-top:14px;border-top:1px solid var(--border);padding-top:12px">';
+
+  // Key Metrics
+  html += '<div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.5px;margin-bottom:8px">KEY METRICS</div>'
+    + '<div class="metrics-grid" style="margin-bottom:14px">'
+    + '<div class="metric"><div class="m-label">Q MARGIN</div><div class="m-value">' + netMargin + '</div></div>'
+    + '<div class="metric"><div class="m-label">GROSS MARGIN</div><div class="m-value">' + grossMargin + '</div></div>'
+    + '<div class="metric"><div class="m-label">NET CASH</div><div class="m-value ' + (netCash == null ? 'neutral' : netCash >= 0 ? 'up' : 'down') + '">$' + fmt(netCash) + '</div></div>'
+    + '<div class="metric"><div class="m-label">FCF</div><div class="m-value">$' + fmt(latestQC['Free Cash Flow']) + '</div></div>'
+    + '<div class="metric"><div class="m-label">CAPEX</div><div class="m-value">$' + fmt(latestQC['Capital Expenditure']) + '</div></div>'
+    + '<div class="metric"><div class="m-label">OP CF</div><div class="m-value">$' + fmt(latestQC['Operating Cash Flow']) + '</div></div>'
+    + '</div>';
+
+  // Quarterly Income & Cash Flow
+  if (qIncome.length) {
+    html += '<div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.5px;margin-bottom:8px">QUARTERLY INCOME & CASH FLOW</div>'
+      + '<table class="fin-table" style="margin-bottom:14px">'
+      + '<tr><th>METRIC</th>' + qIncome.map(function(q) { return '<th>' + q.date + '</th>'; }).join('') + '</tr>'
+      + ['Total Revenue','Gross Profit','Operating Income','Net Income','EBITDA'].map(function(field) {
+          return '<tr><td>' + field + '</td>' + qIncome.map(function(q) { return '<td>$' + fmt(q[field]) + '</td>'; }).join('') + '</tr>';
+        }).join('')
+      + ['Operating Cash Flow','Capital Expenditure','Free Cash Flow'].map(function(field) {
+          const label = field === 'Capital Expenditure' ? 'CapEx' : field === 'Operating Cash Flow' ? 'Op. CF' : 'FCF';
+          return '<tr><td style="color:var(--accent2)">' + label + '</td>' + qCashflow.map(function(q) { return '<td>$' + fmt(q[field]) + '</td>'; }).join('') + '</tr>';
+        }).join('')
+      + (qBalance.length ? '<tr style="border-top:1px solid var(--border)"><td style="color:var(--warn)">Net Cash</td>' + qBalance.map(function(b) {
+          const nc = (b['Cash And Cash Equivalents'] || 0) - (b['Total Debt'] || 0);
+          return '<td style="color:' + (nc >= 0 ? 'var(--up)' : 'var(--down)') + '">$' + fmt(nc) + '</td>';
+        }).join('') + '</tr>' : '')
+      + '</table>';
+  }
+
+  // Annual Income & Cash Flow
+  if (aIncome.length) {
+    html += '<div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.5px;margin-bottom:8px">ANNUAL INCOME & CASH FLOW</div>'
+      + '<table class="fin-table">'
+      + '<tr><th>METRIC</th>' + aIncome.map(function(a) { return '<th>' + a.date + '</th>'; }).join('') + '</tr>'
+      + ['Total Revenue','Gross Profit','Operating Income','Net Income','EBITDA'].map(function(field) {
+          return '<tr><td>' + field + '</td>' + aIncome.map(function(a) { return '<td>$' + fmt(a[field]) + '</td>'; }).join('') + '</tr>';
+        }).join('')
+      + ['Operating Cash Flow','Capital Expenditure','Free Cash Flow'].map(function(field) {
+          const label = field === 'Capital Expenditure' ? 'CapEx' : field === 'Operating Cash Flow' ? 'Op. CF' : 'FCF';
+          return '<tr><td style="color:var(--accent2)">' + label + '</td>' + aCashflow.map(function(a) { return '<td>$' + fmt(a[field]) + '</td>'; }).join('') + '</tr>';
+        }).join('')
+      + (aBalance.length ? '<tr style="border-top:1px solid var(--border)"><td style="color:var(--warn)">Net Cash</td>' + aBalance.map(function(b) {
+          const nc = (b['Cash And Cash Equivalents'] || 0) - (b['Total Debt'] || 0);
+          return '<td style="color:' + (nc >= 0 ? 'var(--up)' : 'var(--down)') + '">$' + fmt(nc) + '</td>';
+        }).join('') + '</tr>' : '')
+      + '</table>';
+  }
+
+  html += '</div>';
+  return html;
+}
+
+
+  {%- endraw %}
+</script>

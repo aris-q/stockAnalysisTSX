@@ -1,0 +1,273 @@
+<script>
+{%- raw %}
+// ── VALIDATION TAB — grades recommendations against real outcomes ───────────
+let signalLoaded = false;
+
+async function loadSignal(force) {
+  if (signalLoaded && !force) return;
+  signalLoaded = true;
+  await renderValidation();
+}
+
+async function renderValidation() {
+  const el = document.getElementById('signalContent');
+  el.innerHTML = '<div class="loading">Loading recommendation outcomes...</div>';
+  try {
+    const [stats, trade] = await Promise.all([
+      fetch('/tradeai/stats').then(r => r.json()),
+      fetch('/tradeai').then(r => r.json()),
+    ]);
+    el.innerHTML = buildValidationHTML(stats, trade);
+  } catch(e) {
+    el.innerHTML = `<div style="color:var(--down);padding:20px;line-height:1.8">
+      <div style="font-weight:700;margin-bottom:8px">❌ Failed to load validation data</div>
+      <div style="font-size:11px;color:var(--muted)">${e.message}</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:8px">💡 If this is the first time loading, restart your Flask server so it picks up the new /tradeai/stats route.</div>
+    </div>`;
+  }
+}
+
+function toggleVersionCard(version) {
+  const body = document.getElementById(`vcard-body-${version}`);
+  const arrow = document.getElementById(`vcard-arrow-${version}`);
+  if (!body) return;
+  const open = body.style.display !== 'none';
+  body.style.display = open ? 'none' : 'block';
+  if (arrow) arrow.textContent = open ? '▸' : '▾';
+}
+
+async function rollbackToVersion(v, btn) {
+  if (!confirm(`Restore the scoring config of v${v}? This creates a new version with that config — history is kept.`)) return;
+  btn.disabled = true; btn.textContent = '⏳';
+  try {
+    const r = await fetch('/tradeai/version/rollback', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({toVersion: v}),
+    }).then(r => r.json());
+    if (r.error) { alert('Rollback failed: ' + r.error); btn.disabled = false; btn.textContent = '⏪ ROLLBACK TO THIS CONFIG'; return; }
+    await renderValidation();
+  } catch(e) {
+    alert('Rollback failed: ' + e.message);
+    btn.disabled = false; btn.textContent = '⏪ ROLLBACK TO THIS CONFIG';
+  }
+}
+
+function buildValidationHTML(stats, trade) {
+  const fmtPct = v => v != null ? (v > 0 ? '+' : '') + Number(v).toFixed(2) + '%' : '—';
+  const pctColor = v => v > 0 ? 'var(--up)' : (v < 0 ? 'var(--down)' : 'var(--muted)');
+  const bktColors = { Momentum:'#fbbf24', Reversal:'#60a5fa', SmartMoney:'#a78bfa', Dream:'#6b7280' };
+  const bktBadge = b => b ? `<span style="font-size:9px;padding:1px 6px;border-radius:4px;background:${(bktColors[b]||'#6b7280')}22;color:${bktColors[b]||'#6b7280'};font-weight:700">${b}</span>` : '—';
+
+  let html = `
+  <div style="margin-bottom:20px">
+    <div style="font-family:'Syne',sans-serif;font-weight:800;font-size:18px">✅ RECOMMENDATION VALIDATION</div>
+    <div style="font-size:11px;color:var(--muted);margin-top:2px">Every buy carries its score breakdown; every sell logs the outcome. This page grades the Recommend engine against reality.</div>
+  </div>`;
+
+  // ── VERSION HISTORY — what changed, and did it help? ──────────────────────
+  const versions = (stats.versions || []).slice().reverse(); // newest first
+  if (versions.length) {
+    const vCards = versions.map((v, idx) => {
+      const s = v.stats;
+      const a = v.assetStats;
+      const es = v.exitStats;
+      const imp = v.improvement;
+      const exitLine = es
+        ? `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:11px;margin-top:4px">
+            <span>exits under this version: <b>${es.n}</b> trade${es.n===1?'':'s'} <span style="color:var(--muted)">(may include positions bought by an earlier version — this version's sell/stop-loss logic decided WHEN to close them)</span></span>
+            <span>exit avg: <b style="color:${pctColor(es.expectancyPct)}">${fmtPct(es.expectancyPct)}</b>/trade</span>
+            <span>realized on exits: <b style="color:${pctColor(es.totalGainLoss)}">${es.totalGainLoss >= 0 ? '+' : ''}$${es.totalGainLoss.toFixed(2)}</b></span>
+          </div>`
+        : `<div style="font-size:11px;color:var(--muted);margin-top:4px">No sells executed while this version was active.</div>`;
+      const accountLine = `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:11px;margin-top:8px">
+            <span>account return: <b style="color:${v.accountReturnPct != null ? pctColor(v.accountReturnPct) : 'var(--muted)'}">${v.accountReturnPct != null ? fmtPct(v.accountReturnPct) : '—'}</b> <span style="color:var(--muted)">(whole portfolio${v.assetAtStart != null ? ', $' + v.assetAtStart.toLocaleString() + ' → ' + (v.assetAtEnd != null ? '$' + v.assetAtEnd.toLocaleString() : 'now') : ', tracking not available for this version'})</span></span>
+          </div>`;
+      const assetLine = a
+        ? `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:11px;margin-top:4px">
+            <span>buys: <b>${a.totalN}</b> <span style="color:var(--muted)">(${a.closedN} closed, ${a.openN} open)</span></span>
+            <span>asset return (this version's trades): <b style="color:${pctColor(a.totalReturnPct)}">${fmtPct(a.totalReturnPct)}</b> on $${a.totalCost.toFixed(0)} deployed</span>
+            <span>total P&amp;L: <b style="color:${pctColor(a.totalPnl)}">${a.totalPnl >= 0 ? '+' : ''}$${a.totalPnl.toFixed(2)}</b> <span style="color:var(--muted)">($${a.closedPnl.toFixed(2)} realized + $${a.openPnl.toFixed(2)} unrealized)</span></span>
+          </div>`
+        : `<div style="font-size:11px;color:var(--muted);margin-top:4px">No buys under this version yet — account return above still reflects whole-portfolio drift.</div>`;
+      const statLine = s
+        ? `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:10px;margin-top:4px;color:var(--muted)">
+            <span>closed-trade avg: ${fmtPct(s.expectancyPct)}/trade</span>
+            <span>win rate: ${s.winRate != null ? s.winRate + '%' : '—'}</span>
+            ${s.excessExpectancyPct != null ? `<span>vs SPY (closed only): ${fmtPct(s.excessExpectancyPct)}/trade</span>` : ''}
+          </div>`
+        : '';
+      let impLine = '';
+      if (imp) {
+        const better = imp.returnDelta > 0;
+        const arrow = better ? '▲' : (imp.returnDelta < 0 ? '▼' : '＝');
+        const col = better ? 'var(--up)' : (imp.returnDelta < 0 ? 'var(--down)' : 'var(--muted)');
+        impLine = `<div style="margin-top:8px;padding:8px 12px;border-radius:6px;background:${better?'rgba(74,222,128,0.08)':'rgba(239,68,68,0.08)'};border:1px solid ${col};font-size:11px">
+          <span style="color:${col};font-weight:700">${arrow} vs v${imp.vsVersion}: ${imp.returnDelta > 0 ? '+' : ''}${imp.returnDelta}% asset return (realized+unrealized vs capital deployed)</span>
+          ${imp.reliable ? '' : '<span style="color:var(--warn);margin-left:8px">⚠ small sample — needs 10+ buys on both versions to be trusted</span>'}
+        </div>`;
+      }
+      const statusChips = {
+        'champion':          '<span style="font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(251,191,36,0.15);color:#fbbf24;font-weight:700">🏆 CHAMPION</span>',
+        'testing':           '<span style="font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(96,165,250,0.15);color:#60a5fa;font-weight:700">🧪 TESTING</span>',
+        'retired':           '<span style="font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(107,114,128,0.15);color:#9ca3af;font-weight:700">RETIRED</span>',
+        'insufficient-data': '<span style="font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(107,114,128,0.15);color:#6b7280;font-weight:700">NO DATA</span>',
+      };
+      const rollbackBtn = (!v.current && v.hasConfig)
+        ? `<button onclick="event.stopPropagation();rollbackToVersion(${v.version}, this)" style="margin-left:auto;font-size:10px;padding:3px 10px;background:transparent;border:1px solid var(--warn);border-radius:5px;color:var(--warn);cursor:pointer;font-family:'DM Mono',monospace;font-weight:700">⏪ ROLLBACK TO THIS CONFIG</button>`
+        : (!v.current && !v.hasConfig ? '<span style="margin-left:auto;font-size:9px;color:var(--muted)">no config saved</span>' : '');
+      const warnLine = v.warning
+        ? `<div style="margin-top:6px;font-size:10px;color:var(--warn)">⚠ ${v.warning}</div>` : '';
+
+      // Newest version (idx 0) starts expanded; older ones start collapsed —
+      // a click on the header toggles the body without re-fetching anything.
+      const expanded = idx === 0;
+      const bodyId = `vcard-body-${v.version}`;
+      const arrowId = `vcard-arrow-${v.version}`;
+      const summaryBits = [
+        v.accountReturnPct != null ? fmtPct(v.accountReturnPct) + ' account return' : null,
+        a ? `${a.totalN} buy${a.totalN===1?'':'s'}` : 'no buys',
+        a && a.totalReturnPct != null ? fmtPct(a.totalReturnPct) + ' asset return' : null,
+      ].filter(Boolean).join(' · ');
+
+      return `<div style="border:1px solid ${v.status === 'champion' ? '#fbbf24' : (v.current ? 'var(--accent)' : 'var(--border)')};border-radius:10px;padding:14px 16px;margin-bottom:10px;background:var(--surface)">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;cursor:pointer" onclick="toggleVersionCard(${v.version})">
+          <span id="${arrowId}" style="color:var(--muted);font-size:11px;width:12px">${expanded ? '▾' : '▸'}</span>
+          <span style="font-family:'DM Mono',monospace;font-weight:800;font-size:14px;color:${v.current ? 'var(--accent)' : 'var(--text)'}">v${v.version}</span>
+          <span style="font-weight:700;font-size:12px">${v.label || ''}</span>
+          <span style="font-size:10px;color:var(--muted)">${v.date || ''}</span>
+          ${v.basedOn ? '<span style="font-size:9px;color:var(--muted)">↩ config of v' + v.basedOn + '</span>' : ''}
+          ${v.current ? '<span style="font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(200,241,53,0.15);color:var(--accent);font-weight:700">CURRENT</span>' : ''}
+          ${statusChips[v.status] || ''}
+          ${!expanded ? `<span style="font-size:10px;color:var(--muted);font-family:'DM Mono',monospace">${summaryBits}</span>` : ''}
+          ${rollbackBtn}
+        </div>
+        <div id="${bodyId}" style="display:${expanded ? 'block' : 'none'}">
+          <ul style="margin:8px 0 0 16px;padding:0;font-size:11px;color:var(--muted);line-height:1.7">
+            ${(v.changes || []).map(ch => '<li>' + ch + '</li>').join('')}
+          </ul>
+          ${warnLine}
+          ${accountLine}
+          ${assetLine}
+          ${exitLine}
+          ${statLine}
+          ${impLine}
+        </div>
+      </div>`;
+    }).join('');
+    const sl = stats.selfLearning || {};
+    const champLine = stats.championVersion != null
+      ? `Champion: <b style="color:#fbbf24">v${stats.championVersion}</b> — the best proven config. `
+      : `No champion yet — a version needs ${sl.minTrades || 10}+ buys to be judged. `;
+    html += `<div style="margin-bottom:22px">
+      <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">RECOMMEND ENGINE — VERSION HISTORY (currently v${stats.currentVersion})</div>
+      <div style="padding:10px 14px;margin-bottom:10px;background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.25);border-radius:8px;font-size:11px;line-height:1.6">
+        <b>🔒 SELF-LEARNING POLICY:</b> ${champLine}
+        After <b>${sl.minTrades || 10}</b> buys, the current version's dollar-weighted asset return (realized+unrealized) is compared to the champion; if it lags by more than <b>${sl.rollbackThresholdPct || 1}%</b>, a rollback is ${sl.autoRollback ? '<b>proposed for your approval</b>' : 'not proposed (detection is OFF)'} — nothing changes automatically. The champion only changes when beaten on equal evidence — the ratchet moves up, never back and forth. The version log is append-only: rollbacks create a new version, so every experiment stays on record.
+      </div>
+      ${buildRollbackBanner(stats.rollbackProposal)}
+      ${vCards}
+      <div style="font-size:10px;color:var(--muted);margin-top:4px">A new version is logged automatically whenever the Scoring Matrix is changed; each version stores its full config. Each closed trade is credited to the version that bought it.</div>
+    </div>`;
+  }
+
+  // ── OPEN POSITIONS — recommendations currently being tested ──────────────
+  const holdings = trade.holdings || [];
+  if (holdings.length) {
+    const rows = holdings.map(h => {
+      const f = h.factors || {};
+      return `<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:7px 10px;font-weight:700">${h.ticker}</td>
+        <td style="padding:7px 10px">${bktBadge(f.bucket)}</td>
+        <td style="padding:7px 10px;text-align:right">${f.composite != null ? f.composite : '—'}</td>
+        <td style="padding:7px 10px">${f.buySignal || '—'}</td>
+        <td style="padding:7px 10px;text-align:right">$${(h.purchasePrice||0).toFixed(2)}</td>
+        <td style="padding:7px 10px;text-align:right">${h.currentPrice != null ? '$' + Number(h.currentPrice).toFixed(2) : '—'}</td>
+        <td style="padding:7px 10px;text-align:right;font-weight:700;color:${pctColor(h.gainLossPct)}">${fmtPct(h.gainLossPct)}</td>
+        <td style="padding:7px 10px;color:var(--muted)">${h.purchasedAt ? h.purchasedAt.slice(0,16) : '—'}</td>
+      </tr>`;
+    }).join('');
+    html += `<div style="margin-bottom:22px">
+      <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">OPEN POSITIONS — RECOMMENDATIONS IN FLIGHT</div>
+      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+        <thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">
+          <th style="padding:7px 10px;text-align:left">TICKER</th><th style="padding:7px 10px;text-align:left">BUCKET</th>
+          <th style="padding:7px 10px;text-align:right">SCORE@BUY</th><th style="padding:7px 10px;text-align:left">SIGNAL@BUY</th>
+          <th style="padding:7px 10px;text-align:right">BUY PRICE</th><th style="padding:7px 10px;text-align:right">NOW</th>
+          <th style="padding:7px 10px;text-align:right">P&amp;L</th><th style="padding:7px 10px;text-align:left">BOUGHT</th>
+        </tr></thead><tbody>${rows}</tbody></table></div>
+      <div style="font-size:10px;color:var(--muted);margin-top:4px">SCORE@BUY shows "—" for positions bought before factor tracking was added.</div>
+    </div>`;
+  }
+
+  // ── SHADOW VALIDATION — grades the ranking on ALL candidates, no risk ────
+  const sh = stats.shadow;
+  if (sh && sh.graded) {
+    const edge = (sh.top5AvgExcessPct != null && sh.restAvgExcessPct != null)
+      ? sh.top5AvgExcessPct - sh.restAvgExcessPct : null;
+    const bandRows = Object.entries(sh.byCompositeBand || {}).map(([band, b]) =>
+      `<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:6px 10px;font-weight:700">${band}</td>
+        <td style="padding:6px 10px;text-align:right">${b.n}</td>
+        <td style="padding:6px 10px;text-align:right;color:${pctColor(b.avgFwdPct)}">${fmtPct(b.avgFwdPct)}</td>
+        <td style="padding:6px 10px;text-align:right;color:${pctColor(b.avgExcessPct)}">${fmtPct(b.avgExcessPct)}</td>
+      </tr>`).join('');
+    html += `<div style="margin-bottom:22px">
+      <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">SHADOW VALIDATION — ALL SCORED CANDIDATES (5-DAY FORWARD, NO TRADING RISK)</div>
+      <div style="display:flex;gap:18px;flex-wrap:wrap;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:8px;font-family:'DM Mono',monospace;font-size:11px">
+        <span>graded: <b>${sh.graded}</b> candidate-days over <b>${sh.snapshots}</b> snapshots</span>
+        <span>top-5 picks: <b style="color:${pctColor(sh.top5AvgExcessPct)}">${fmtPct(sh.top5AvgExcessPct)}</b> vs SPY</span>
+        <span>the rest: <b style="color:${pctColor(sh.restAvgExcessPct)}">${fmtPct(sh.restAvgExcessPct)}</b> vs SPY</span>
+        ${edge != null ? `<span>selection edge: <b style="color:${pctColor(edge)}">${fmtPct(edge)}</b></span>` : ''}
+      </div>
+      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+        <thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">
+          <th style="padding:6px 10px;text-align:left">COMPOSITE AT SCORING</th><th style="padding:6px 10px;text-align:right">N</th>
+          <th style="padding:6px 10px;text-align:right">AVG 5D RETURN</th><th style="padding:6px 10px;text-align:right">VS SPY</th>
+        </tr></thead><tbody>${bandRows}</tbody></table></div>
+      <div style="font-size:10px;color:var(--muted);margin-top:4px">If higher composite bands don't show higher forward returns here, the scoring matrix isn't ranking predictively — this table learns ~20× faster than waiting for real trades.</div>
+    </div>`;
+  }
+
+  // ── STATS + SUGGESTIONS — reuses the INSIGHTS renderer from the TradeAI tab
+  if (typeof _renderInsights === 'function') {
+    html += _renderInsights(stats);
+  }
+
+  // ── CLOSED TRADES — the validation record ─────────────────────────────────
+  const recent = stats.recent || [];
+  if (recent.length) {
+    const rows = recent.map(o => {
+      const f = o.factors || {};
+      return `<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:7px 10px;font-weight:700">${o.ticker}</td>
+        <td style="padding:7px 10px">${bktBadge(f.bucket)}</td>
+        <td style="padding:7px 10px;text-align:right">${f.composite != null ? f.composite : '—'}</td>
+        <td style="padding:7px 10px">${f.buySignal || '—'}</td>
+        <td style="padding:7px 10px;color:var(--muted)">${o.buyDate ? o.buyDate.slice(0,10) : '—'}</td>
+        <td style="padding:7px 10px;color:var(--muted)">${o.sellDate ? o.sellDate.slice(0,10) : '—'}</td>
+        <td style="padding:7px 10px;text-align:right">${o.daysHeld != null ? o.daysHeld + 'd' : '—'}</td>
+        <td style="padding:7px 10px">${o.trigger || '—'}</td>
+        <td style="padding:7px 10px;text-align:right;font-weight:700;color:${pctColor(o.gainLossPct)}">${fmtPct(o.gainLossPct)}</td>
+      </tr>`;
+    }).join('');
+    html += `<div style="margin-bottom:22px">
+      <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">CLOSED TRADES — LAST ${recent.length}</div>
+      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+        <thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">
+          <th style="padding:7px 10px;text-align:left">TICKER</th><th style="padding:7px 10px;text-align:left">BUCKET</th>
+          <th style="padding:7px 10px;text-align:right">SCORE@BUY</th><th style="padding:7px 10px;text-align:left">SIGNAL@BUY</th>
+          <th style="padding:7px 10px;text-align:left">BOUGHT</th><th style="padding:7px 10px;text-align:left">SOLD</th>
+          <th style="padding:7px 10px;text-align:right">HELD</th><th style="padding:7px 10px;text-align:left">EXIT</th>
+          <th style="padding:7px 10px;text-align:right">RESULT</th>
+        </tr></thead><tbody>${rows}</tbody></table></div>
+    </div>`;
+  } else {
+    html += `<div style="color:var(--muted);font-size:12px;padding:16px;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+      No closed trades logged yet. Outcomes are recorded automatically every time TradeAI sells a position — check back after the next few Recommend cycles.
+    </div>`;
+  }
+
+  return html;
+}
+{%- endraw %}
+</script>
