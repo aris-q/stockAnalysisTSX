@@ -3826,7 +3826,9 @@ def signal_history():
 
 if __name__ == "__main__":
     # Different port from the US repo (5050) so both can run side by side.
+    # NOT 5060/5061 — both are on Chrome/Safari's blocked "unsafe ports"
+    # list (reserved for SIP), so the browser refuses to connect at all.
     # use_reloader=False is required: the reloader forks a second process that
     # re-executes this module, doubling every background thread (scheduler,
     # startup refresh) and causing duplicate scheduled runs.
-    app.run(debug=True, port=5060, use_reloader=False)
+    app.run(debug=True, port=5090, use_reloader=False)

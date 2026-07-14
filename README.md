@@ -19,7 +19,7 @@ TSX Composite build of [stock-analysis](../stock-analysis), same design and pipe
 python -m venv venv
 venv\Scripts\activate        # or: source venv/bin/activate
 pip install -r requirements.txt
-python app.py                # http://127.0.0.1:5060
+python app.py                # http://127.0.0.1:5090
 ```
 
 Optional `.env` for FRED_API_KEY / NEWSAPI_KEY (Macro tab, News features) — not required
