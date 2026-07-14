@@ -285,6 +285,45 @@ def _version_stats_map():
     return {v: _outcome_stats(rows) for v, rows in grouped.items()}
 
 
+def _rule_based_trajectory(detail, cfg):
+    """Non-AI trajectory proxy: is the last 7 days' daily price pace faster
+    or slower than the trailing 30 days' daily pace? A real momentum signal
+    (not a qualitative judgment) — used because AI scoring is disabled in
+    this build, so trajectoryBonus would otherwise always be dead weight."""
+    c7 = detail.get("change7d")
+    c30 = detail.get("change30d")
+    if c7 is None or c30 is None:
+        return ""
+    daily_7d  = c7 / 7.0
+    daily_30d = c30 / 30.0
+    delta = daily_7d - daily_30d
+    thresh = float(cfg.get("accelDeltaThreshold", 0.15))
+    if delta > thresh:
+        return "Accelerating"
+    if delta < -thresh:
+        return "Decelerating"
+    return "Stable"
+
+
+def _rule_based_stage(detail, cfg):
+    """Non-AI stage proxy from revenue growth + market cap tier — reuses the
+    same cap thresholds as execution slippage tiers for consistency."""
+    growth = detail.get("revenueGrowth")
+    cap = detail.get("marketCap")
+    if growth is None:
+        return ""
+    if growth < 0:
+        return "Declining"
+    small_cap_below  = float(cfg.get("smallCapBelow", 3e8))
+    growth_threshold = float(cfg.get("growthThreshold", 40))
+    mature_threshold = float(cfg.get("matureThreshold", 10))
+    if growth >= growth_threshold:
+        return "Early-Stage" if (cap and cap < small_cap_below) else "Growth"
+    if growth >= mature_threshold:
+        return "Growth"
+    return "Mature"
+
+
 def _resolve_holding_price(ticker, pos, wl_map, details, dream_map):
     """Best-available current price for a held ticker: prefer the watchlist
     price when fresher than the Fetch Info detail price, else fall back
@@ -1474,6 +1513,15 @@ SCORING_DEFAULTS = {
     "sectorDiversity": {
         "penalty": -15
     },
+    # Feeds trajectoryBonus/stageBonus with a real, non-AI signal — see
+    # _rule_based_trajectory / _rule_based_stage. Only used as a fallback
+    # when ai.trajectory / ai.stage are empty (always, in this build).
+    "trajectoryStageRule": {
+        "accelDeltaThreshold": 0.15,  # %/day faster (or slower) than the 30d pace to call it Accelerating/Decelerating
+        "growthThreshold": 40,        # revenueGrowth% at/above this -> Growth or Early-Stage
+        "matureThreshold": 10,        # revenueGrowth% at/above this (below growthThreshold) -> Growth; below -> Mature
+        "smallCapBelow": 300000000    # marketCap below this, combined with high growth -> Early-Stage instead of Growth
+    },
     "purchaseMatrix": {
         "slots":         6,
         "maxDeployPct":  100,
@@ -2002,6 +2050,7 @@ def run_tradeai_recommend():
         REGIME_CFG      = cfg.get("regime", {})
         BKT_SC          = cfg.get("breakoutScore", {})
         SD_PENALTY      = cfg.get("sectorDiversity", {}).get("penalty", -15)
+        TS_RULE         = cfg.get("trajectoryStageRule", {})
 
         # Load today's signal forecasts for boost calculation
         today_str = datetime.now(TZ).strftime("%Y-%m-%d")
@@ -2053,8 +2102,13 @@ def run_tradeai_recommend():
             price = live_prices.get(ticker) or detail.get("price") or d_data.get("price")
 
             ai_score    = ai.get("aiScore") or 0
-            trajectory  = ai.get("trajectory", "")
-            stage       = ai.get("stage", "")
+            # AI is disabled in this build, so trajectory/stage fall back to
+            # rule-based proxies computed from real price/fundamental data
+            # instead of always being empty (see _rule_based_trajectory /
+            # _rule_based_stage) — otherwise trajectoryBonus/stageBonus would
+            # be dead weight for every bucket that relies on them.
+            trajectory  = ai.get("trajectory") or _rule_based_trajectory(detail, TS_RULE)
+            stage       = ai.get("stage") or _rule_based_stage(detail, TS_RULE)
             bkt_key     = bucket if bucket in BKT_WEIGHTS else "Dream"
             w           = BKT_WEIGHTS[bkt_key]
 
