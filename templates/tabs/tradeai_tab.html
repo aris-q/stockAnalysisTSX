@@ -61,6 +61,165 @@ function buildRollbackBanner(proposal) {
   </div>`;
 }
 
+// ── TUNING PROPOSAL — config change proposed from missed-gainer evidence ──
+// Never applied automatically. Same approve/dismiss + versioning pattern as
+// the rollback banner above, just a different underlying trigger: the
+// weekly missed-gainer analysis (see _check_tuning_candidate) instead of
+// version underperformance.
+function buildTuningBanner(proposal) {
+  if (!proposal || proposal.status !== 'pending') return '';
+  const c = proposal.proposedChange || {};
+  const f = proposal.forecast || {};
+  const keyName = (c.path || '').split('.').pop();
+  return `<div id="tuningBanner" style="border:1px solid #60a5fa;border-radius:10px;padding:14px 16px;margin-bottom:16px;background:rgba(96,165,250,0.08)">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+      <span style="font-size:16px">🎯</span>
+      <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:13px">CONFIG TUNING PROPOSED — your approval needed</span>
+    </div>
+    <div style="font-size:12px;color:var(--text);line-height:1.7;margin-bottom:8px">
+      Change: <b style="color:#60a5fa">${keyName}</b>: <b>${c.from}</b> → <b>${c.to}</b>
+    </div>
+    <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:8px">${proposal.reason || ''}</div>
+    <div style="font-size:11px;color:var(--text);line-height:1.7;margin-bottom:10px;padding:8px 10px;background:rgba(0,0,0,0.15);border-radius:6px">
+      <b>Historical backtest</b> (last ${proposal.windowDays} days, ${proposal.missedGainersAnalyzed} missed ${proposal.gainThresholdPct}%+ gainers, ${proposal.boughtRowsAnalyzed} bought rows analyzed):
+      would have caught <b style="color:var(--up)">${f.historicalMissedGainersWouldHaveCaught}/${f.historicalMissedGainersTotal}</b> missed gainers,
+      would have excluded <b style="color:${f.currentPicksWouldHaveExcluded > 0 ? 'var(--down)' : 'var(--up)'}">${f.currentPicksWouldHaveExcluded}</b> of what was actually bought.
+      <span style="color:var(--muted)">This is a candidate-pool count from real history, not a P&amp;L forecast — treat it as directional evidence.</span>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button onclick="approveTuning(this)" style="font-size:11px;padding:7px 16px;background:#60a5fa;border:none;border-radius:6px;color:#0a1420;cursor:pointer;font-family:'DM Mono',monospace;font-weight:700">✅ APPROVE CHANGE</button>
+      <button onclick="dismissTuning(this)" style="font-size:11px;padding:7px 16px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">DISMISS</button>
+    </div>
+  </div>`;
+}
+
+async function approveTuning(btn) {
+  if (!confirm('Apply this config change? This creates a new version — history is kept, and you can roll back to any prior version from the Validation tab.')) return;
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
+  try {
+    const r = await fetch('/tradeai/tuning/approve', { method: 'POST' }).then(res => res.json());
+    if (r.error) { alert('Approve failed: ' + r.error); btn.disabled = false; btn.textContent = orig; return; }
+    alert(`Applied as new v${r.newVersion}.`);
+    await _refreshTradeViews();
+  } catch(e) {
+    alert('Approve failed: ' + e.message);
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
+async function dismissTuning(btn) {
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
+  try {
+    const r = await fetch('/tradeai/tuning/dismiss', { method: 'POST' }).then(res => res.json());
+    if (r.error) { alert('Dismiss failed: ' + r.error); btn.disabled = false; btn.textContent = orig; return; }
+    await _refreshTradeViews();
+  } catch(e) {
+    alert('Dismiss failed: ' + e.message);
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
+// ── SEVERE NEWS WARNINGS — flag only, held positions, never auto-sell ──────
+// Detected server-side (run_tradeai_sell_check scans cached news for
+// bankruptcy/fraud/halt/recall-class keywords every ~20 min). This layer
+// is purely UI: a persistent banner + a highlighted, clickable ticker row,
+// plus a one-time popup the first time THIS browser sees a given headline
+// (tracked in localStorage — independent of the server-side active/
+// dismissed status, which is permanent and shared across devices).
+const NEWS_WARNING_SEEN_KEY = 'newsWarningSeenHashes';
+
+function _seenWarningHashes() {
+  try { return new Set(JSON.parse(localStorage.getItem(NEWS_WARNING_SEEN_KEY) || '[]')); }
+  catch(e) { return new Set(); }
+}
+function _markWarningSeen(hash) {
+  try {
+    const seen = _seenWarningHashes();
+    seen.add(hash);
+    localStorage.setItem(NEWS_WARNING_SEEN_KEY, JSON.stringify([...seen]));
+  } catch(e) {}
+}
+
+function checkNewNewsWarnings(data) {
+  const warnings = data.newsWarnings || {};
+  const seen = _seenWarningHashes();
+  const fresh = Object.entries(warnings).filter(([,w]) => w.status === 'active' && w.headlineHash && !seen.has(w.headlineHash));
+  if (!fresh.length) return;
+  fresh.forEach(([, w]) => _markWarningSeen(w.headlineHash));
+  showNewsWarningPopup(fresh.map(([tk, w]) => ({ticker: tk, ...w})));
+}
+
+function showNewsWarningPopup(items) {
+  const modal = document.getElementById('newsWarningModal');
+  const body = document.getElementById('newsWarningModalBody');
+  const title = document.getElementById('newsWarningModalTitle');
+  if (!modal || !body) return;
+  title.textContent = `🚨 ${items.length} New Severe News Alert${items.length===1?'':'s'}`;
+  body.innerHTML = items.map(w => _newsWarningCard(w)).join('');
+  modal.classList.add('visible');
+}
+
+function _newsWarningCard(w) {
+  const tickerSafe = (w.ticker||'').replace(/'/g, "\\'");
+  return `<div style="border:1px solid var(--down);border-radius:10px;padding:14px 16px;margin-bottom:12px;background:rgba(248,113,113,0.06)">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:15px;color:var(--down)">${w.ticker}</span>
+      <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(248,113,113,0.2);color:var(--down);font-weight:700;text-transform:uppercase">${w.keyword}</span>
+      <span style="font-size:10px;color:var(--muted);margin-left:auto">${w.detectedAt || ''}</span>
+    </div>
+    <div style="font-size:13px;color:var(--text);line-height:1.5;margin-bottom:8px">${(w.headline||'').replace(/</g,'&lt;')}</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">${w.provider || 'Unknown source'}${w.pubDate ? ' · ' + w.pubDate : ''}</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      ${w.url ? `<a href="${w.url}" target="_blank" rel="noopener" style="font-size:11px;padding:6px 14px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--text);text-decoration:none;font-family:'DM Mono',monospace">READ ARTICLE ↗</a>` : ''}
+      <button onclick="forceSellFromWarning('${tickerSafe}')" style="font-size:11px;padding:6px 14px;background:transparent;border:1px solid var(--down);border-radius:6px;color:var(--down);cursor:pointer;font-family:'DM Mono',monospace">SELL NOW</button>
+      <button onclick="dismissNewsWarningUI('${tickerSafe}', this)" style="font-size:11px;padding:6px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace;margin-left:auto">ACKNOWLEDGE — KEEP HOLDING</button>
+    </div>
+  </div>`;
+}
+
+function goToMacroTab() {
+  const tab = document.querySelector('.tab[data-tab="macro"]');
+  showTab('macro', tab);
+  loadMacro(true);
+}
+
+function openNewsWarningDetail(ticker) {
+  const data = _lastTradeAIData;
+  if (!data) return;
+  const w = (data.newsWarnings || {})[ticker];
+  if (!w) return;
+  showNewsWarningPopup([{ticker, ...w}]);
+}
+
+async function dismissNewsWarningUI(ticker, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '⏳'; }
+  try {
+    const r = await fetch('/tradeai/news_warning/dismiss', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ticker})
+    }).then(res => res.json());
+    if (r.error) { alert('Dismiss failed: ' + r.error); if (btn) { btn.disabled = false; btn.textContent = 'ACKNOWLEDGE — KEEP HOLDING'; } return; }
+    const card = btn ? btn.closest('div[style*="border-radius:10px"]') : null;
+    if (card) card.remove();
+    if (!document.querySelector('#newsWarningModalBody > div')) closeNewsWarningModal();
+    await _refreshTradeViews();
+  } catch(e) {
+    alert('Dismiss failed: ' + e.message);
+    if (btn) { btn.disabled = false; btn.textContent = 'ACKNOWLEDGE — KEEP HOLDING'; }
+  }
+}
+
+async function forceSellFromWarning(ticker) {
+  closeNewsWarningModal();
+  const h = ((_lastTradeAIData || {}).holdings || []).find(x => x.ticker === ticker);
+  await forceSellHolding(ticker, h ? h.shares : 0);
+}
+
+function closeNewsWarningModal() {
+  const modal = document.getElementById('newsWarningModal');
+  if (modal) modal.classList.remove('visible');
+}
+
 // Re-fetches every tab that shows account-derived numbers (holdings P&L,
 // version asset/account returns) — called after anything that refreshes
 // prices, so those numbers never sit stale until a tab is manually reopened.
@@ -453,22 +612,119 @@ async function resetTradeSimulation(btn) {
 // ── TRADEAI SIMULATION ────────────────────────────────────────────────────────
 
 let tradeAILoaded = false;
+let tradeAIRefreshTimer = null;
+let tradeAIRefreshInFlight = false;
+let _lastTradeAIData = null;
 
 async function loadTradeAI(force) {
   if (tradeAILoaded && !force) return null;
   const el = document.getElementById('tradeaiContent');
   el.innerHTML = '<div class="loading">Loading TradeAI simulation...</div>';
   try {
-    const res = await fetch('/tradeai');
+    const res = await fetch('/tradeai?t=' + Date.now(), {cache: 'no-store'});
     const data = await res.json();
     el.innerHTML = renderTradeAI(data);
     tradeAILoaded = true;
+    startTradeAIRefresh();
+    _lastTradeAIData = data;
+    checkNewNewsWarnings(data);
     console.log('[TradeAI] loaded | balance:' + data.balance + ' holdings:' + (data.holdings||[]).length + ' assessed:' + Object.keys(data.aiAssessments||{}).length);
     return data;
   } catch(e) {
     el.innerHTML = '<span style="color:var(--down)">Failed to load TradeAI data.</span>';
     console.error('[TradeAI] load FAIL:', e);
     return null;
+  }
+}
+
+function startTradeAIRefresh() {
+  if (tradeAIRefreshTimer) return;
+  tradeAIRefreshTimer = setInterval(async () => {
+    const panel = document.getElementById('tab-tradeai');
+    if (!panel || !panel.classList.contains('active') || tradeAIRefreshInFlight) return;
+    const status = await fetch('/status').then(r => r.json()).catch(() => ({running: true}));
+    if (status.running) return;
+    tradeAIRefreshInFlight = true;
+    try { await loadTradeAI(true); }
+    finally { tradeAIRefreshInFlight = false; }
+  }, 60000);
+}
+
+async function toggleScoringMatrix() {
+  const body = document.getElementById('scoringMatrixBody');
+  const arrow = document.getElementById('scoringMatrixArrow');
+  if (!body) return;
+  const opening = body.style.display === 'none';
+  body.style.display = opening ? 'block' : 'none';
+  if (arrow) arrow.textContent = opening ? '▾ collapse' : '▸ expand';
+  if (!opening || body.dataset.loaded === '1') return;
+  try {
+    const cfg = await fetch('/scoring/config?t=' + Date.now(), {cache: 'no-store'}).then(r => r.json());
+    const pm = cfg.purchaseMatrix || {};
+    const sell = cfg.sellThresholds || {};
+    const weights = cfg.bucketWeights || {};
+    const input = 'background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:5px 7px;color:var(--text);font-family:\'DM Mono\',monospace;font-size:11px;width:70px';
+    const field = (id, label, value) => `<label style="display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:11px;color:var(--muted)">${label}<input id="${id}" value="${value ?? ''}" style="${input}"></label>`;
+    body.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:18px">
+      <div><div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">BUY RULES</div>
+        ${field('matrixMinBuy', 'Minimum composite', pm.minBuyComposite ?? 60)}
+        ${field('matrixSlots', 'Maximum positions', pm.slots ?? 6)}
+        ${field('matrixDeploy', 'Deploy balance %', pm.maxDeployPct ?? 100)}
+        ${field('matrixEarnings', 'Earnings blackout days', pm.earningsBlackoutDays ?? 3)}
+        ${field('matrixRotationGap', 'Rotation score advantage', pm.rotationMinScoreGap ?? 15)}
+        ${field('matrixRotationCooldown', 'Re-entry cooldown (trading days)', pm.rotationCooldownTradingDays ?? 5)}
+      </div>
+      <div><div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">BUCKET WEIGHTS</div>
+        ${field('matrixMomentumDream', 'Momentum Dream', weights.Momentum?.dream ?? .15)}
+        ${field('matrixMomentumRule', 'Momentum rule', weights.Momentum?.ai ?? .65)}
+        ${field('matrixReversalDream', 'Reversal Dream', weights.Reversal?.dream ?? .15)}
+        ${field('matrixReversalRule', 'Reversal rule', weights.Reversal?.ai ?? .65)}
+        ${field('matrixSmartDream', 'Smart Money Dream', weights.SmartMoney?.dream ?? .3)}
+        ${field('matrixSmartRule', 'Smart Money rule', weights.SmartMoney?.ai ?? .55)}
+      </div>
+      <div><div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">SELL RULES</div>
+        ${field('matrixHardStop', 'Hard stop %', sell.stopLossHard ?? 8)}
+        ${field('matrixDailyStop', 'Daily-drop stop %', sell.dailyDropStop ?? 8)}
+        ${field('matrixSoftStop', 'Soft stop %', sell.stopLossSoft ?? 6)}
+        ${field('matrixTrailStop', 'Trailing stop %', sell.trailingStopPeak ?? 10)}
+        ${field('matrixSoftFloor', 'Rotation score floor', sell.softSellFloor ?? 50)}
+        ${field('matrixHoldDays', 'Minimum hold days', sell.minHoldDays ?? 3)}
+      </div>
+    </div><div style="display:flex;align-items:center;gap:10px;margin-top:16px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="saveScoringMatrix()">SAVE MATRIX</button>
+      <span id="matrixSaveStatus" style="font-size:10px;color:var(--muted)"></span>
+    </div>`;
+    body.dataset.loaded = '1';
+  } catch (e) {
+    body.innerHTML = '<div style="color:var(--down);font-size:11px">Unable to load scoring config.</div>';
+    console.error('[ScoringMatrix] load FAIL:', e);
+  }
+}
+
+async function saveScoringMatrix() {
+  const status = document.getElementById('matrixSaveStatus');
+  const number = id => Number(document.getElementById(id).value);
+  try {
+    const cfg = await fetch('/scoring/config?t=' + Date.now(), {cache: 'no-store'}).then(r => r.json());
+    const pm = cfg.purchaseMatrix || (cfg.purchaseMatrix = {});
+    const sell = cfg.sellThresholds || (cfg.sellThresholds = {});
+    const weights = cfg.bucketWeights || (cfg.bucketWeights = {});
+    pm.minBuyComposite = number('matrixMinBuy'); pm.slots = number('matrixSlots');
+    pm.maxDeployPct = number('matrixDeploy'); pm.earningsBlackoutDays = number('matrixEarnings');
+    pm.rotationMinScoreGap = number('matrixRotationGap'); pm.rotationCooldownTradingDays = number('matrixRotationCooldown');
+    weights.Momentum.dream = number('matrixMomentumDream'); weights.Momentum.ai = number('matrixMomentumRule');
+    weights.Reversal.dream = number('matrixReversalDream'); weights.Reversal.ai = number('matrixReversalRule');
+    weights.SmartMoney.dream = number('matrixSmartDream'); weights.SmartMoney.ai = number('matrixSmartRule');
+    sell.stopLossHard = number('matrixHardStop'); sell.dailyDropStop = number('matrixDailyStop');
+    sell.stopLossSoft = number('matrixSoftStop'); sell.trailingStopPeak = number('matrixTrailStop');
+    sell.softSellFloor = number('matrixSoftFloor'); sell.minHoldDays = number('matrixHoldDays');
+    if (![pm.minBuyComposite, pm.slots, pm.maxDeployPct].every(Number.isFinite)) throw new Error('Enter valid numbers');
+    const result = await fetch('/scoring/config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(cfg)}).then(r => r.json());
+    if (result.error) throw new Error(result.error);
+    if (status) status.textContent = result.changed?.length ? 'Saved. New Recommend version created.' : 'Saved. No changes detected.';
+  } catch (e) {
+    if (status) status.textContent = 'Save failed: ' + e.message;
+    console.error('[ScoringMatrix] save FAIL:', e);
   }
 }
 
@@ -492,20 +748,88 @@ function renderTradeAI(data) {
   const lastRec = data.lastRecommend || null;
   const balance = data.balance ?? 100000;
   const newsTsMap = data.newsTsMap || {};
+  const newsWarnings = data.newsWarnings || {};
+  const activeWarnings = Object.entries(newsWarnings).filter(([,w]) => w.status === 'active');
 
-  let totalCost = 0, totalValue = 0;
+  let totalCost = 0, totalValue = 0, totalPrevValue = 0, totalDayAmt = 0, haveDayData = false;
   holdings.forEach(h => {
     totalCost += (h.purchasePrice||0) * (h.shares||0);
     totalValue += (h.currentPrice||h.purchasePrice||0) * (h.shares||0);
+    if (h.previousClose != null) {
+      totalPrevValue += h.previousClose * (h.shares||0);
+      haveDayData = true;
+    }
+    if (h.dayChangeAmount != null) totalDayAmt += h.dayChangeAmount;
   });
   const totalGL = totalValue - totalCost;
   const glClass = totalGL >= 0 ? 'up' : 'down';
+  // Portfolio's own blended today % — directly comparable to the TSX
+  // day-change figures below (all three are "vs yesterday's close").
+  const acctTodayPct = (haveDayData && totalPrevValue > 0) ? (totalDayAmt / totalPrevValue * 100) : null;
 
   const months = [...new Set(transactions.map(t => t.date ? t.date.slice(0,7) : null).filter(Boolean))].sort().reverse();
   const monthOptions = months.map(m => `<option value="${m}">${m}</option>`).join('');
 
+  const bm = data.benchmarks || {};
+  function bmTile(label, b) {
+    const pct = b && b.dayChangePct;
+    const cls = pct == null ? 'var(--muted)' : (pct >= 0 ? 'var(--up)' : 'var(--down)');
+    const txt = pct == null ? '—' : (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
+    return `<div style="text-align:center">
+      <div style="font-size:10px;color:var(--muted);margin-bottom:2px">${label}</div>
+      <div class="trade-balance-big" style="color:${cls}">${txt}</div>
+    </div>`;
+  }
+  const acctCls = acctTodayPct == null ? 'var(--muted)' : (acctTodayPct >= 0 ? 'var(--up)' : 'var(--down)');
+  const acctTxt = acctTodayPct == null ? '—' : (acctTodayPct >= 0 ? '+' : '') + acctTodayPct.toFixed(2) + '%';
+
+  const macroSignal = data.macroSignal || {};
+  const macroBadgeStyle = {
+    riskOff: { c: 'var(--down)', bg: 'rgba(248,113,113,0.12)', icon: '⚠️', label: 'RISK-OFF' },
+    riskOn:  { c: 'var(--up)',   bg: 'rgba(74,222,128,0.12)',  icon: '📈', label: 'RISK-ON' },
+    neutral: { c: 'var(--muted)',bg: 'transparent',            icon: '•',  label: 'NEUTRAL' },
+  }[macroSignal.signal || 'neutral'];
+  const macroBadgeTitle = (macroSignal.reasons && macroSignal.reasons.length
+    ? macroSignal.reasons.join('; ')
+    : 'No notable macro signal — click to view Macro tab').replace(/"/g, '&quot;');
+  const macroBadge = `
+    <button onclick="goToMacroTab()" title="${macroBadgeTitle}" style="display:flex;align-items:center;gap:5px;font-size:10px;font-weight:700;padding:5px 10px;border-radius:6px;border:1px solid ${macroBadgeStyle.c};background:${macroBadgeStyle.bg};color:${macroBadgeStyle.c};cursor:pointer;font-family:'DM Mono',monospace;white-space:nowrap">
+      ${macroBadgeStyle.icon} MACRO: ${macroBadgeStyle.label} ▸
+    </button>`;
+
+  const benchmarkStrip = `
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:12px;display:flex;gap:24px;align-items:center">
+      <div style="font-size:10px;color:var(--muted);letter-spacing:0.5px">TODAY VS MARKET</div>
+      <div style="text-align:center">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">YOUR ACCOUNT</div>
+        <div class="trade-balance-big" style="color:${acctCls}">${acctTxt}</div>
+      </div>
+      ${bmTile('TSX Composite', bm.TSX)}
+      ${bmTile('TSX 60', bm.TSX60)}
+      ${macroBadge}
+      <div style="font-size:10px;color:var(--muted);margin-left:auto">${bm.TSX && bm.TSX.fetchedAt ? 'as of ' + bm.TSX.fetchedAt : 'not yet refreshed — click REFRESH PRICES'}</div>
+    </div>`;
+
+  // ── SEVERE NEWS WARNING BANNER — flags only, never sells automatically ──
+  const newsWarningBanner = activeWarnings.length === 0 ? '' : `
+    <div id="newsWarningBanner" style="border:1px solid var(--down);border-radius:10px;padding:14px 16px;margin-bottom:12px;background:rgba(248,113,113,0.1);animation:newsWarnPulse 2s ease-in-out infinite">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:${activeWarnings.length ? '10px' : '0'}">
+        <span style="font-size:18px">🚨</span>
+        <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:13px;color:var(--down)">SEVERE NEWS DETECTED — ${activeWarnings.length} holding${activeWarnings.length===1?'':'s'} flagged</span>
+        <span style="font-size:11px;color:var(--muted)">Flagged for your review only — nothing is sold automatically.</span>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        ${activeWarnings.map(([tk, w]) => `
+          <button onclick="openNewsWarningDetail('${tk}')" style="display:flex;align-items:center;gap:6px;font-size:11px;padding:6px 12px;background:rgba(248,113,113,0.15);border:1px solid var(--down);border-radius:6px;color:var(--text);cursor:pointer;font-family:'DM Mono',monospace">
+            <b style="color:var(--down)">${tk}</b><span style="color:var(--muted)">${w.keyword}</span><span style="color:var(--down)">▸</span>
+          </button>`).join('')}
+      </div>
+    </div>
+    <style>@keyframes newsWarnPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(248,113,113,0.25); } 50% { box-shadow: 0 0 0 6px rgba(248,113,113,0); } }
+    @media (prefers-reduced-motion: reduce) { #newsWarningBanner { animation: none; } }</style>`;
+
   const holdingsRows = holdings.length === 0
-    ? `<tr><td colspan="14" style="color:var(--muted);text-align:center;padding:20px">No holdings yet. Run Identify → Fetch Info → AI Analyze → Recommend.</td></tr>`
+    ? `<tr><td colspan="15" style="color:var(--muted);text-align:center;padding:20px">No holdings yet. Run Identify → Fetch Info → AI Analyze → Recommend.</td></tr>`
     : holdings.map(h => {
         const gl = h.gainLoss;
         const glPct = h.gainLossPct;
@@ -515,18 +839,29 @@ function renderTradeAI(data) {
           const cls = val >= 0 ? 'var(--up)' : 'var(--down)';
           return '<td style="color:' + cls + ';text-align:right;font-family:\'DM Mono\',monospace;font-size:11px">' + (val >= 0 ? '+' : '') + val.toFixed(2) + '%</td>';
         }
+        function dayAmt(val) {
+          if (val == null) return '<td style="color:var(--muted);text-align:right">—</td>';
+          const cls = val >= 0 ? 'var(--up)' : 'var(--down)';
+          return '<td style="color:' + cls + ';text-align:right;font-family:\'DM Mono\',monospace;font-size:11px">' + (val >= 0 ? '+' : '') + fmt$(val) + '</td>';
+        }
         const tickerSafe = h.ticker.replace(/'/g, "\\'");
-        return `<tr>
-          <td><span style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px">${h.ticker}</span></td>
+        const warn = newsWarnings[h.ticker];
+        const isWarned = warn && warn.status === 'active';
+        const sentiment = (aiAssessments[h.ticker] || {}).newsSentiment;
+        const sentIcon = sentimentIcon(sentiment);
+        const sentBadge = sentIcon ? ` <span title="News sentiment: ${sentiment}" style="font-size:11px">${sentIcon}</span>` : '';
+        return `<tr${isWarned ? ' style="background:rgba(248,113,113,0.08);box-shadow:inset 3px 0 0 var(--down)"' : ''}>
+          <td><span style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px">${h.ticker}</span>${sentBadge}${isWarned ? ` <span onclick="event.stopPropagation();openNewsWarningDetail('${tickerSafe}')" title="Severe news: ${(warn.keyword||'').replace(/"/g,'')} — click for details" style="cursor:pointer;font-size:12px">🚨</span>` : ''}</td>
           <td>${h.shares}</td>
           <td>${fmt$(h.purchasePrice)}</td>
           <td>${fmt$(h.previousClose)}</td>
           <td>${fmt$(h.currentPrice)}</td>
-          ` + dayPct(h.dayChangePct) + `
+          ` + dayPct(h.dayChangePct) + dayAmt(h.dayChangeAmount) + `
           <td class="${glCls}">${fmt$(gl)}</td>
           <td class="${glCls}">${fmtPct(glPct)}</td>
           ` + dayPct(h.change5d) + dayPct(h.change4d) + dayPct(h.change3d) + dayPct(h.change2d) + dayPct(h.change1d) + `
-          <td><button onclick="event.stopPropagation();editHolding('${tickerSafe}',${h.shares},${h.purchasePrice})" style="font-size:10px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer">✏️</button></td>
+          <td style="white-space:nowrap"><button onclick="event.stopPropagation();editHolding('${tickerSafe}',${h.shares},${h.purchasePrice})" style="font-size:10px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer">✏️</button>
+          <button onclick="event.stopPropagation();forceSellHolding('${tickerSafe}',${h.shares})" title="Sell this holding now" style="font-size:10px;padding:2px 7px;margin-left:4px;background:transparent;border:1px solid var(--down);border-radius:4px;color:var(--down);cursor:pointer">SELL</button></td>
         </tr>`;
       }).join('');
 
@@ -534,10 +869,14 @@ function renderTradeAI(data) {
   function signalBadge(sig) {
     const colors = {
       'Strong Buy': '#4ade80', 'Buy': '#86efac',
-      'Hold': '#fbbf24', 'Avoid': '#f87171', 'Unknown': '#6b7280'
+      'Hold': '#fbbf24', 'Avoid': '#f87171', 'Unknown': '#ffffff'
     };
-    const c = colors[sig] || '#6b7280';
+    const c = colors[sig] || '#ffffff';
     return `<span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${c}22;color:${c};border:1px solid ${c}44;font-weight:700">${sig||'—'}</span>`;
+  }
+
+  function sentimentIcon(s) {
+    return { positive: '📈', negative: '📉', neutral: '➖' }[(s||'').toLowerCase()] || '';
   }
 
   function trajectoryIcon(t) {
@@ -587,10 +926,10 @@ function renderTradeAI(data) {
           </div>
           <div style="flex:1">
             <div class="trade-candidate-reason">${item.reason || '—'}</div>
-            ${hasAI ? `<div style="display:flex;gap:6px;align-items:center;margin-top:4px">${signalBadge(ai.buySignal)}<span style="font-size:10px;color:var(--muted)">${trajectoryIcon(ai.trajectory)} ${ai.trajectory||''} · ${ai.stage||''}</span></div>` : ''}
+            ${hasAI ? `<div style="display:flex;gap:6px;align-items:center;margin-top:4px">${signalBadge(ai.buySignal)}<span style="font-size:10px;color:var(--muted)">${trajectoryIcon(ai.trajectory)} ${ai.trajectory||''} · ${ai.stage||''}</span>${sentimentIcon(ai.newsSentiment) ? `<span title="News sentiment: ${ai.newsSentiment}" style="font-size:11px">${sentimentIcon(ai.newsSentiment)}</span>` : ''}</div>` : ''}
           </div>
           <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
-            ${(()=>{const bkt=item.bucket||'';const bktColors={'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','Insider':'#f97316','Account':'#4ade80','Dream':'#6b7280'};const bc=bktColors[bkt]||'#6b7280';return bkt?`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt.toUpperCase()}</span>`:''})()}
+            ${(()=>{const bkt=item.bucket||'';const bktColors={'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','Insider':'#f97316','Account':'#4ade80','Dream':'#ffffff'};const bc=bktColors[bkt]||'#ffffff';return bkt?`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt.toUpperCase()}</span>`:''})()}
             ${hasAI && ai.aiScore != null ? `<span style="font-size:12px;font-weight:800;color:var(--accent);font-family:'DM Mono',monospace">${ai.aiScore}<span style="font-size:9px;color:var(--muted)">/100</span></span>` : ''}
             <span class="trade-candidate-source">${item.source || ''}</span>
             <button onclick="event.stopPropagation();refreshTickerNews('${item.ticker}', this)" style="font-size:9px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">🔄 NEWS</button>
@@ -615,7 +954,7 @@ function renderTradeAI(data) {
   <!-- TRADEAI TOP CONTROL BAR -->
   <div style="display:grid;grid-template-columns:repeat(5,1fr) auto;gap:12px;margin-bottom:28px;align-items:start">
     ${['identify','fetch','macro','analyze','recommend'].map((op, i) => {
-      const labels  = ['IDENTIFY','FETCH INFO','REFRESH MACRO','AI ANALYZE','RECOMMEND'];
+      const labels  = ['IDENTIFY','FETCH INFO','REFRESH MACRO','RULE ANALYZE','RECOMMEND'];
       const ops     = ['identify','fetch','macro','analyze','recommend'];
       const tsKeys  = ['identifiedAt','detailsFetchedAt','macroFetchedAt','aiAnalyzedAt','lastRecommendAt'];
       const tsVals  = [data.identifiedAt, data.detailsFetchedAt, data.macroFetchedAt, data.aiAnalyzedAt, (data.lastRecommend||{}).scoredAt];
@@ -658,6 +997,7 @@ function renderTradeAI(data) {
   </div>
 
   ${buildRollbackBanner(data.rollbackProposal)}
+  ${buildTuningBanner(data.tuningProposal)}
 
   <!-- ACCOUNT SECTION -->
   <div class="trade-section">
@@ -679,9 +1019,15 @@ function renderTradeAI(data) {
         <button class="btn" style="color:var(--down);border-color:var(--down)" onclick="resetTradeAISimulation(this)">RESET</button>
       </div>
     </div>
+    ${(data.resetPending && data.resetPending.status === 'pending') ? `
+    <div style="border:1px solid var(--warn);border-radius:10px;padding:10px 16px;margin-bottom:12px;background:rgba(251,191,36,0.08);font-size:11px;color:var(--warn)">
+      ⏳ Reset queued — will auto dream-scan → identify → analyze → buy-in $${Number(data.resetPending.targetBalance).toLocaleString()} at the next Recommend window (10am/11am ET).
+    </div>` : ''}
+    ${newsWarningBanner}
+    ${benchmarkStrip}
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden">
       <table class="trade-account-table">
-        <thead><tr><th>TICKER</th><th>SHARES</th><th>PURCHASE</th><th>YEST CLOSE</th><th>CURRENT</th><th style="text-align:right">TODAY %</th><th>GAIN/LOSS</th><th>%</th><th style="text-align:right">D-5</th><th style="text-align:right">D-4</th><th style="text-align:right">D-3</th><th style="text-align:right">D-2</th><th style="text-align:right">D-1</th><th></th></tr></thead>
+        <thead><tr><th>TICKER</th><th>SHARES</th><th>PURCHASE</th><th>YEST CLOSE</th><th>CURRENT</th><th style="text-align:right">TODAY %</th><th style="text-align:right">TODAY $</th><th>GAIN/LOSS</th><th>%</th><th style="text-align:right">D-5</th><th style="text-align:right">D-4</th><th style="text-align:right">D-3</th><th style="text-align:right">D-2</th><th style="text-align:right">D-1</th><th></th></tr></thead>
         <tbody>${holdingsRows}</tbody>
       </table>
     </div>
@@ -709,12 +1055,25 @@ function renderTradeAI(data) {
     </div>
   </div>
 
+  <!-- RECENT ACTIVITY — sourced from the raw transaction log, so sells from
+       the sell-check cycle / rotation / manual force-sell show up immediately,
+       not only after the next Recommend run repopulates lastRecommend. -->
+  <div class="trade-section">
+    <div class="trade-section-header">
+      <div>
+        <div class="trade-section-title">📜 RECENT ACTIVITY</div>
+        <div class="trade-section-sub">Last 15 trades, most recent first · buy &amp; sell details incl. gain/loss</div>
+      </div>
+    </div>
+    ${renderRecentActivity(transactions)}
+  </div>
+
   <!-- IDENTIFY / CANDIDATES SECTION -->
   <div class="trade-section">
     <div class="trade-section-header">
       <div>
         <div class="trade-section-title">CANDIDATES</div>
-        <div class="trade-section-sub">Holdings + top dream scorers · max 15${data.identifiedAt ? ' · last run: ' + data.identifiedAt : ''}</div>
+        <div class="trade-section-sub">Holdings + top dream scorers · max 30${data.identifiedAt ? ' · last run: ' + data.identifiedAt : ''}</div>
       </div>
     </div>
     ${identifiedHtml}
@@ -729,6 +1088,20 @@ function renderTradeAI(data) {
       </div>
     </div>
     ${recHtml}
+  </div>
+
+  <!-- SEVERE NEWS WARNING MODAL -->
+  <div class="modal-overlay" id="newsWarningModal" onclick="if(event.target===this)closeNewsWarningModal()">
+    <div class="modal" style="width:640px">
+      <div class="modal-header">
+        <div>
+          <div class="modal-title" id="newsWarningModalTitle" style="color:var(--down)">🚨 Severe News Alert</div>
+          <div class="modal-subtitle">Flagged automatically from held-position news — your call on each one.</div>
+        </div>
+        <button class="modal-close" onclick="closeNewsWarningModal()">✕</button>
+      </div>
+      <div id="newsWarningModalBody"></div>
+    </div>
   </div>
 
   <!-- TRANSACTIONS MODAL -->
@@ -749,8 +1122,8 @@ function renderTradeAI(data) {
 
 function renderAIAssessment(ai) {
   if (!ai) return '';
-  const sigColors = {'Strong Buy':'#4ade80','Buy':'#86efac','Hold':'#fbbf24','Avoid':'#f87171','Unknown':'#6b7280'};
-  const c = sigColors[ai.buySignal] || '#6b7280';
+  const sigColors = {'Strong Buy':'#4ade80','Buy':'#86efac','Hold':'#fbbf24','Avoid':'#f87171','Unknown':'#ffffff'};
+  const c = sigColors[ai.buySignal] || '#ffffff';
   return `
   <div style="margin-top:12px;padding:12px 14px;background:rgba(139,92,246,0.05);border:1px solid rgba(139,92,246,0.2);border-radius:8px">
     <div style="font-size:10px;letter-spacing:1px;color:#a78bfa;margin-bottom:8px">🤖 AI ASSESSMENT</div>
@@ -849,6 +1222,65 @@ function showRecommendSummary(rec) {
   modal.classList.add('visible');
 }
 
+// Reads straight from the full transaction log (not lastRecommend), so it
+// reflects sells from ANY source — Recommend rotation/hard-sell, the
+// standalone sell-check stop-loss cycle, and manual force-sells — the
+// moment they happen, instead of only after the next Recommend run.
+function renderRecentActivity(transactions, limit) {
+  limit = limit || 15;
+  const rows = (transactions || [])
+    .map((t, i) => ({...t, _idx: i}))
+    .sort((a, b) => (b.date || '').localeCompare(a.date || ''))
+    .slice(0, limit);
+
+  if (!rows.length) {
+    return `<div style="color:var(--muted);padding:16px">No trades yet.</div>`;
+  }
+
+  function fmtDate(d) { return d ? d.slice(0, 16) : '—'; }
+
+  const trs = rows.map(t => {
+    const isBuy = t.action === 'BUY';
+    const cls = isBuy ? 'var(--up)' : 'var(--down)';
+    // Older sell records predate the purchasePrice/purchasedAt fields — fall
+    // back to deriving purchase price from pctFromPurchase when available.
+    let boughtPrice = t.purchasePrice;
+    if (boughtPrice == null && t.pctFromPurchase != null && t.pctFromPurchase !== -100) {
+      boughtPrice = t.price / (1 + t.pctFromPurchase / 100);
+    }
+    const boughtDate = t.purchasedAt ? fmtDate(t.purchasedAt) : '—';
+    const boughtCell = isBuy ? '—' : `${boughtDate}${boughtPrice != null ? ' @ ' + fmt$(boughtPrice) : ''}`;
+    const glPct = t.pctFromPurchase;
+    const glCls = (t.gainLoss || 0) >= 0 ? 'var(--up)' : 'var(--down)';
+    const srcBadge = t.rotation ? 'rotation' : t.manual ? 'manual' : t.stopLoss ? 'stop-loss' : isBuy ? '' : 'recommend';
+    return `<tr>
+      <td style="white-space:nowrap;font-family:'DM Mono',monospace;font-size:10px">${fmtDate(t.date)}</td>
+      <td><span class="trade-action-badge ${isBuy ? 'buy' : 'sell'}" style="font-size:9px">${t.action}</span></td>
+      <td style="font-family:'Syne',sans-serif;font-weight:700">${t.ticker}</td>
+      <td style="text-align:right">${t.shares}</td>
+      <td style="text-align:right">${fmt$(t.price)}${!isBuy ? ` <button onclick="editTransaction(${t._idx},'${(t.ticker||'').replace(/'/g,"\\'")}',${t.price})" title="Edit sell price" style="font-size:9px;padding:0 4px;margin-left:2px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✏️</button>` : ''}</td>
+      <td style="text-align:right">${fmt$(t.amount)}</td>
+      <td style="font-size:10px;color:var(--muted);white-space:nowrap">${boughtCell}</td>
+      <td style="text-align:right;color:${isBuy ? 'var(--muted)' : glCls}">${isBuy ? '—' : fmt$(t.gainLoss)}</td>
+      <td style="text-align:right;color:${isBuy ? 'var(--muted)' : glCls}">${isBuy || glPct == null ? '—' : (glPct >= 0 ? '+' : '') + glPct.toFixed(2) + '%'}</td>
+      <td style="font-size:10px;color:var(--muted)">${srcBadge}</td>
+      <td style="font-size:10px;color:var(--muted);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(t.reason||'').replace(/"/g,'&quot;')}">${t.reason || '—'}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;overflow-x:auto">
+      <table class="trade-txn-table">
+        <thead><tr>
+          <th>DATE</th><th>ACTION</th><th>TICKER</th><th style="text-align:right">SHARES</th>
+          <th style="text-align:right">PRICE</th><th style="text-align:right">AMOUNT</th><th>BOUGHT</th>
+          <th style="text-align:right">GAIN/LOSS</th><th style="text-align:right">%</th><th>TRIGGER</th><th>REASON</th>
+        </tr></thead>
+        <tbody>${trs}</tbody>
+      </table>
+    </div>`;
+}
+
 function renderTradeAIRecommend(rec, identified) {
   const buys = rec.buys || [];
   const sells = rec.sells || [];
@@ -858,13 +1290,13 @@ function renderTradeAIRecommend(rec, identified) {
   const candMap = {};
   (identified || []).forEach(item => { candMap[item.ticker] = item; });
 
-  const bktColors = {'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','Insider':'#f97316','Account':'#4ade80','Dream':'#6b7280'};
+  const bktColors = {'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','Insider':'#f97316','Account':'#4ade80','Dream':'#ffffff'};
   function strategyBadge(ticker) {
     const cand = candMap[ticker];
     if (!cand) return '';
     const parts = [];
     if (cand.bucket) {
-      const bc = bktColors[cand.bucket] || '#6b7280';
+      const bc = bktColors[cand.bucket] || '#ffffff';
       parts.push(`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${cand.bucket.toUpperCase()}</span>`);
     }
     if (cand.source) {
@@ -899,13 +1331,13 @@ function renderTradeAIRecommend(rec, identified) {
         <div style="font-size:11px;color:var(--muted);margin-top:4px;font-style:italic">${s.reason}</div>
       </div>`).join('');
 
-  const sigColors = {'Strong Buy':'#4ade80','Buy':'#86efac','Hold':'#fbbf24','Avoid':'#f87171','Unknown':'#6b7280'};
+  const sigColors = {'Strong Buy':'#4ade80','Buy':'#86efac','Hold':'#fbbf24','Avoid':'#f87171','Unknown':'#ffffff'};
   const scoreRows = scored.map((s, i) => {
-    const c = sigColors[s.buySignal] || '#6b7280';
+    const c = sigColors[s.buySignal] || '#ffffff';
     const cand = candMap[s.ticker];
     const bkt = cand && cand.bucket ? cand.bucket : '—';
     const src = cand && cand.source ? cand.source : '—';
-    const bc = bktColors[bkt] || '#6b7280';
+    const bc = bktColors[bkt] || '#ffffff';
     return `<tr>
       <td>${i+1}</td>
       <td style="font-family:'Syne',sans-serif;font-weight:700">${s.ticker}</td>
@@ -932,7 +1364,7 @@ function renderTradeAIRecommend(rec, identified) {
         ${sellCards}
       </div>
     </div>
-    <div style="font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:10px">AI COMPOSITE SCORES</div>
+    <div style="font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:10px">RULE COMPOSITE SCORES</div>
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden">
       <table class="trade-txn-table">
         <thead><tr><th>#</th><th>TICKER</th><th>STRATEGY</th><th>SOURCE</th><th>DREAM</th><th>AI</th><th>SIGNAL</th><th>TRAJECTORY</th><th>STAGE</th><th>COMPOSITE</th><th>STATUS</th></tr></thead>
@@ -1150,6 +1582,20 @@ async function editHolding(ticker, currentShares, currentPrice) {
   } catch(e) { console.error('[TradeAI] editHolding FAIL:', e); }
 }
 
+async function forceSellHolding(ticker, shares) {
+  if (!confirm(`Force sell ${shares} shares of ${ticker} at the next fresh quote?`)) return;
+  try {
+    const r = await fetch('/tradeai/force_sell', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ ticker })
+    });
+    const d = await r.json();
+    if (d.error) { alert('Force sell failed: ' + d.error); return; }
+    alert(`${ticker} sold: ${d.transaction.shares} shares @ $${Number(d.transaction.price).toFixed(4)}. Proceeds: $${Number(d.transaction.amount).toFixed(2)}`);
+    await _refreshTradeViews();
+  } catch(e) { alert('Force sell failed: ' + e.message); }
+}
+
 async function editBalance(currentBalance) {
   const val = prompt('Set new cash balance:', currentBalance);
   if (val === null) return;
@@ -1176,25 +1622,35 @@ async function editTransaction(index, ticker, currentPrice) {
     const d = await r.json();
     if (d.error) { alert('Error: ' + d.error); return; }
     console.log('[TradeAI] transaction edited: idx', index, 'price', val);
-    await showAITransactions();
+    // Refresh whichever view(s) are currently showing this transaction.
+    const txnModal = document.getElementById('aiTxnModal');
+    if (txnModal && txnModal.classList.contains('visible')) await showAITransactions();
+    if (tradeAILoaded) await loadTradeAI(true);
   } catch(e) { console.error('[TradeAI] editTransaction FAIL:', e); }
 }
 
 async function resetTradeAISimulation(btn) {
-  const balStr = prompt('Reset TradeAI simulation.\n\nEnter starting cash balance:', '100000');
+  if (!confirm('Reset the TradeAI account?\n\nThis clears all current holdings and transactions and starts a new account epoch. Past trade history stays available separately in Insights (nothing is deleted) so you can compare old vs. new.\n\nContinue?')) return;
+
+  const balStr = prompt('Enter the new starting cash balance:', '100000');
   if (balStr === null) return;
   const balance = parseFloat(balStr);
   if (isNaN(balance) || balance < 0) { alert('Invalid balance amount.'); return; }
-  if (!confirm('This will wipe ALL AI holdings, trades and history. Irreversible. Continue?')) return;
+
+  const autoBuyIn = confirm('Automatically buy in?\n\nOK = run the full pipeline (dream scan → identify → analyze → buy) at the next Recommend window (10am or 11am ET) and deploy the new balance.\nCancel = leave it as cash only — you can run Identify/Recommend yourself whenever you want.');
+
   btn.disabled = true;
   btn.textContent = '⏳';
   try {
     const res = await fetch('/tradeai/reset', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ balance })
+      body: JSON.stringify({ balance, autoBuyIn })
     });
     const data = await res.json();
-    console.log('[TradeAI] reset complete | balance:', data.balance);
+    console.log('[TradeAI] reset complete | balance:', data.balance, 'epoch:', data.epoch, 'autoBuyIn:', data.autoBuyIn);
+    alert(`Account reset to ${fmt$(data.balance)} (epoch ${data.epoch}).` + (data.autoBuyIn
+      ? ' Buy-in is queued for the next Recommend window (10am/11am ET).'
+      : ' No auto buy-in — run Identify/Recommend yourself whenever ready.'));
     btn.textContent = 'RESET';
     btn.disabled = false;
     if (tradeAILoaded) loadTradeAI(true);
@@ -1582,13 +2038,14 @@ async function doReportReset(all) {
 <script>
 {%- raw %}
 // ── TRADEAI SCORING INSIGHTS ────────────────────────────────────────────────
-async function showAIInsights() {
+async function showAIInsights(epoch) {
   const modal = document.getElementById('aiInsightsModal');
   const body  = document.getElementById('aiInsightsBody');
   body.innerHTML = '<div style="color:var(--muted);padding:20px">Loading outcome stats...</div>';
   modal.classList.add('visible');
   try {
-    const d = await fetch('/tradeai/stats').then(r => r.json());
+    const url = '/tradeai/stats' + (epoch ? '?epoch=' + encodeURIComponent(epoch) : '');
+    const d = await fetch(url).then(r => r.json());
     body.innerHTML = _renderInsights(d);
     document.getElementById('aiInsightsSubtitle').textContent =
       `${d.outcomesLogged} closed trades logged · ${d.outcomesWithFactors} with factor data`;
@@ -1633,6 +2090,20 @@ function _insightGroupTable(title, groups) {
 
 function _renderInsights(d) {
   let html = '';
+  // Epoch filter — a reset never deletes trade_outcomes history, it starts
+  // a new epoch, so let the user look at "all time" or just one slice.
+  const epochs = d.epochs || [];
+  if (epochs.length) {
+    const selected = d.selectedEpoch == null ? 'all' : String(d.selectedEpoch);
+    const opts = ['<option value="all"' + (selected === 'all' ? ' selected' : '') + '>All time</option>']
+      .concat(epochs.map(e => `<option value="${e.epoch}"${selected === String(e.epoch) ? ' selected' : ''}>Epoch ${e.epoch} — ${e.label}</option>`));
+    html += `<div style="margin-bottom:14px;display:flex;align-items:center;gap:8px">
+      <span style="font-size:10px;color:var(--muted);letter-spacing:0.5px">SHOWING</span>
+      <select onchange="showAIInsights(this.value)" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px">
+        ${opts.join('')}
+      </select>
+    </div>`;
+  }
   // Suggestions first — this is the feedback loop
   if (d.suggestions && d.suggestions.length) {
     html += `<div style="margin-bottom:18px">

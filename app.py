@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, redirect, jsonify, make_response
-import json, os, logging, threading, time
+import json, os, logging, threading, time, hashlib
 from config import WATCHLIST, OUTPUT_PATH, NEWS_PATH, WATCHLIST_PATH, TRADES_AI_PATH, TRADE_AI_CANDIDATES_PATH
 try:
     from config import FRED_API_KEY, NEWSAPI_KEY, MACRO_PATH
@@ -10,11 +10,48 @@ except ImportError:
 DREAM_PATH = "output/dream.json"
 TRADE_OUTCOMES_PATH = "output/trade_outcomes.json"
 SHADOW_PATH = "output/shadow_candidates.json"
-from fetcher import fetch_yfinance, fetch_daily_gainers, fetch_news, fetch_price_context, fetch_price_only, fetch_macro_data, fetch_dream_candidates, fetch_trade_detail, fetch_ticker_news, fetch_ai_analyze, fetch_live_prices, fetch_prev_closes
+EPOCHS_PATH = "output/account_epochs.json"
+RESET_PENDING_PATH = "output/reset_pending.json"
+
+def _load_epochs():
+    return load_json(EPOCHS_PATH, {"epochs": []})
+
+def _record_new_epoch(balance, label=None):
+    """Called on /tradeai/reset. Trade/scoring history (trade_outcomes.json,
+    recommend_versions.json) is deliberately NOT cleared on reset — the user
+    wants pre/post-reset performance kept separate for comparison rather than
+    lost, so Insights buckets outcomes by which epoch their sell date falls
+    in instead of wiping anything."""
+    db = _load_epochs()
+    epoch_num = len(db["epochs"]) + 1
+    entry = {
+        "epoch": epoch_num, "startedAt": ts(),
+        "label": label or f"Reset on {datetime.now(ET).strftime('%B %-d, %Y')}",
+        "startingBalance": balance,
+    }
+    db["epochs"].append(entry)
+    save_json(EPOCHS_PATH, db)
+    log.info(f"[Epoch] new epoch {epoch_num} started | balance:${balance:,.2f} | label:{entry['label']}")
+    return entry
+
+def _epoch_for_date(date_str, epochs):
+    """Which epoch a YYYY-MM-DD... date string falls into (epochs are sorted
+    ascending by startedAt; a record before any epoch's start belongs to the
+    earliest/implicit epoch 0 — pre-dates this feature)."""
+    if not date_str:
+        return 0
+    matched = 0
+    for e in epochs:
+        if date_str >= e["startedAt"]:
+            matched = e["epoch"]
+        else:
+            break
+    return matched
+from fetcher import fetch_yfinance, fetch_daily_gainers, fetch_news, fetch_price_context, fetch_price_only, fetch_macro_data, fetch_dream_candidates, fetch_trade_detail, fetch_ticker_news, fetch_live_prices, fetch_prev_closes
 from compute import process_watchlist
 from ai_summary import generate_summary, generate_recommendations, generate_followup, generate_news_impact
-from refresh_manager import check_what_needs_refresh, needs_news_refresh, now
-from datetime import datetime
+from refresh_manager import check_what_needs_refresh, needs_news_refresh, now, hours_since
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 os.makedirs("logs", exist_ok=True)
@@ -42,8 +79,6 @@ def _sanitize_str(s):
 def _sanitize_news(items):
     return [{k: _sanitize_str(v) for k, v in item.items()} for item in items]
 
-
-# watchlist = list(WATCHLIST)
 
 def load_watchlist():
     try:
@@ -231,7 +266,7 @@ def load_recommend_versions():
                 "0.2% slippage per side on fills",
                 "minHoldDays=3 hysteresis on rotation sells",
                 "Signal forecast boost disabled (measured: 49% direction accuracy = coin flip)",
-                "Gemini prompt recalibrated: batch-relative scoring, full 0-100 range, max 1-2 Strong Buys",
+                "Rule-based candidate scoring with full 0-100 range",
                 "Outcome logging with buy-time factors (this validation system)",
             ],
             "configSnapshot": v2_cfg,
@@ -285,43 +320,197 @@ def _version_stats_map():
     return {v: _outcome_stats(rows) for v, rows in grouped.items()}
 
 
-def _rule_based_trajectory(detail, cfg):
-    """Non-AI trajectory proxy: is the last 7 days' daily price pace faster
-    or slower than the trailing 30 days' daily pace? A real momentum signal
-    (not a qualitative judgment) — used because AI scoring is disabled in
-    this build, so trajectoryBonus would otherwise always be dead weight."""
-    c7 = detail.get("change7d")
-    c30 = detail.get("change30d")
-    if c7 is None or c30 is None:
-        return ""
-    daily_7d  = c7 / 7.0
-    daily_30d = c30 / 30.0
-    delta = daily_7d - daily_30d
-    thresh = float(cfg.get("accelDeltaThreshold", 0.15))
-    if delta > thresh:
-        return "Accelerating"
-    if delta < -thresh:
-        return "Decelerating"
-    return "Stable"
+def _cap_filtered_candidates(candidates_sorted, holdings, details, identify_rules, exclude_ticker=None):
+    """Walk composite-sorted candidates, keeping only those that respect a
+    max-per-bucket cap and (optionally) a sector hard-block — both counted
+    against current holdings first, then against candidates already kept
+    earlier in this same walk. A candidate that's blocked is skipped, not a
+    stop condition, so a lower-ranked but compliant candidate can still take
+    the slot. `exclude_ticker` lets a rotation sell free its own bucket/
+    sector before the replacement is picked. Returns the full filtered list
+    in order — callers slice off however many slots they actually need."""
+    max_per_bucket    = int(identify_rules.get("maxPerBucketFinal", 3))
+    hard_block_sector = bool(identify_rules.get("hardBlockSectorDiversity", False))
+
+    bucket_counts = {}
+    held_sectors = set()
+    for t, pos in holdings.items():
+        if t == exclude_ticker:
+            continue
+        b = (pos.get("factors") or {}).get("bucket", "Dream")
+        bucket_counts[b] = bucket_counts.get(b, 0) + 1
+        sector = details.get(t, {}).get("sector") or ""
+        if sector:
+            held_sectors.add(sector)
+
+    kept = []
+    for c in candidates_sorted:
+        bucket = c.get("bucket", "Dream")
+        if bucket_counts.get(bucket, 0) >= max_per_bucket:
+            continue
+        sector = details.get(c["ticker"], {}).get("sector") or ""
+        if hard_block_sector and sector and sector in held_sectors:
+            continue
+        kept.append(c)
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        if sector:
+            held_sectors.add(sector)
+    return kept
 
 
-def _rule_based_stage(detail, cfg):
-    """Non-AI stage proxy from revenue growth + market cap tier — reuses the
-    same cap thresholds as execution slippage tiers for consistency."""
-    growth = detail.get("revenueGrowth")
-    cap = detail.get("marketCap")
-    if growth is None:
-        return ""
-    if growth < 0:
-        return "Declining"
-    small_cap_below  = float(cfg.get("smallCapBelow", 3e8))
-    growth_threshold = float(cfg.get("growthThreshold", 40))
-    mature_threshold = float(cfg.get("matureThreshold", 10))
-    if growth >= growth_threshold:
-        return "Early-Stage" if (cap and cap < small_cap_below) else "Growth"
-    if growth >= mature_threshold:
-        return "Growth"
-    return "Mature"
+def _refresh_ticker_news_if_stale(ticker, news_db, max_age_hours=4):
+    """Fetch and merge fresh news articles for `ticker` into news_db if the
+    cached copy is older than max_age_hours (or missing). Merges into
+    whatever's already there (fetchedAt/articles keys only) rather than
+    replacing the entry outright, so it never clobbers the separate
+    todayItems/sevenDayItems/impact fields the on-demand /news/<ticker>
+    detail-panel route writes into the same per-ticker record. This is what
+    feeds _rule_based_assessment's newsSentiment and the severe-keyword
+    warning scan — without it, both run on an empty article list most days."""
+    entry = news_db.get(ticker, {})
+    if hours_since(entry.get("fetchedAt")) <= max_age_hours:
+        return False
+    try:
+        articles = fetch_ticker_news(ticker)
+        entry["articles"] = articles
+        entry["fetchedAt"] = ts()
+        news_db[ticker] = entry
+        return True
+    except Exception as e:
+        log.warning(f"[News] refresh FAIL: {ticker} | {e}")
+        return False
+
+
+NEWS_WARNINGS_PATH = "output/news_warnings.json"
+
+# Deliberately narrow and severe — distinct from _rule_based_assessment's
+# mild bullish/bearish keyword scoring. This list is for "a human should
+# look at this now" events, never for routine sentiment.
+SEVERE_NEWS_KEYWORDS = [
+    "bankruptcy", "chapter 11", "insolvency", "going concern",
+    "securities fraud", "sec investigation", "doj investigation", "fraud charges",
+    "class action", "restatement", "accounting irregularit",
+    "delisting", "delisted", "trading halt", "halted trading",
+    "product recall", "debt default", "default on",
+    "ceo resigns", "cfo resigns", "resignation of", "executive resigns",
+    "short seller report", "going private investigation",
+]
+
+def _scan_news_warnings(tickers, news_db):
+    """Scan cached news for `tickers` (expected: currently-held positions)
+    for severe red-flag keywords. Flags only — never sells anything. A
+    ticker is re-flagged only when a NEW matching headline appears; if the
+    same headline that triggered a dismissed warning is still the most
+    recent match, it stays dismissed. Returns the updated warnings dict."""
+    warnings_db = load_json(NEWS_WARNINGS_PATH, {"warnings": {}})
+    warnings = warnings_db.get("warnings", {})
+    changed = False
+    for ticker in tickers:
+        articles = (news_db.get(ticker, {}) or {}).get("articles", [])[:5]
+        hit = None
+        for a in articles:
+            title = str(a.get("title", "")).lower()
+            for kw in SEVERE_NEWS_KEYWORDS:
+                if kw in title:
+                    hit = (kw, a)
+                    break
+            if hit:
+                break
+        if not hit:
+            continue
+        kw, article = hit
+        headline = article.get("title", "")
+        headline_hash = hashlib.md5(f"{ticker}|{headline}".encode()).hexdigest()[:12]
+        existing = warnings.get(ticker)
+        if existing and existing.get("headlineHash") == headline_hash:
+            continue  # same headline already on record (active or dismissed) — don't re-flag
+        warnings[ticker] = {
+            "status": "active",
+            "keyword": kw,
+            "headline": headline,
+            "url": article.get("url"),
+            "provider": article.get("provider"),
+            "pubDate": article.get("pubDate"),
+            "headlineHash": headline_hash,
+            "detectedAt": ts(),
+        }
+        changed = True
+        log.warning(f"[NewsWarning] {ticker}: '{kw}' matched — {headline}")
+    if changed:
+        warnings_db["warnings"] = warnings
+        save_json(NEWS_WARNINGS_PATH, warnings_db)
+    return warnings
+
+
+MACRO_NEGATIVE_WORDS = ("recession", "crash", "selloff", "sell-off", "correction", "bear market",
+                         "layoffs", "default", "crisis", "downturn", "stagflation", "plunge")
+MACRO_POSITIVE_WORDS = ("rally", "record high", "soft landing", "rate cut", "growth beat", "strong jobs")
+
+def _macro_risk_signal():
+    """Rule-based macro risk-off read: yield curve inversion + negative
+    keyword density in fetched market headlines. Same additive pattern as
+    the existing VIX regime gate — an extra input to it, not a replacement."""
+    macro = load_json(MACRO_PATH, {})
+    indicators = macro.get("indicators", {})
+    headlines = macro.get("headlines", [])
+
+    yc = (indicators.get("yield_curve") or {}).get("value")
+    inverted = yc is not None and yc < 0
+
+    text = " ".join(str(h.get("title", "")).lower() for h in headlines)
+    neg = sum(text.count(w) for w in MACRO_NEGATIVE_WORDS)
+    pos = sum(text.count(w) for w in MACRO_POSITIVE_WORDS)
+    headline_bearish = neg > pos and neg >= 2  # require 2+ hits, not one stray word
+
+    risk_off = inverted or headline_bearish
+    headline_bullish = pos > neg and pos >= 2  # mirror of the bearish check, display-only (no buy boost yet)
+
+    reasons = []
+    if inverted:
+        reasons.append(f"yield curve inverted ({yc}%)")
+    if headline_bearish:
+        reasons.append(f"{neg} bearish vs {pos} bullish macro headline keyword hits")
+    if not risk_off and headline_bullish:
+        reasons.append(f"{pos} bullish vs {neg} bearish macro headline keyword hits")
+
+    signal = "riskOff" if risk_off else ("riskOn" if headline_bullish else "neutral")
+
+    return {
+        "riskOff": risk_off, "signal": signal,
+        "yieldCurve": yc, "negHits": neg, "posHits": pos,
+        "reasons": reasons, "macroFetchedAt": macro.get("fetchedAt"),
+    }
+
+
+BENCHMARK_TICKERS = {"TSX": "^GSPTSE", "TSX60": "XIU.TO"}  # TSX60 uses the XIU.TO ETF proxy — ^TX60 isn't available on Yahoo Finance
+
+def _refresh_benchmarks():
+    """Fetch live price + yesterday's close for the S&P/TSX Composite index
+    directly and the TSX 60 via its XIU.TO ETF proxy (Yahoo Finance has no
+    raw ^TX60 index symbol), and store into analysis.json's top-level
+    "benchmarks" key, alongside the watchlist. Called on the same cadence as
+    holding price refreshes (the sell-check cycle and the manual refresh
+    button) so they're always as fresh as your own positions."""
+    tickers = list(BENCHMARK_TICKERS.values())
+    live = fetch_live_prices(tickers)
+    prevs = fetch_prev_closes(tickers)
+    now_ts = ts()
+    with _output_lock:
+        out = load_json(OUTPUT_PATH, {"watchlist": []})
+        benchmarks = out.get("benchmarks", {})
+        for name, tk in BENCHMARK_TICKERS.items():
+            price = live.get(tk)
+            prev = prevs.get(tk)
+            if not price:
+                continue
+            day_change_pct = round((price - prev) / prev * 100, 2) if prev else None
+            benchmarks[name] = {
+                "ticker": tk, "price": price, "previousClose": prev,
+                "dayChangePct": day_change_pct, "fetchedAt": now_ts,
+            }
+        out["benchmarks"] = benchmarks
+        save_json(OUTPUT_PATH, out)
+    return benchmarks
 
 
 def _resolve_holding_price(ticker, pos, wl_map, details, dream_map):
@@ -483,6 +672,149 @@ def _check_rollback_candidate(sl_cfg, holdings=None, live_prices=None):
                 f"champion v{champ['version']} ({champ_s['totalReturnPct']}%) — gap {round(gap,2)}% "
                 f"exceeds {thresh}% — awaiting approval")
     return proposal
+
+TUNING_PROPOSAL_PATH = "output/tuning_proposal.json"
+
+def _check_tuning_candidate(min_gainers=10, gain_threshold=5.0, window_days=30):
+    """Compare tickers the shadow log shows had a real 5%+ day against what
+    actually got bought, on the factors behind each configurable Identify
+    gate (Momentum RSI band, data-completeness floor). If relaxing one gate
+    would provably have let a meaningful number of those missed gainers
+    through, propose that ONE relaxation — never applied automatically, see
+    /tradeai/tuning/approve. Forecast is honest counts from real history
+    (how many missed gainers would now qualify), not a fabricated P&L
+    number — there isn't enough data for that kind of claim yet."""
+    db = load_json(SHADOW_PATH, {"snapshots": []})
+    cutoff = datetime.now(TZ).date() - timedelta(days=window_days)
+    missed, bought_n = [], 0
+    for snap in db.get("snapshots", []):
+        try:
+            snap_date = datetime.strptime(snap["date"], "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if snap_date < cutoff:
+            continue
+        for r in snap.get("rows", []):
+            if r.get("maxDailyGainPct") is None:
+                continue  # not graded yet
+            if r.get("outcome") == "bought":
+                bought_n += 1
+            elif r["maxDailyGainPct"] >= gain_threshold:
+                missed.append(r)
+
+    if len(missed) < min_gainers:
+        return None  # not enough evidence yet
+
+    ir          = load_scoring_config().get("identifyRules", {})
+    cur_rsi_min = float(ir.get("momentumRsiMin", 45))
+    cur_rsi_max = float(ir.get("momentumRsiMax", 70))
+    cur_floor   = float(ir.get("dataCompletenessFloor", 0.6))
+    catch_bar   = max(3, len(missed) * 0.2)
+
+    rule_candidates = []
+    for new_max in [72, 75, 80, 85]:
+        catch = [r for r in missed
+                 if r.get("rsi") is not None and r.get("aboveMa50") is True
+                 and cur_rsi_min <= r["rsi"] <= new_max
+                 and not (cur_rsi_min <= r["rsi"] <= cur_rsi_max)]
+        if len(catch) >= catch_bar:
+            rule_candidates.append({
+                "path": "identifyRules.momentumRsiMax", "from": cur_rsi_max, "to": new_max,
+                "wouldCatch": len(catch),
+                "reason": f"{len(catch)} of {len(missed)} missed 5%+ gainers had RSI between "
+                          f"{cur_rsi_max} and {new_max} (above MA50) — currently excluded by the "
+                          f"Momentum RSI cap.",
+            })
+            break  # least-aggressive value that clears the bar
+    for new_min in [40, 35, 30]:
+        catch = [r for r in missed
+                 if r.get("rsi") is not None and r.get("aboveMa50") is True
+                 and new_min <= r["rsi"] <= cur_rsi_max
+                 and not (cur_rsi_min <= r["rsi"] <= cur_rsi_max)]
+        if len(catch) >= catch_bar:
+            rule_candidates.append({
+                "path": "identifyRules.momentumRsiMin", "from": cur_rsi_min, "to": new_min,
+                "wouldCatch": len(catch),
+                "reason": f"{len(catch)} of {len(missed)} missed 5%+ gainers had RSI between "
+                          f"{new_min} and {cur_rsi_min} (above MA50) — currently excluded by the "
+                          f"Momentum RSI floor.",
+            })
+            break
+    for new_floor in [0.5, 0.4, 0.3]:
+        catch = [r for r in missed
+                 if r.get("outcome") == "scanned_not_identified"
+                 and r.get("dataCompleteness") is not None
+                 and new_floor <= r["dataCompleteness"] < cur_floor]
+        if len(catch) >= catch_bar:
+            rule_candidates.append({
+                "path": "identifyRules.dataCompletenessFloor", "from": cur_floor, "to": new_floor,
+                "wouldCatch": len(catch),
+                "reason": f"{len(catch)} of {len(missed)} missed 5%+ gainers were excluded entirely "
+                          f"by the data-completeness floor ({cur_floor}) before any bucket even saw "
+                          f"them. They'd still need to pass a bucket's own criteria — this only "
+                          f"removes the completeness block.",
+            })
+            break
+
+    if not rule_candidates:
+        return None
+    best = max(rule_candidates, key=lambda c: c["wouldCatch"])
+
+    proposal_key = f"{best['path']}={best['to']}"
+    existing = load_json(TUNING_PROPOSAL_PATH, None)
+    if existing and existing.get("status") == "dismissed" and existing.get("proposalKey") == proposal_key:
+        return None  # user already said no to this exact change
+    if existing and existing.get("status") == "pending" and existing.get("proposalKey") == proposal_key:
+        return existing  # already surfaced, don't spam a duplicate
+
+    proposal = {
+        "status": "pending",
+        "proposalKey": proposal_key,
+        "detectedAt": ts(),
+        "windowDays": window_days,
+        "gainThresholdPct": gain_threshold,
+        "missedGainersAnalyzed": len(missed),
+        "boughtRowsAnalyzed": bought_n,
+        "proposedChange": {"path": best["path"], "from": best["from"], "to": best["to"]},
+        "reason": best["reason"],
+        "forecast": {
+            "historicalMissedGainersWouldHaveCaught": best["wouldCatch"],
+            "historicalMissedGainersTotal": len(missed),
+            # Every rule in this catalog only ever ADMITS candidates it
+            # previously excluded (a raised/lowered RSI bound, a lowered
+            # floor) — none can exclude something that already qualified,
+            # so there is no "cost" side to this forecast by construction.
+            "currentPicksWouldHaveExcluded": 0,
+        },
+    }
+    save_json(TUNING_PROPOSAL_PATH, proposal)
+    log.warning(f"[Tuning] PROPOSED: {best['path']} {best['from']} -> {best['to']} "
+                f"— would have caught {best['wouldCatch']}/{len(missed)} missed gainers — awaiting approval")
+    return proposal
+
+
+def _missed_gainers_summary(window_days=30, gain_threshold=5.0, limit=25):
+    """Top non-bought tickers from the last N days that had a real 5%+ day —
+    the same pool _check_tuning_candidate reasons over, surfaced directly in
+    the Validation tab so you can see WHICH tickers and WHY they were missed,
+    not just the aggregate proposal."""
+    db = load_json(SHADOW_PATH, {"snapshots": []})
+    cutoff = datetime.now(TZ).date() - timedelta(days=window_days)
+    rows = []
+    for snap in db.get("snapshots", []):
+        try:
+            snap_date = datetime.strptime(snap["date"], "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if snap_date < cutoff:
+            continue
+        for r in snap.get("rows", []):
+            if (r.get("outcome") != "bought" and r.get("maxDailyGainPct") is not None
+                    and r["maxDailyGainPct"] >= gain_threshold):
+                rows.append({**r, "snapshotDate": snap["date"]})
+    rows.sort(key=lambda r: r["maxDailyGainPct"], reverse=True)
+    return rows[:limit]
+
 
 def _flatten_cfg(d, prefix=""):
     out = {}
@@ -800,7 +1132,6 @@ def trigger_fetch_ticker(ticker):
     if not fetch_status["running"] and ticker in watchlist:
         thread = threading.Thread(target=run_fetch, args=([ticker], "single"))
         thread.start()
-    # return redirect("/")
     return "", 204
 
 @app.route("/fetch/ticker/<ticker>/ai")
@@ -1418,15 +1749,11 @@ SCORING_DEFAULTS = {
         "Avoid": 0,
         "Unknown": 10
     },
-    # AI is disabled in this build (see ai_summary._call_gemini) — every
-    # bucket's weight is 100% dream score so the composite still spans a
-    # real 0-100 range instead of collapsing toward the old dream-only
-    # 15-30% share while "ai" silently multiplies against zero.
     "bucketWeights": {
-        "Momentum":   {"dream": 1.0, "ai": 0.0},
-        "Reversal":   {"dream": 1.0, "ai": 0.0},
-        "SmartMoney": {"dream": 1.0, "ai": 0.0},
-        "Dream":      {"dream": 1.0, "ai": 0.0}
+        "Momentum":   {"dream": 0.15, "ai": 0.65},
+        "Reversal":   {"dream": 0.15, "ai": 0.65},
+        "SmartMoney": {"dream": 0.30, "ai": 0.55},
+        "Dream":      {"dream": 0.25, "ai": 0.65}
     },
     "trajectoryBonus": {
         "Momentum":   {"Accelerating": 20, "Stable": 8,  "Decelerating": 0},
@@ -1476,7 +1803,6 @@ SCORING_DEFAULTS = {
     "sellThresholds": {
         "hardSellFloor":    25,
         "softSellFloor":    50,
-        "maxPositions":     5,
         "stopLossHard":     8.0,
         "stopLossSoft":     6.0,
         "trailingStopPeak": 10.0,
@@ -1491,7 +1817,8 @@ SCORING_DEFAULTS = {
         "smallCapBelow":       300000000
     },
     "regime": {
-        "vixNoBuyAbove": 30
+        "vixNoBuyAbove": 30,
+        "macroRiskGateEnabled": True
     },
     "selfLearning": {
         "autoRollback": True,
@@ -1513,88 +1840,187 @@ SCORING_DEFAULTS = {
     "sectorDiversity": {
         "penalty": -15
     },
-    # Feeds trajectoryBonus/stageBonus with a real, non-AI signal — see
-    # _rule_based_trajectory / _rule_based_stage. Only used as a fallback
-    # when ai.trajectory / ai.stage are empty (always, in this build).
-    "trajectoryStageRule": {
-        "accelDeltaThreshold": 0.15,  # %/day faster (or slower) than the 30d pace to call it Accelerating/Decelerating
-        "growthThreshold": 40,        # revenueGrowth% at/above this -> Growth or Early-Stage
-        "matureThreshold": 10,        # revenueGrowth% at/above this (below growthThreshold) -> Growth; below -> Mature
-        "smallCapBelow": 300000000    # marketCap below this, combined with high growth -> Early-Stage instead of Growth
-    },
     "purchaseMatrix": {
         "slots":         6,
         "maxDeployPct":  100,
-        # Lower than the US repo's 60: without the AI weight's contribution,
-        # the achievable composite ceiling comes from dream score + technical
-        # bonuses alone. Start conservative and retune once real TSX Dream
-        # Scan output shows the actual score distribution.
-        "minBuyComposite": 50,
-        "earningsBlackoutDays": 3
+        "minBuyComposite": 60,
+        "earningsBlackoutDays": 3,
+        "rotationEnabled": True,
+        "rotationMinScoreGap": 15,
+        "rotationCooldownTradingDays": 5
+    },
+    "identifyRules": {
+        # A half-scored ticker (missing data, or SCORE_INCOMPLETE) shouldn't
+        # compete for bucket slots against fully-scored ones. See
+        # score_dream_stock's dataCompleteness field.
+        "dataCompletenessFloor": 0.6,
+        # Max tickers any single bucket can contribute to the final 6 buys —
+        # stops one strategy (e.g. SmartMoney) from sweeping every slot.
+        "maxPerBucketFinal": 3,
+        # Hard-block a second buy in an already-held sector at final
+        # selection, instead of only soft-penalizing it in the composite.
+        "hardBlockSectorDiversity": False,
+        # Momentum bucket RSI band — moved out of hardcoded Python so it's
+        # tunable (and proposable by the tuning-analysis pipeline, see
+        # _check_tuning_candidate). Defaults match prior hardcoded behavior.
+        "momentumRsiMin": 45,
+        "momentumRsiMax": 70,
+        # Volume-surge gate for Momentum — None means not enforced (day-one
+        # default: the signal is new, no evidence yet on where to set it).
+        # A candidate with no volumeRatio data always passes through
+        # regardless of this setting. Set by approving a tuning proposal,
+        # or by hand once you have a view.
+        "momentumVolumeRatioMin": None
     }
 }
 
-def _record_shadow_snapshot(scored, live_prices, spy_now, rec_version):
-    """Shadow validation: snapshot EVERY scored candidate (bought or not) so the
-    composite ranking can be graded against 5-day forward returns — ~20 data
-    points per day instead of only the handful of positions actually traded."""
+def _record_shadow_snapshot(scored, qualified, actual_buys, dream_map, holdings, live_prices, spy_now, rec_version):
+    """Shadow validation: snapshot the FULL daily funnel, not just what got
+    bought — every dream-scanned ticker gets a row, tagged with how far it
+    got: scanned_not_identified (never made the 30-shortlist) ->
+    identified_not_qualified (shortlisted, filtered at Recommend — cooldown,
+    earnings blackout, composite too low, etc.) -> qualified_not_bought
+    (passed every check, lost the slot race or blocked by bucket/sector
+    caps) -> bought. This is what lets the tuning-analysis pipeline compare
+    "what we bought" against "what we missed" on the same factors, instead
+    of only ever seeing the ~30 tickers that made the shortlist."""
     db = load_json(SHADOW_PATH, {"snapshots": []})
     today = datetime.now(TZ).strftime("%Y-%m-%d")
     if any(s.get("date") == today for s in db["snapshots"]):
         return
+
+    qualified_tickers = {q["ticker"] for q in qualified}
+    bought_tickers = {b["ticker"] for b in actual_buys} | set(holdings.keys())
+    scored_by_ticker = {s["ticker"]: s for s in scored}
+
     rows = []
-    for s in scored:
-        p = live_prices.get(s["ticker"])
-        if not p:
+    for ticker, c in dream_map.items():
+        bd = c.get("breakdown") or {}
+        s = scored_by_ticker.get(ticker)
+        if s:
+            outcome = ("bought" if ticker in bought_tickers
+                       else "qualified_not_bought" if ticker in qualified_tickers
+                       else "identified_not_qualified")
+            price = live_prices.get(ticker) or s.get("price") or c.get("price")
+            composite = s.get("composite")
+            bucket = s.get("bucket")
+        else:
+            outcome = "scanned_not_identified"
+            price = c.get("price")
+            composite = None
+            bucket = None
+        if not price:
             continue
         rows.append({
-            "ticker": s["ticker"], "bucket": s.get("bucket"),
-            "composite": s.get("composite"), "aiScore": s.get("aiScore"),
-            "dreamScore": s.get("dreamScore"), "breakoutScore": s.get("breakoutScore"),
-            "buySignal": s.get("buySignal"), "price": p, "spyPrice": spy_now,
-            "recVersion": rec_version, "fwdReturnPct": None, "fwdExcessPct": None,
+            "ticker": ticker, "bucket": bucket, "outcome": outcome,
+            "composite": composite, "dreamScore": c.get("score"),
+            "rsi": bd.get("rsi"), "volumeRatio": bd.get("volumeRatio"),
+            "rangeExpansion": bd.get("rangeExpansion"), "aboveMa50": bd.get("aboveMa50"),
+            "dataCompleteness": bd.get("dataCompleteness"),
+            "price": price, "spyPrice": spy_now, "recVersion": rec_version,
+            "fwdReturnPct": None, "fwdExcessPct": None,
+            "maxDailyGainPct": None, "maxDailyGainDate": None,
         })
     if rows:
         db["snapshots"].append({"date": today, "rows": rows})
-        db["snapshots"] = db["snapshots"][-90:]
+        # Full-universe rows are much smaller per-row than the old
+        # scored-only shape, but there are ~20x more of them — shorter
+        # retention keeps total size in the same ballpark.
+        db["snapshots"] = db["snapshots"][-45:]
         save_json(SHADOW_PATH, db)
-        log.info(f"[Shadow] snapshot {today}: {len(rows)} candidates recorded")
+        outcomes = {}
+        for r in rows:
+            outcomes[r["outcome"]] = outcomes.get(r["outcome"], 0) + 1
+        log.info(f"[Shadow] snapshot {today}: {len(rows)} tickers | {outcomes}")
+
+
+def _daily_closes(hist):
+    """(date, close) pairs from a yfinance history DataFrame, oldest first."""
+    if hist is None or hist.empty:
+        return []
+    return [(idx.date() if hasattr(idx, "date") else idx, float(c)) for idx, c in zip(hist.index, hist["Close"])]
 
 
 def _grade_shadow_snapshots(min_age_days=5, max_fetches=40):
-    """Fill in forward returns (vs SPY) for shadow snapshots old enough to judge."""
+    """Fill in forward returns (vs SPY) AND the max single-day gain seen in
+    the window for shadow snapshots old enough to judge. Max daily gain is
+    what actually answers "did we miss a real mover" — a stock that spiked
+    8% on day 2 then gave it back by day 5 would show ~0% cumulative return
+    here but was a real 5%+ day someone could have caught."""
+    import yfinance as yf
     db = load_json(SHADOW_PATH, {"snapshots": []})
     today = datetime.now(TZ).date()
-    pending = []
+    pending_rows = []
     for snap in db["snapshots"]:
         try:
-            age = (today - datetime.strptime(snap["date"], "%Y-%m-%d").date()).days
+            snap_date = datetime.strptime(snap["date"], "%Y-%m-%d").date()
+            age = (today - snap_date).days
         except Exception:
             continue
-        if age >= min_age_days and any(r.get("fwdReturnPct") is None for r in snap.get("rows", [])):
-            pending.append((snap, age))
-    if not pending:
+        if age < min_age_days:
+            continue
+        for r in snap.get("rows", []):
+            if r.get("fwdReturnPct") is None:
+                pending_rows.append((r, snap_date, age))
+    if not pending_rows:
         return 0
-    tickers = {r["ticker"] for snap, _ in pending for r in snap["rows"] if r.get("fwdReturnPct") is None}
-    prices = fetch_live_prices(sorted(tickers)[:max_fetches] + ["SPY"])
-    spy_p = prices.get("SPY")
+
+    # Cap DISTINCT tickers fetched this cycle (rate-limit protection); grade
+    # every pending row for those tickers while their history is in hand.
+    tickers_to_grade = sorted({r["ticker"] for r, _, _ in pending_rows})[:max_fetches]
+
+    spy_closes = []
+    try:
+        spy_closes = _daily_closes(yf.Ticker("SPY").history(period="2mo"))
+    except Exception as e:
+        log.warning(f"[Shadow] SPY history FAIL: {e}")
+
+    def _after(closes, d):
+        return [(cd, c) for cd, c in closes if cd > d]
+
     graded = 0
-    for snap, age in pending:
-        for r in snap["rows"]:
-            if r.get("fwdReturnPct") is not None:
+    for ticker in tickers_to_grade:
+        try:
+            closes = _daily_closes(yf.Ticker(ticker).history(period="2mo"))
+        except Exception as e:
+            log.warning(f"[Shadow] {ticker} history FAIL: {e}")
+            continue
+        if not closes:
+            continue
+        for r, snap_date, age in pending_rows:
+            if r["ticker"] != ticker:
                 continue
-            p = prices.get(r["ticker"])
-            if not p or not r.get("price"):
+            after = _after(closes, snap_date)
+            base_price = r.get("price")
+            if not after or not base_price:
                 continue
-            r["fwdReturnPct"] = round((p - r["price"]) / r["price"] * 100, 2)
-            if spy_p and r.get("spyPrice"):
-                spy_ret = (spy_p - r["spyPrice"]) / r["spyPrice"] * 100
+            latest_close = after[-1][1]
+            r["fwdReturnPct"] = round((latest_close - base_price) / base_price * 100, 2)
+
+            # Day-over-day % change through the window, first day anchored
+            # off the snapshot's own recorded price.
+            prev_close = base_price
+            max_gain, max_gain_date = None, None
+            for cd, c in after:
+                if prev_close:
+                    pct = (c - prev_close) / prev_close * 100
+                    if max_gain is None or pct > max_gain:
+                        max_gain, max_gain_date = pct, str(cd)
+                prev_close = c
+            if max_gain is not None:
+                r["maxDailyGainPct"] = round(max_gain, 2)
+                r["maxDailyGainDate"] = max_gain_date
+
+            spy_after = _after(spy_closes, snap_date)
+            spy_base = r.get("spyPrice")
+            if spy_after and spy_base:
+                spy_ret = (spy_after[-1][1] - spy_base) / spy_base * 100
                 r["fwdExcessPct"] = round(r["fwdReturnPct"] - spy_ret, 2)
             r["gradedAfterDays"] = age
             graded += 1
     if graded:
         save_json(SHADOW_PATH, db)
-        log.info(f"[Shadow] graded {graded} candidate rows")
+        log.info(f"[Shadow] graded {graded} candidate rows (max-daily-gain tracking)")
     return graded
 
 
@@ -1727,14 +2153,6 @@ def reset_scoring_config():
 
 # ── TRADEAI SIMULATION ────────────────────────────────────────────────────────
 
-# AI (Gemini) scoring is disabled in this build — see ai_summary._call_gemini,
-# which returns "" instead of calling out. Ranking runs on dream score +
-# technicals only. This flag tells the missing-data sell guard that AI is
-# absent BY DESIGN, not because a per-ticker API call failed — so composite-
-# based sells (which are now dream-only) work normally instead of being
-# permanently suppressed.
-AI_ENABLED = False
-
 STARTING_BALANCE = 100_000.0
 
 def load_trades_ai():
@@ -1752,36 +2170,55 @@ def run_tradeai_identify():
     log.info("=== TradeAI Identify Started (3-bucket) ===")
     try:
         dream = load_json(DREAM_PATH, {})
-        candidates = dream.get("candidates", [])
-        seen = set()  # held tickers now compete for slots on merit
-        result = []
+        all_candidates = dream.get("candidates", [])
 
         # Helper to safely get breakdown field
         def bd(c, key):
             return (c.get("breakdown") or {}).get(key)
 
-        CANDIDATE_SLOTS = 20  # flat cap, holdings no longer force-included
+        # Exclude anything that failed to score (SCORE_INCOMPLETE -> score is
+        # None) or is too data-sparse to trust — a half-blank ticker
+        # shouldn't compete for a bucket slot against a fully-scored one.
+        # dataCompleteness is a new field: candidates scored before this fix
+        # won't have it at all yet, so only apply the floor when it's
+        # actually present — otherwise every pre-existing candidate would
+        # get excluded until the next full Dream Scan refreshes them.
+        identify_rules = load_scoring_config().get("identifyRules", {})
+        completeness_floor = float(identify_rules.get("dataCompletenessFloor", 0.6))
+        candidates = [
+            c for c in all_candidates
+            if c.get("score") is not None
+            and (bd(c, "dataCompleteness") is None or bd(c, "dataCompleteness") >= completeness_floor)
+        ]
+        excluded = len(all_candidates) - len(candidates)
+        if excluded:
+            log.info(f"[TradeAI Identify] Excluded {excluded} ticker(s) below dataCompleteness floor {completeness_floor} or with no score")
 
-        # ── BUCKET 1: MOMENTUM (7 slots) ──────────────────────────────────────
-        # RSI 45-70 (trending up, not exhausted) + price above MA50
-        # Fast signal: money already moving, confirm with trend
+        seen = set()  # held tickers now compete for slots on merit
+        result = []
+
+        CANDIDATE_SLOTS = 30  # 8 Momentum + 8 Reversal + 8 SmartMoney + 6 Dream fallback
+
+        # ── BUCKET 1: MOMENTUM (8 slots) ──────────────────────────────────────
+        # RSI band (configurable) + price above MA50, optionally requiring a
+        # volume surge. Fast signal: money already moving, confirm with trend
+        momentum_rsi_min = float(identify_rules.get("momentumRsiMin", 45))
+        momentum_rsi_max = float(identify_rules.get("momentumRsiMax", 70))
+        momentum_vol_min = identify_rules.get("momentumVolumeRatioMin")
         momentum_pool = [
             c for c in candidates
             if c["ticker"] not in seen
             and bd(c, "rsi") is not None
-            and 45 <= bd(c, "rsi") <= 70
+            and momentum_rsi_min <= bd(c, "rsi") <= momentum_rsi_max
             and bd(c, "aboveMa50") is True
+            # Only enforced once a value is set (via tuning proposal or by
+            # hand) AND the ticker actually has volume data — missing data
+            # never excludes, matching the dataCompleteness lesson.
+            and (momentum_vol_min is None or bd(c, "volumeRatio") is None
+                 or bd(c, "volumeRatio") >= momentum_vol_min)
         ]
-        # Fall back to just RSI range if aboveMa50 not available
-        if not momentum_pool:
-            momentum_pool = [
-                c for c in candidates
-                if c["ticker"] not in seen
-                and bd(c, "rsi") is not None
-                and 45 <= bd(c, "rsi") <= 70
-            ]
         momentum_pool.sort(key=lambda c: bd(c, "rsi") or 0, reverse=True)
-        for c in momentum_pool[:7]:
+        for c in momentum_pool[:8]:
             if len(result) >= CANDIDATE_SLOTS: break
             ticker = c["ticker"]
             seen.add(ticker)
@@ -1790,7 +2227,7 @@ def run_tradeai_identify():
             result.append({"ticker": ticker, "reason": reason, "source": c.get("source", "Dream"), "bucket": "Momentum"})
         log.info(f"[TradeAI Identify] Bucket 1 Momentum: {[r['ticker'] for r in result if r.get('bucket')=='Momentum']}")
 
-        # ── BUCKET 2: REVERSAL (7 slots) ──────────────────────────────────────
+        # ── BUCKET 2: REVERSAL (8 slots) ──────────────────────────────────────
         # RSI < 40 (oversold) + dream score 20-60 (not trash, not already priced in)
         # Goal: catch accumulation before it shows — early-stage signal
         reversal_pool = [
@@ -1800,8 +2237,11 @@ def run_tradeai_identify():
             and bd(c, "rsi") < 40
             and 20 <= c.get("score", 0) <= 60
         ]
-        reversal_pool.sort(key=lambda c: bd(c, "rsi") or 99)
-        for c in reversal_pool[:7]:
+        # Ascending by RSI (most oversold first) — explicit None-check
+        # instead of `or 99`, which would wrongly sort a literal RSI of 0
+        # to the bottom instead of the top.
+        reversal_pool.sort(key=lambda c: bd(c, "rsi") if bd(c, "rsi") is not None else 99)
+        for c in reversal_pool[:8]:
             if len(result) >= CANDIDATE_SLOTS: break
             ticker = c["ticker"]
             seen.add(ticker)
@@ -1811,7 +2251,7 @@ def run_tradeai_identify():
             result.append({"ticker": ticker, "reason": reason, "source": c.get("source", "Dream"), "bucket": "Reversal"})
         log.info(f"[TradeAI Identify] Bucket 2 Reversal: {[r['ticker'] for r in result if r.get('bucket')=='Reversal']}")
 
-        # ── BUCKET 3: SMART MONEY (6 slots) ───────────────────────────────────
+        # ── BUCKET 3: SMART MONEY (8 slots) ───────────────────────────────────
         # High gross margin + revenue growth + score below top tier
         # Dream score 35-70: fundamentally strong but not yet consensus buy
         smart_pool = [
@@ -1825,7 +2265,7 @@ def run_tradeai_identify():
         ]
         # Sort by revenue growth — accelerating fundamentals
         smart_pool.sort(key=lambda c: bd(c, "revenueGrowth") or 0, reverse=True)
-        for c in smart_pool[:6]:
+        for c in smart_pool[:8]:
             if len(result) >= CANDIDATE_SLOTS: break
             ticker = c["ticker"]
             seen.add(ticker)
@@ -1840,7 +2280,7 @@ def run_tradeai_identify():
         if candidate_count < CANDIDATE_SLOTS:
             filler_pool = [c for c in candidates if c["ticker"] not in seen]
             filler_pool.sort(key=lambda c: c.get("score", 0), reverse=True)
-            for c in filler_pool:
+            for c in filler_pool[:6]:
                 if len(result) >= CANDIDATE_SLOTS:
                     break
                 ticker = c["ticker"]
@@ -1892,6 +2332,8 @@ def run_tradeai_fetch():
         total = len(fetch_list)
         fetch_status["total"] = total
         details = candidates_data.get("details", {})
+        news_db = load_json(NEWS_PATH, {})
+        news_updated = False
         for idx, item in enumerate(fetch_list, 1):
             if stop_flag:
                 log.info(f"[TradeAI Fetch] Stopped by user at {idx}/{total}")
@@ -1924,6 +2366,16 @@ def run_tradeai_fetch():
                     log.info(f"TradeAI fetch OK: {ticker} | price:{detail.get('price')} rsi:{rsi_val}")
             except Exception as e:
                 log.error(f"TradeAI fetch FAIL: {ticker} | {e}")
+            # Bulk news refresh — keeps _rule_based_assessment's newsSentiment
+            # (and the severe-news warning scan) fed with real, same-day
+            # headlines instead of running dry until someone clicks a ticker.
+            try:
+                if _refresh_ticker_news_if_stale(ticker, news_db, max_age_hours=4):
+                    news_updated = True
+            except Exception as ne:
+                log.warning(f"TradeAI fetch news FAIL: {ticker} | {ne}")
+        if news_updated:
+            save_json(NEWS_PATH, news_db)
         candidates_data["details"] = details
         candidates_data["detailsFetchedAt"] = ts()
         save_json(TRADE_AI_CANDIDATES_PATH, candidates_data)
@@ -1934,90 +2386,142 @@ def run_tradeai_fetch():
         fetch_status = {"running": False, "message": f"TradeAI fetch FAIL: {e}", "operation": None, "current": 0, "total": total, "current_ticker": ""}
 
 
+def run_tradeai_price_refresh():
+    """Refresh only fast-changing fields for the fixed daily shortlist."""
+    global fetch_status, stop_flag
+    stop_flag = False
+    candidates_data = load_json(TRADE_AI_CANDIDATES_PATH, {})
+    identified = candidates_data.get("identified", [])
+    details = candidates_data.get("details", {})
+    holdings = load_trades_ai().get("holdings", {})
+    tickers = [item["ticker"] for item in identified]
+    tickers += [ticker for ticker in holdings if ticker not in tickers]
+    total = len(tickers)
+    fetch_status = {"running": True, "message": "TradeAI: refreshing prices...", "operation": "tradeai_prices", "current": 0, "total": total, "current_ticker": ""}
+    try:
+        rsi_history = candidates_data.get("rsiHistory", {})
+        for idx, ticker in enumerate(tickers, 1):
+            if stop_flag:
+                break
+            fetch_status.update({"current": idx, "current_ticker": ticker, "message": f"TradeAI prices: {idx} of {total} — {ticker}"})
+            price_data = fetch_price_only(ticker)
+            if not price_data or ticker not in details:
+                continue
+            details[ticker].update(price_data)
+            details[ticker]["priceFetchedAt"] = ts()
+            rsi = price_data.get("rsi14")
+            if rsi is not None:
+                history = rsi_history.setdefault(ticker, [])
+                history.append({"rsi": rsi, "ts": ts()})
+                rsi_history[ticker] = history[-5:]
+        candidates_data["details"] = details
+        candidates_data["rsiHistory"] = rsi_history
+        candidates_data["pricesRefreshedAt"] = ts()
+        save_json(TRADE_AI_CANDIDATES_PATH, candidates_data)
+        fetch_status = {"running": False, "message": f"TradeAI prices refreshed: {total} tickers", "operation": None, "current": total, "total": total, "current_ticker": ""}
+    except Exception as e:
+        log.error(f"TradeAI price refresh FAIL: {e}")
+        fetch_status = {"running": False, "message": f"TradeAI price refresh FAIL: {e}", "operation": None, "current": 0, "total": total, "current_ticker": ""}
+
+
+def _rule_based_assessment(ticker, detail, news_items, bucket):
+    """Create the assessment contract used by Recommend without an AI call."""
+    detail = detail or {}
+    value = lambda key, default=0: detail.get(key) if detail.get(key) is not None else default
+    rsi = float(value("rsi14", 50) or 50)
+    change1d = float(value("change1d") or 0)
+    change7d = float(value("change7d") or 0)
+    change30d = float(value("change30d") or 0)
+    revenue_growth = float(value("revenueGrowth") or 0)
+    gross_margin = float(value("grossMargin") or 0)
+    analyst_upside = float(value("analystUpside") or 0)
+    volume_ratio = float(value("volumeRatio") or 0)
+    bb_percent = detail.get("bbPercent")
+
+    momentum = (change1d > 0) + (change7d > 0) + (change30d > 0)
+    if momentum == 3 or (change7d > 2 and change30d > 5):
+        trajectory = "Accelerating"
+    elif momentum == 0 or (change7d < -2 and change30d < 0):
+        trajectory = "Decelerating"
+    else:
+        trajectory = "Stable"
+
+    if revenue_growth >= 20 and change30d > 0:
+        stage = "Growth"
+    elif revenue_growth >= 10 and gross_margin >= 40:
+        stage = "Mature"
+    elif revenue_growth < 0 and change30d < 0:
+        stage = "Declining"
+    else:
+        stage = "Early-Stage"
+
+    positive_words = ("beat", "growth", "surge", "upgrade", "profit", "strong", "record", "approve")
+    negative_words = ("miss", "cut", "loss", "downgrade", "risk", "lawsuit", "fall", "weak")
+    news_text = " ".join(str(n.get("title", "")).lower() for n in news_items or [])
+    positive_news = sum(news_text.count(word) for word in positive_words)
+    negative_news = sum(news_text.count(word) for word in negative_words)
+    news_sentiment = "Bullish" if positive_news > negative_news else "Bearish" if negative_news > positive_news else "Neutral"
+
+    score = 35
+    score += 15 if change30d > 10 else 8 if change30d > 0 else -8 if change30d < -10 else 0
+    score += 12 if 45 <= rsi <= 65 else 5 if 35 <= rsi < 45 else -8 if rsi > 75 else 0
+    score += 8 if gross_margin >= 40 else 3 if gross_margin >= 20 else -5
+    score += 8 if revenue_growth >= 20 else 4 if revenue_growth >= 10 else -4 if revenue_growth < 0 else 0
+    score += 8 if analyst_upside >= 20 else 4 if analyst_upside >= 10 else 0
+    score += 5 if volume_ratio >= 1.5 else 0
+    score += 5 if trajectory == "Accelerating" else -5 if trajectory == "Decelerating" else 0
+    score += 5 if news_sentiment == "Bullish" else -5 if news_sentiment == "Bearish" else 0
+    if bucket == "Reversal" and rsi < 40:
+        score += 8
+    if bb_percent is not None and bb_percent < 0.1:
+        score += 5
+    score = max(0, min(100, round(score)))
+    signal = "Strong Buy" if score >= 80 else "Buy" if score >= 60 else "Hold" if score >= 40 else "Avoid"
+    sentiment = "Bullish" if score >= 60 else "Bearish" if score < 40 else "Neutral"
+    return {
+        "ticker": ticker, "aiScore": score, "buySignal": signal,
+        "sentiment": sentiment, "newsSentiment": news_sentiment,
+        "trajectory": trajectory, "stage": stage, "confidence": "Rule-based",
+        "reasoning": f"Rule assessment: {trajectory.lower()} price trend, {stage.lower()} profile, and {news_sentiment.lower()} recent-news signal.",
+        "forecastReason": f"Rule forecast uses RSI {rsi:.1f}, momentum {change7d:.1f}% over 7 days, and the current technical range.",
+        "promptSent": "Rule-based assessment; no AI provider used.",
+    }
+
+
 def run_tradeai_analyze():
     global fetch_status, stop_flag
     stop_flag = False
     total = 0
-    fetch_status = {"running": True, "message": "TradeAI: running AI analysis...", "operation": "tradeai_analyze", "current": 0, "total": 0, "current_ticker": ""}
-    log.info("=== TradeAI Analyze Started ===")
+    fetch_status = {"running": True, "message": "TradeAI: running rule assessment...", "operation": "tradeai_analyze", "current": 0, "total": 0, "current_ticker": ""}
+    log.info("=== TradeAI Rule Assessment Started ===")
     try:
         candidates_data = load_json(TRADE_AI_CANDIDATES_PATH, {})
         identified = candidates_data.get("identified", [])
         details = candidates_data.get("details", {})
         news_db = load_json(NEWS_PATH, {})
-        macro = load_json(MACRO_PATH, {}) if MACRO_PATH else {}
-
-        if not identified:
-            fetch_status = {"running": False, "message": "TradeAI analyze: run Identify + Fetch Info first.", "operation": None, "current": 0, "total": 0, "current_ticker": ""}
-            return
-
-        # Holdings FIRST within the 20-call Gemini budget: an unscored holding
-        # used to default to aiScore 0 and get force-sold on a phantom
-        # "score collapse". A shorter candidate tail costs far less than that.
-        MAX_ANALYZE_CALLS = 20
         held_tickers = list(load_trades_ai().get("holdings", {}).keys())
         identified_map = {i["ticker"]: i for i in identified}
-        eligible = [
-            identified_map.get(t, {"ticker": t, "bucket": "Holding", "reason": "Currently held position"})
-            for t in held_tickers if details.get(t)
-        ]
-        eligible += [i for i in identified
-                     if details.get(i["ticker"]) and i["ticker"] not in held_tickers]
-        eligible = eligible[:MAX_ANALYZE_CALLS]
+        eligible = [identified_map.get(t, {"ticker": t, "bucket": "Holding"}) for t in held_tickers if details.get(t)]
+        eligible += [i for i in identified if details.get(i["ticker"]) and i["ticker"] not in held_tickers]
         total = len(eligible)
-        fetch_status["total"] = total
-
-        # Compact one-line-per-candidate cohort summary so Gemini can score
-        # each ticker RELATIVE to the batch (no extra API calls needed)
-        cohort_lines = []
-        for item in eligible:
-            t = item["ticker"]
-            dt = details.get(t, {})
-            cohort_lines.append(
-                f"- {t} [{item.get('bucket','?')}]: 30d {dt.get('change30d')}% | rev growth {dt.get('revenueGrowth')}% | "
-                f"margin {dt.get('grossMargin')}% | RSI {dt.get('rsi14')} | analyst upside {dt.get('analystUpside')}%"
-            )
-        cohort_block = "\n".join(cohort_lines)
-
-        ai_assessments = candidates_data.get("aiAssessments", {})
+        if not total:
+            fetch_status = {"running": False, "message": "Rule assessment: no fetched candidates", "operation": None, "current": 0, "total": 0, "current_ticker": ""}
+            return
+        assessments = candidates_data.get("aiAssessments", {})
         for idx, item in enumerate(eligible, 1):
             if stop_flag:
-                log.info(f"[TradeAI Analyze] Stopped by user at {idx}/{total}")
-                candidates_data["aiAssessments"] = ai_assessments
-                candidates_data["aiAnalyzedAt"] = ts()
-                save_json(TRADE_AI_CANDIDATES_PATH, candidates_data)
-                fetch_status = {"running": False, "message": f"TradeAI analyze stopped: {len(ai_assessments)}/{total} analyzed", "operation": None, "current": idx, "total": total, "current_ticker": ""}
-                return
+                break
             ticker = item["ticker"]
-            detail = details.get(ticker)
-            fetch_status["current"] = idx
-            fetch_status["current_ticker"] = ticker
-            fetch_status["message"] = f"TradeAI analyze: {idx} of {total} — {ticker}"
-            news_items = news_db.get(ticker, {}).get("articles", [])[:5]  # limit to 5 most recent to keep prompt short
-            bucket = item.get("bucket", "Dream")
-            reason = item.get("reason", "")
-            log.info(f"--- TradeAI analyze: {ticker} [{idx}/{total}] | bucket:{bucket} | news:{len(news_items)} articles ---")
-            # Inject bucket context into detail so fetch_ai_analyze prompt sees it
-            detail_with_ctx = dict(detail) if detail else {}
-            detail_with_ctx["_bucket"] = bucket
-            detail_with_ctx["_selectionReason"] = reason
-            detail_with_ctx["_cohort"] = cohort_block
-            assessment = fetch_ai_analyze(ticker, detail_with_ctx, news_items, macro)
-            ai_assessments[ticker] = assessment
-            candidates_data["aiAssessments"] = ai_assessments
-            candidates_data["aiAnalyzedAt"] = ts()
-            save_json(TRADE_AI_CANDIDATES_PATH, candidates_data)
-            log.info(f"TradeAI analyze OK: {ticker} | bucket:{bucket} | signal:{assessment.get('buySignal')} score:{assessment.get('aiScore')} trajectory:{assessment.get('trajectory')}")
-
-        candidates_data["aiAssessments"] = ai_assessments
+            fetch_status.update({"current": idx, "current_ticker": ticker, "message": f"TradeAI rule assessment: {idx} of {total} — {ticker}"})
+            assessments[ticker] = _rule_based_assessment(ticker, details.get(ticker), news_db.get(ticker, {}).get("articles", [])[:5], item.get("bucket", "Dream"))
+        candidates_data["aiAssessments"] = assessments
         candidates_data["aiAnalyzedAt"] = ts()
         save_json(TRADE_AI_CANDIDATES_PATH, candidates_data)
-        log.info(f"TradeAI aiAssessments saved | keys: {list(ai_assessments.keys())}")
-        fetch_status = {"running": False, "message": f"TradeAI analyze done: {len(ai_assessments)} assessed", "operation": None, "current": total, "total": total, "current_ticker": ""}
-        log.info(f"=== TradeAI Analyze Complete: {len(ai_assessments)} tickers ===")
+        fetch_status = {"running": False, "message": f"Rule assessment done: {len(eligible)} assessed", "operation": None, "current": total, "total": total, "current_ticker": ""}
+        log.info(f"=== TradeAI Rule Assessment Complete: {len(eligible)} tickers ===")
     except Exception as e:
-        log.error(f"TradeAI analyze FAIL: {e}")
-        fetch_status = {"running": False, "message": f"TradeAI analyze FAIL: {e}", "operation": None, "current": 0, "total": total, "current_ticker": ""}
+        log.error(f"TradeAI rule assessment FAIL: {e}")
+        fetch_status = {"running": False, "message": f"Rule assessment FAIL: {e}", "operation": None, "current": 0, "total": total, "current_ticker": ""}
 
 
 def run_tradeai_recommend():
@@ -2050,7 +2554,9 @@ def run_tradeai_recommend():
         REGIME_CFG      = cfg.get("regime", {})
         BKT_SC          = cfg.get("breakoutScore", {})
         SD_PENALTY      = cfg.get("sectorDiversity", {}).get("penalty", -15)
-        TS_RULE         = cfg.get("trajectoryStageRule", {})
+        pm              = cfg.get("purchaseMatrix", {})
+        max_slots       = int(pm.get("slots", 5))
+        identify_rules  = cfg.get("identifyRules", {})
 
         # Load today's signal forecasts for boost calculation
         today_str = datetime.now(TZ).strftime("%Y-%m-%d")
@@ -2098,17 +2604,12 @@ def run_tradeai_recommend():
             detail = details.get(ticker, {})
             ai = ai_assessments.get(ticker, {})
             d_data = dream_map.get(ticker, {})
-            dream_score = d_data.get("score", 0)
+            dream_score = d_data.get("score") or 0  # score can be None (SCORE_INCOMPLETE)
             price = live_prices.get(ticker) or detail.get("price") or d_data.get("price")
 
             ai_score    = ai.get("aiScore") or 0
-            # AI is disabled in this build, so trajectory/stage fall back to
-            # rule-based proxies computed from real price/fundamental data
-            # instead of always being empty (see _rule_based_trajectory /
-            # _rule_based_stage) — otherwise trajectoryBonus/stageBonus would
-            # be dead weight for every bucket that relies on them.
-            trajectory  = ai.get("trajectory") or _rule_based_trajectory(detail, TS_RULE)
-            stage       = ai.get("stage") or _rule_based_stage(detail, TS_RULE)
+            trajectory  = ai.get("trajectory", "")
+            stage       = ai.get("stage", "")
             bkt_key     = bucket if bucket in BKT_WEIGHTS else "Dream"
             w           = BKT_WEIGHTS[bkt_key]
 
@@ -2235,21 +2736,22 @@ def run_tradeai_recommend():
             })
 
         scored.sort(key=lambda x: x["composite"], reverse=True)
-        top5 = [s["ticker"] for s in scored[:5]]
+        top_slots = [s["ticker"] for s in scored[:max_slots]]
 
-        # Shadow validation: record all scored candidates + grade old snapshots
+        # Grade old snapshots now; recording today's happens at the end of
+        # this function once qualify/buy outcomes are known (see below).
         try:
-            _record_shadow_snapshot(scored, live_prices, spy_now, rec_version)
             _grade_shadow_snapshots()
         except Exception as she:
-            log.error(f"[Shadow] FAIL: {she}")
+            log.error(f"[Shadow] grade FAIL: {she}")
 
         sells = []
         for ticker, pos in list(holdings.items()):
             scored_entry   = next((s for s in scored if s["ticker"] == ticker), None)
             composite      = scored_entry["composite"] if scored_entry else 0
             buy_signal     = scored_entry["buySignal"] if scored_entry else "Unknown"
-            current_price  = live_prices.get(ticker)
+            current_price  = fetch_live_prices([ticker]).get(ticker)
+            current_price_fetched_at = ts() if current_price else None
             purchase_price = pos.get("purchasePrice") or current_price or 0
 
             if not current_price:
@@ -2294,17 +2796,14 @@ def run_tradeai_recommend():
 
             # ── Score-based sell checks ───────────────────────────────────────
             hard_sell = buy_signal == "Avoid" or composite < SELL_CFG["hardSellFloor"]
-            soft_sell = ticker not in top5 and composite < SELL_CFG["softSellFloor"]
+            soft_sell = ticker not in top_slots and composite < SELL_CFG["softSellFloor"]
 
             # Missing-data guard: a held ticker with NO fresh AI assessment
             # computes composite from aiScore=0 — that's absent data, not a
             # score collapse. Suppress score-based sells; price-based stops
             # above remain fully active so real losers still get cut.
-            # Only applies when AI_ENABLED — in this build AI is absent BY
-            # DESIGN (composite is dream+technicals only), not a per-ticker
-            # API failure, so score-based sells work normally.
             has_ai = bool(scored_entry and scored_entry.get("hasAI"))
-            if AI_ENABLED and not has_ai and (hard_sell or soft_sell):
+            if not has_ai and (hard_sell or soft_sell):
                 log.warning(f"TradeAI SELL-GUARD: {ticker} has no fresh AI assessment — "
                             f"score-based sell suppressed (composite {composite} is data-starved); stops still active")
                 hard_sell = soft_sell = False
@@ -2339,6 +2838,7 @@ def run_tradeai_recommend():
                     sells.append({
                         "ticker": ticker, "action": "SELL", "shares": pos["shares"],
                         "price": price, "amount": proceeds, "date": ts(),
+                        "priceFetchedAt": current_price_fetched_at,
                         "balance": round(balance, 2), "reason": sell_reason,
                         "composite": composite, "buySignal": buy_signal,
                         "pctFromPurchase": round(pct_from_purchase, 2),
@@ -2347,6 +2847,7 @@ def run_tradeai_recommend():
                         "stopLoss": stop_loss_triggered,
                         "gainLoss": round((price - purchase_price) * pos["shares"], 2) if purchase_price else None,
                         "daysHeld": round(days_held, 1) if days_held is not None else None,
+                        "purchasePrice": purchase_price, "purchasedAt": pos.get("purchasedAt"),
                     })
                     transactions.append(sells[-1])
                     trigger = "stop-loss" if stop_loss_triggered else ("hard" if hard_sell else "soft")
@@ -2363,11 +2864,12 @@ def run_tradeai_recommend():
         # Load RSI history for Reversal entry confirmation
         rsi_history = candidates_data.get("rsiHistory", {})
 
-        # Purchase Matrix config
-        pm               = cfg.get("purchaseMatrix", {})
-        max_slots        = int(pm.get("slots", 5))
+        # Purchase Matrix config (pm, max_slots loaded earlier alongside cfg)
         max_deploy       = float(pm.get("maxDeployPct", 80)) / 100.0
         min_composite    = float(pm.get("minBuyComposite", 60))
+        rotation_enabled = bool(pm.get("rotationEnabled", True))
+        rotation_gap     = float(pm.get("rotationMinScoreGap", 15))
+        rotation_cooldown = int(pm.get("rotationCooldownTradingDays", 5))
         deployable       = round(balance * max_deploy, 2)
         budget_per_slot  = round(deployable / max(1, max_slots), 2)
         log.info(f"TradeAI BUY config | balance:{balance} deployable:{deployable} slots:{max_slots} per_slot:{budget_per_slot} min_composite:{min_composite}")
@@ -2384,6 +2886,23 @@ def run_tradeai_recommend():
                 log.info(f"TradeAI QUALIFY skip (already held): {ticker}")
                 skip_reasons.append({"ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"), "reason": "Already held in portfolio"})
                 continue
+            if rotation_cooldown > 0:
+                recent_sells = [t for t in transactions if t.get("ticker") == ticker and t.get("action") == "SELL" and t.get("date")]
+                if recent_sells:
+                    try:
+                        last_sell_date = datetime.strptime(max(t["date"][:10] for t in recent_sells), "%Y-%m-%d").date()
+                        trading_days_since = sum(
+                            (last_sell_date + timedelta(days=offset)).weekday() < 5
+                            for offset in range(1, (datetime.now(TZ).date() - last_sell_date).days + 1)
+                        )
+                        if trading_days_since < rotation_cooldown:
+                            skip_reasons.append({
+                                "ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"),
+                                "reason": f"Re-entry cooldown: {rotation_cooldown - trading_days_since} trading day(s) remaining"
+                            })
+                            continue
+                    except Exception:
+                        pass
             if s.get("buySignal") == "Avoid":
                 log.info(f"TradeAI QUALIFY skip (AI says Avoid): {ticker}")
                 skip_reasons.append({"ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"), "reason": "AI buy signal is Avoid"})
@@ -2428,7 +2947,8 @@ def run_tradeai_recommend():
                 log.info(f"TradeAI QUALIFY skip (composite {s.get('composite')} < min {min_composite}): {ticker}")
                 skip_reasons.append({"ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"), "reason": f"Composite score {s.get('composite')} below minimum {min_composite}"})
                 continue
-            if budget_per_slot < price:
+            full_book_rotation = rotation_enabled and held_count >= max_slots
+            if budget_per_slot < price and not full_book_rotation:
                 log.warning(f"TradeAI QUALIFY skip (price ${price} > per-slot budget ${budget_per_slot}): {ticker}")
                 skip_reasons.append({"ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"), "reason": f"Price ${price} exceeds per-slot budget ${budget_per_slot}"})
                 continue
@@ -2441,10 +2961,99 @@ def run_tradeai_recommend():
             log.warning(f"TradeAI REGIME GATE: VIX {vix_now} > {vix_ceiling} — no new buys this run (sells unaffected)")
             skip_reasons.append({"ticker": "*", "reason": f"VIX {vix_now} above {vix_ceiling} — regime gate blocked all new buys"})
             qualified = []
+        elif bool(REGIME_CFG.get("macroRiskGateEnabled", True)):
+            # Macro regime gate: same additive pattern as VIX above, sourced
+            # from the daily macro refresh (yield curve + headline keywords)
+            # instead of live VIX. Only evaluated when VIX itself is fine —
+            # the two gates don't stack, either is sufficient to pause buys.
+            macro_signal = _macro_risk_signal()
+            if macro_signal["riskOff"]:
+                reason_str = "; ".join(macro_signal["reasons"])
+                log.warning(f"TradeAI REGIME GATE: macro risk-off ({reason_str}) — no new buys this run (sells unaffected)")
+                skip_reasons.append({"ticker": "*", "reason": f"Macro risk-off: {reason_str} — regime gate blocked all new buys"})
+                qualified = []
 
         slots_to_fill = max(0, max_slots - held_count)
         qualified_sorted = sorted(qualified, key=lambda x: x.get("composite", 0), reverse=True)
-        actual_buys = qualified_sorted[:slots_to_fill]
+
+        rotation_seller = None
+        rotation_candidate = None
+        if rotation_enabled and slots_to_fill == 0 and qualified_sorted:
+            min_hold_days = float(SELL_CFG.get("minHoldDays", 3))
+            eligible_held = []
+            for held_ticker, held_pos in holdings.items():
+                held_entry = next((s for s in scored if s["ticker"] == held_ticker), None)
+                held_days = _days_held(held_pos)
+                if (held_entry and held_entry.get("hasAI") and held_days is not None
+                        and held_days >= min_hold_days):
+                    eligible_held.append((held_entry, held_pos, held_days))
+
+            if eligible_held:
+                weakest_entry, weakest_pos, weakest_days = min(
+                    eligible_held, key=lambda row: row[0].get("composite", 0))
+                weakest_ticker = weakest_entry["ticker"]
+                weakest_quote = fetch_live_prices([weakest_ticker]).get(weakest_ticker)
+                if weakest_quote:
+                    weakest_slip = _slippage_for(details.get(weakest_ticker), EXEC_CFG)
+                    estimated_proceeds = round(
+                        weakest_quote * (1 - weakest_slip) * weakest_pos["shares"], 2)
+                    post_sale_budget = round((balance + estimated_proceeds) * max_deploy, 2)
+                    rotation_pool = _cap_filtered_candidates(
+                        qualified_sorted, holdings, details, identify_rules, exclude_ticker=weakest_ticker)
+                    for candidate in rotation_pool:
+                        if (candidate.get("composite", 0) >= weakest_entry.get("composite", 0) + rotation_gap
+                                and candidate.get("price", 0) <= post_sale_budget):
+                            rotation_seller = (weakest_entry, weakest_pos, weakest_days, weakest_quote)
+                            rotation_candidate = candidate
+                            break
+
+                if rotation_candidate:
+                    log.info(
+                        f"TradeAI ROTATION: replacing {weakest_ticker} ({weakest_entry.get('composite')}) "
+                        f"with {rotation_candidate['ticker']} ({rotation_candidate.get('composite')}) "
+                        f"gap:{rotation_candidate.get('composite', 0) - weakest_entry.get('composite', 0):.1f}")
+                else:
+                    skip_reasons.append({
+                        "ticker": "*", "reason": f"No rotation: best affordable candidate did not exceed "
+                        f"weakest eligible holding by {rotation_gap} points"})
+
+        if rotation_seller:
+            weakest_entry, weakest_pos, weakest_days, current_price = rotation_seller
+            weakest_ticker = weakest_entry["ticker"]
+            sell_slip = _slippage_for(details.get(weakest_ticker), EXEC_CFG)
+            sell_price = round(current_price * (1 - sell_slip), 4)
+            proceeds = round(sell_price * weakest_pos["shares"], 2)
+            balance += proceeds
+            sell_reason = (
+                f"Portfolio rotation: replacing composite {weakest_entry.get('composite')}/100 "
+                f"with {rotation_candidate['ticker']} at {rotation_candidate.get('composite')}/100 "
+                f"(minimum advantage {rotation_gap} points)"
+            )
+            weakest_purchase_price = weakest_pos.get("purchasePrice") or 0
+            rotation_sell = {
+                "ticker": weakest_ticker, "action": "SELL", "shares": weakest_pos["shares"],
+                "price": sell_price, "amount": proceeds, "date": ts(),
+                "priceFetchedAt": ts(), "balance": round(balance, 2), "reason": sell_reason,
+                "composite": weakest_entry.get("composite"), "buySignal": weakest_entry.get("buySignal", "Unknown"),
+                "stopLoss": False, "gainLoss": round((sell_price - weakest_purchase_price) * weakest_pos["shares"], 2),
+                "pctFromPurchase": round((sell_price - weakest_purchase_price) / weakest_purchase_price * 100, 2) if weakest_purchase_price else None,
+                "daysHeld": round(weakest_days, 1), "rotation": True,
+                "purchasePrice": weakest_purchase_price, "purchasedAt": weakest_pos.get("purchasedAt"),
+            }
+            sells.append(rotation_sell)
+            transactions.append(rotation_sell)
+            try:
+                _log_trade_outcome(weakest_ticker, weakest_pos, sell_price, sell_reason, "rotation",
+                                   weakest_entry.get("composite", 0), spy_now, weakest_days, sell_rec_version=rec_version)
+            except Exception as oe:
+                log.error(f"[TradeOutcome] rotation log FAIL: {weakest_ticker} | {oe}")
+            del holdings[weakest_ticker]
+            held_count -= 1
+            slots_to_fill = 1
+            deployable = round(balance * max_deploy, 2)
+            qualified_sorted = [rotation_candidate]
+
+        actual_buys = _cap_filtered_candidates(qualified_sorted, holdings, details, identify_rules)[:slots_to_fill]
 
         # Equal budget split across actual buys — not wasted across empty slots
         actual_buy_count = len(actual_buys)
@@ -2457,8 +3066,14 @@ def run_tradeai_recommend():
         # ── Step 2: buy top N qualifiers by composite score ───────────────────
         for s in actual_buys:
             ticker = s["ticker"]
+            fresh_price = fetch_live_prices([ticker]).get(ticker)
+            if not fresh_price:
+                log.warning(f"TradeAI BUY skip (no fresh price): {ticker} — refusing to trade without an order-time quote")
+                skip_reasons.append({"ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"), "reason": "No order-time live price"})
+                continue
+            price_fetched_at = ts()
             buy_slip = _slippage_for(details.get(ticker), EXEC_CFG)
-            price  = round(s["price"] * (1 + buy_slip), 4)  # buy fill above market: spread + slippage
+            price  = round(fresh_price * (1 + buy_slip), 4)  # buy fill above market: spread + slippage
             shares = int(equal_budget // price)
             if shares < 1:
                 continue
@@ -2479,10 +3094,11 @@ def run_tradeai_recommend():
                 "sectorPenalty": s.get("sectorPenalty"),
             }
             holdings[ticker] = {"shares": shares, "purchasePrice": price, "purchasedAt": ts(), "factors": factors,
+                                "priceFetchedAt": price_fetched_at,
                                 "recVersion": rec_version, "spyAtBuy": spy_now, "vixAtBuy": vix_now}
             buys.append({
                 "ticker": ticker, "action": "BUY", "shares": shares,
-                "price": price, "amount": cost, "date": ts(),
+                "price": price, "amount": cost, "date": ts(), "priceFetchedAt": price_fetched_at,
                 "balance": round(balance, 2), "reason": s.get("reasoning", ""),
                 "composite": s.get("composite"), "bucket": s.get("bucket"),
             })
@@ -2495,6 +3111,13 @@ def run_tradeai_recommend():
         trades["transactions"] = transactions
         trades["lastRecommendAt"] = ts()
         save_trades_ai(trades)
+
+        # Shadow validation: full-funnel snapshot now that qualify/buy
+        # outcomes are known (see _record_shadow_snapshot).
+        try:
+            _record_shadow_snapshot(scored, qualified, actual_buys, dream_map, holdings, live_prices, spy_now, rec_version)
+        except Exception as she:
+            log.error(f"[Shadow] record FAIL: {she}")
 
         # ── Self-learning check: does the current version still deserve to run? ──
         # Detection only — never changes the live config. A rollback needs the
@@ -2535,6 +3158,19 @@ def get_tradeai():
     analysis_data = load_json(OUTPUT_PATH, {})
     wl_map = {s.get("ticker"): s for s in analysis_data.get("watchlist", [])}
 
+    # Keep displayed candidate prices aligned with the scheduled watchlist
+    # refresh without replacing the deeper Fetch Info fields.
+    display_details = {ticker: dict(detail) for ticker, detail in details.items()}
+    for ticker, detail in display_details.items():
+        wl_entry = wl_map.get(ticker, {})
+        wl_ts = wl_entry.get("priceFetchedAt") or ""
+        detail_ts = detail.get("fetchCompletedAt") or ""
+        if wl_entry.get("price") is not None and wl_ts >= detail_ts:
+            for field in ("price", "previousClose", "volume", "marketCap", "rsi14", "bbPercent"):
+                if field in wl_entry:
+                    detail[field] = wl_entry[field]
+            detail["priceFetchedAt"] = wl_ts
+
     holdings_out = []
     for ticker, pos in trades.get("holdings", {}).items():
         detail = details.get(ticker, {})
@@ -2546,10 +3182,11 @@ def get_tradeai():
         gain_loss_pct = round(((current_price - purchase_price) / purchase_price) * 100, 2) if current_price and purchase_price else None
         prev_close = wl_entry.get("previousClose") or detail.get("previousClose")
         day_change_pct = round((current_price - prev_close) / prev_close * 100, 2) if (current_price and prev_close) else None
+        day_change_amount = round((current_price - prev_close) * shares, 2) if (current_price and prev_close) else None
         holdings_out.append({
             "ticker": ticker, "shares": shares,
             "purchasePrice": purchase_price, "currentPrice": current_price,
-            "previousClose": prev_close, "dayChangePct": day_change_pct,
+            "previousClose": prev_close, "dayChangePct": day_change_pct, "dayChangeAmount": day_change_amount,
             "gainLoss": gain_loss, "gainLossPct": gain_loss_pct,
             "purchasedAt": pos.get("purchasedAt"),
             "factors": pos.get("factors"),
@@ -2590,7 +3227,7 @@ def get_tradeai():
         "holdings": holdings_out,
         "transactions": trades.get("transactions", []),
         "identified": identified,
-        "details": details,
+        "details": display_details,
         "aiAssessments": candidates.get("aiAssessments", {}),
         "lastRecommend": candidates.get("lastRecommend"),
         "identifiedAt":       candidates.get("identifiedAt"),
@@ -2601,18 +3238,27 @@ def get_tradeai():
         "newsTsMap":          news_ts_map,
         "signalFcMap":        signal_fc_map,
         "rollbackProposal":   load_json(ROLLBACK_PROPOSAL_PATH, {"status": "none"}),
+        "tuningProposal":     load_json(TUNING_PROPOSAL_PATH, {"status": "none"}),
+        "benchmarks":         analysis_data.get("benchmarks", {}),
+        "newsWarnings":       load_json(NEWS_WARNINGS_PATH, {"warnings": {}}).get("warnings", {}),
+        "macroSignal":        _macro_risk_signal(),
+        "resetPending":       load_json(RESET_PENDING_PATH, {"status": "none"}),
     })
 
 
 def run_tradeai_sell_check(trigger="manual"):
     """Sell-only cycle: refresh holdings prices and run the price-based stops
     (hard stop, daily-drop vs yesterday's close, soft stop, trailing stop).
-    No scoring, no buys, no Gemini calls — light enough to run every few
+    No scoring, no buys, no AI calls — light enough to run every few
     minutes during market hours. Composite context comes from the last full
     Recommend; rotation (top-5) sells are deliberately excluded here."""
     global fetch_status
     fetch_status = {"running": True, "message": "TradeAI: sell-only stop check...", "operation": "tradeai_sellcheck"}
     log.info(f"=== TradeAI Sell-Check Started [{trigger}] ===")
+    try:
+        _refresh_benchmarks()
+    except Exception as be:
+        log.warning(f"[Benchmarks] refresh FAIL: {be}")
     try:
         trades = load_trades_ai()
         holdings = trades.get("holdings", {})
@@ -2627,6 +3273,21 @@ def run_tradeai_sell_check(trigger="manual"):
         SELL_CFG = cfg["sellThresholds"]
         EXEC_CFG = cfg.get("execution", {})
 
+        # Severe-news watch on held positions: fresh news (1h cache — this
+        # cycle runs every ~20 min so it's still cheap) then scan for
+        # red-flag keywords. Flags only — never sells on its own.
+        try:
+            news_db = load_json(NEWS_PATH, {})
+            news_updated = False
+            for t in holdings.keys():
+                if _refresh_ticker_news_if_stale(t, news_db, max_age_hours=1):
+                    news_updated = True
+            if news_updated:
+                save_json(NEWS_PATH, news_db)
+            _scan_news_warnings(list(holdings.keys()), news_db)
+        except Exception as nwe:
+            log.warning(f"[NewsWarning] scan FAIL: {nwe}")
+
         candidates_data = load_json(TRADE_AI_CANDIDATES_PATH, {})
         details = candidates_data.get("details", {})
         last_scored = {s["ticker"]: s for s in (candidates_data.get("lastRecommend") or {}).get("scored", [])}
@@ -2638,7 +3299,8 @@ def run_tradeai_sell_check(trigger="manual"):
 
         sells = []
         for ticker, pos in list(holdings.items()):
-            current_price = live_prices.get(ticker)
+            current_price = fetch_live_prices([ticker]).get(ticker)
+            current_price_fetched_at = ts() if current_price else None
             if not current_price:
                 log.warning(f"SellCheck skip: {ticker} — no live price, holding position")
                 continue
@@ -2669,7 +3331,7 @@ def run_tradeai_sell_check(trigger="manual"):
                 reason = f"Stop-loss triggered: down {abs(pct_from_purchase):.1f}% from purchase ${purchase_price:.2f} (hard stop at -{stop_loss_hard}%)"
             elif day_change_pct is not None and day_change_pct <= -daily_drop_stop:
                 reason = f"Daily-drop stop triggered: down {abs(day_change_pct):.1f}% vs yesterday's close ${prev_close:.2f} (stop at -{daily_drop_stop}%)"
-            elif pct_from_purchase <= -stop_loss_soft and (has_ai or not AI_ENABLED) and composite < 50:
+            elif pct_from_purchase <= -stop_loss_soft and has_ai and composite < 50:
                 reason = f"Stop-loss triggered: down {abs(pct_from_purchase):.1f}% from purchase and composite {composite}/100 below 50"
             elif pct_from_peak <= -trailing_pct and pct_from_purchase > 0:
                 reason = f"Trailing stop triggered: down {abs(pct_from_peak):.1f}% from peak ${peak_price:.2f} — protecting gains"
@@ -2686,7 +3348,7 @@ def run_tradeai_sell_check(trigger="manual"):
             balance  += proceeds
             sells.append({
                 "ticker": ticker, "action": "SELL", "shares": pos["shares"],
-                "price": price, "amount": proceeds, "date": ts(),
+                "price": price, "amount": proceeds, "date": ts(), "priceFetchedAt": current_price_fetched_at,
                 "balance": round(balance, 2), "reason": reason,
                 "composite": composite, "buySignal": (entry or {}).get("buySignal", "Unknown"),
                 "pctFromPurchase": round(pct_from_purchase, 2),
@@ -2695,6 +3357,7 @@ def run_tradeai_sell_check(trigger="manual"):
                 "stopLoss": True,
                 "gainLoss": round((price - purchase_price) * pos["shares"], 2) if purchase_price else None,
                 "daysHeld": round(days_held, 1) if days_held is not None else None,
+                "purchasePrice": purchase_price, "purchasedAt": pos.get("purchasedAt"),
             })
             transactions.append(sells[-1])
             try:
@@ -2735,11 +3398,83 @@ def run_tradeai_sell_check(trigger="manual"):
         fetch_status = {"running": False, "message": f"Sell-check FAIL: {e}", "operation": None}
 
 
+@app.route("/tradeai/force_sell", methods=["POST"])
+def tradeai_force_sell():
+    """Sell one holding immediately at a fresh quote and record the exit."""
+    try:
+        if fetch_status.get("running"):
+            return jsonify({"error": "Another TradeAI operation is running; try again when it finishes"}), 409
+        body = request.get_json(silent=True) or {}
+        ticker = str(body.get("ticker") or "").upper().strip()
+        if not ticker:
+            return jsonify({"error": "ticker is required"}), 400
+
+        trades = load_trades_ai()
+        holdings = trades.get("holdings", {})
+        pos = holdings.get(ticker)
+        if not pos:
+            return jsonify({"error": f"{ticker} is not currently held"}), 404
+
+        quotes = fetch_live_prices([ticker, "SPY"])
+        current_price = quotes.get(ticker)
+        if not current_price:
+            return jsonify({"error": f"No live price available for {ticker}; nothing was sold"}), 503
+
+        candidates_data = load_json(TRADE_AI_CANDIDATES_PATH, {})
+        details = candidates_data.get("details", {})
+        exec_cfg = load_scoring_config().get("execution", {})
+        sell_slip = _slippage_for(details.get(ticker), exec_cfg)
+        sell_price = round(current_price * (1 - sell_slip), 4)
+        shares = int(pos.get("shares") or 0)
+        if shares < 1:
+            return jsonify({"error": f"{ticker} has no sellable shares"}), 400
+
+        proceeds = round(sell_price * shares, 2)
+        balance = round(trades.get("balance", STARTING_BALANCE) + proceeds, 2)
+        now_ts = ts()
+        last_scored = {s["ticker"]: s for s in (candidates_data.get("lastRecommend") or {}).get("scored", [])}
+        scored = last_scored.get(ticker, {})
+        sell_reason = "Manual force sell requested by user"
+        force_sell_purchase_price = pos.get("purchasePrice") or 0
+        transaction = {
+            "ticker": ticker, "action": "SELL", "shares": shares,
+            "price": sell_price, "amount": proceeds, "date": now_ts,
+            "priceFetchedAt": now_ts, "balance": balance, "reason": sell_reason,
+            "composite": scored.get("composite", 0), "buySignal": scored.get("buySignal", "Unknown"),
+            "stopLoss": False, "manual": True,
+            "gainLoss": round((sell_price - force_sell_purchase_price) * shares, 2),
+            "pctFromPurchase": round((sell_price - force_sell_purchase_price) / force_sell_purchase_price * 100, 2) if force_sell_purchase_price else None,
+            "daysHeld": round(_days_held(pos), 1) if _days_held(pos) is not None else None,
+            "purchasePrice": force_sell_purchase_price, "purchasedAt": pos.get("purchasedAt"),
+        }
+        trades["balance"] = balance
+        trades["holdings"] = holdings
+        trades["transactions"] = trades.get("transactions", []) + [transaction]
+        del holdings[ticker]
+        save_trades_ai(trades)
+
+        try:
+            _log_trade_outcome(ticker, pos, sell_price, sell_reason, "manual", scored.get("composite", 0), quotes.get("SPY"), _days_held(pos))
+        except Exception as outcome_error:
+            log.error(f"[TradeOutcome] force sell log FAIL: {ticker} | {outcome_error}")
+
+        _sync_watchlist_from_holdings(list(holdings.keys()))
+        log.info(f"TradeAI FORCE SELL: {ticker} | shares:{shares} price:{sell_price} proceeds:{proceeds}")
+        return jsonify({"status": "ok", "transaction": transaction, "balance": balance})
+    except Exception as e:
+        log.error(f"TradeAI FORCE SELL FAIL: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/tradeai/refresh_prices", methods=["POST"])
 def tradeai_refresh_prices():
     """Refresh live price + yesterday's close for held tickers only (~6 Yahoo
     calls) and sync into analysis.json so the account view updates. No trading."""
     try:
+        try:
+            _refresh_benchmarks()
+        except Exception as be:
+            log.warning(f"[Benchmarks] refresh FAIL: {be}")
         holdings = load_trades_ai().get("holdings", {})
         tickers = list(holdings.keys())
         if not tickers:
@@ -2825,6 +3560,79 @@ def tradeai_rollback_dismiss():
     return jsonify({"status": "ok"})
 
 
+def _set_cfg_path(cfg, path, value):
+    """Set a dotted path (e.g. 'identifyRules.momentumRsiMax') in a nested
+    config dict, creating intermediate dicts as needed."""
+    parts = path.split(".")
+    node = cfg
+    for p in parts[:-1]:
+        node = node.setdefault(p, {})
+    node[parts[-1]] = value
+
+
+@app.route("/tradeai/tuning/approve", methods=["POST"])
+def tradeai_tuning_approve():
+    """Apply a pending tuning proposal — the only path that actually changes
+    the live scoring config based on missed-gainer evidence. Always creates
+    a new tracked version, so it's rollback-able like any other change."""
+    proposal = load_json(TUNING_PROPOSAL_PATH, None)
+    if not proposal or proposal.get("status") != "pending":
+        return jsonify({"error": "No pending tuning proposal"}), 400
+    change = proposal["proposedChange"]
+    new_cfg = load_scoring_config()
+    _set_cfg_path(new_cfg, change["path"], change["to"])
+    save_json(SCORING_CONFIG_PATH, new_cfg)
+    f = proposal["forecast"]
+    new_v = bump_recommend_version(
+        [f"APPROVED TUNING: {change['path']} {change['from']} -> {change['to']} — based on "
+         f"{proposal['missedGainersAnalyzed']} missed {proposal['gainThresholdPct']}%+ gainers over the "
+         f"last {proposal['windowDays']} days ({proposal['boughtRowsAnalyzed']} bought rows in the same window)",
+         proposal["reason"],
+         f"Historical backtest: would have caught {f['historicalMissedGainersWouldHaveCaught']}/"
+         f"{f['historicalMissedGainersTotal']} of those missed gainers, would have excluded "
+         f"{f['currentPicksWouldHaveExcluded']} of what was actually bought"],
+        label=f"Tuning: {change['path'].split('.')[-1]} -> {change['to']} (approved)",
+        config_snapshot=new_cfg,
+    )
+    save_json(TUNING_PROPOSAL_PATH, {"status": "none"})
+    log.warning(f"[Tuning] APPROVED by user: {change['path']} {change['from']} -> {change['to']} (v{new_v})")
+    return jsonify({"status": "ok", "newVersion": new_v})
+
+
+@app.route("/tradeai/tuning/dismiss", methods=["POST"])
+def tradeai_tuning_dismiss():
+    """Decline a pending tuning proposal. Won't resurface for this exact
+    proposed change, but a fresh analysis cycle can propose a different one."""
+    proposal = load_json(TUNING_PROPOSAL_PATH, None)
+    if not proposal or proposal.get("status") != "pending":
+        return jsonify({"error": "No pending tuning proposal"}), 400
+    proposal["status"] = "dismissed"
+    proposal["dismissedAt"] = ts()
+    save_json(TUNING_PROPOSAL_PATH, proposal)
+    log.info(f"[Tuning] proposal dismissed by user: {proposal['proposalKey']}")
+    return jsonify({"status": "ok"})
+
+
+@app.route("/tradeai/news_warning/dismiss", methods=["POST"])
+def tradeai_news_warning_dismiss():
+    """Acknowledge a severe-news warning on a held ticker. It won't resurface
+    for this exact headline — a genuinely new severe headline on the same
+    ticker still raises a fresh warning."""
+    body = request.get_json(silent=True) or {}
+    ticker = str(body.get("ticker") or "").upper().strip()
+    if not ticker:
+        return jsonify({"error": "ticker is required"}), 400
+    warnings_db = load_json(NEWS_WARNINGS_PATH, {"warnings": {}})
+    warning = warnings_db.get("warnings", {}).get(ticker)
+    if not warning or warning.get("status") != "active":
+        return jsonify({"error": f"No active news warning for {ticker}"}), 400
+    warning["status"] = "dismissed"
+    warning["dismissedAt"] = ts()
+    save_json(NEWS_WARNINGS_PATH, warnings_db)
+    log.info(f"[NewsWarning] dismissed by user: {ticker} ({warning.get('keyword')})")
+    return jsonify({"status": "ok"})
+
+
 @app.route("/tradeai/identify", methods=["POST"])
 def tradeai_identify():
     if fetch_status.get("running"):
@@ -2900,9 +3708,26 @@ def _composite_band(c):
 @app.route("/tradeai/stats")
 def tradeai_stats():
     """Scoring feedback: closed-trade outcomes attributed to buy-time factors,
-    plus rule-based tuning suggestions for the scoring matrix."""
+    plus rule-based tuning suggestions for the scoring matrix.
+
+    ?epoch=<n> filters to trades whose sellDate falls within that account
+    epoch (epoch 0 = everything before the first reset). Default/omitted =
+    "all" = every trade ever, unfiltered — a reset never deletes history,
+    it only lets the UI look at one slice of it at a time."""
+    epochs_db = _load_epochs()
+    epochs = epochs_db.get("epochs", [])
+    epoch_param = request.args.get("epoch")
+
     db = load_json(TRADE_OUTCOMES_PATH, {"outcomes": []})
     outcomes = db.get("outcomes", [])
+    for o in outcomes:
+        o["epoch"] = _epoch_for_date(o.get("sellDate") or o.get("date"), epochs)
+    if epoch_param not in (None, "", "all"):
+        try:
+            target_epoch = int(epoch_param)
+            outcomes = [o for o in outcomes if o["epoch"] == target_epoch]
+        except ValueError:
+            pass
     with_factors = [o for o in outcomes if o.get("factors")]
 
     def group_by(rows, key_fn):
@@ -3127,6 +3952,8 @@ def tradeai_stats():
                 suggestions.append(f"Shadow test over {shadow['graded']} candidate-days: top-5 picks beat the rest by {round(edge,2)}% (5-day, vs SPY) — the composite ranking is adding real selection value.")
 
     return jsonify({
+        "epochs": epochs,
+        "selectedEpoch": epoch_param if epoch_param not in (None, "") else "all",
         "overall": overall,
         "shadow": shadow,
         "byBucket": by_bucket,
@@ -3143,6 +3970,8 @@ def tradeai_stats():
         "currentVersion": versions_db["versions"][-1]["version"],
         "championVersion": champion_v,
         "rollbackProposal": load_json(ROLLBACK_PROPOSAL_PATH, {"status": "none"}),
+        "tuningProposal": load_json(TUNING_PROPOSAL_PATH, {"status": "none"}),
+        "missedGainers": _missed_gainers_summary(),
         "selfLearning": {
             "autoRollback": bool(sl_cfg.get("autoRollback", True)),
             "minTrades": sl_min_n,
@@ -3245,10 +4074,20 @@ def tradeai_reset():
     try:
         body = request.get_json(silent=True) or {}
         balance = float(body.get("balance", STARTING_BALANCE))
+        auto_buy = bool(body.get("autoBuyIn", False))
         save_json(TRADES_AI_PATH, {"balance": balance, "holdings": {}, "transactions": []})
         save_json(TRADE_AI_CANDIDATES_PATH, {})
-        log.info(f"TradeAI simulation reset | balance: ${balance:,.2f}")
-        return jsonify({"status": "reset", "balance": balance})
+        epoch = _record_new_epoch(balance, label=body.get("label"))
+        if auto_buy:
+            save_json(RESET_PENDING_PATH, {
+                "status": "pending", "requestedAt": ts(),
+                "targetBalance": balance, "epoch": epoch["epoch"],
+            })
+            log.info(f"[Reset] auto buy-in queued — will run at the next Recommend slot (10am/11am ET)")
+        else:
+            save_json(RESET_PENDING_PATH, {"status": "none"})
+        log.info(f"TradeAI simulation reset | balance: ${balance:,.2f} | epoch:{epoch['epoch']} | autoBuyIn:{auto_buy}")
+        return jsonify({"status": "reset", "balance": balance, "epoch": epoch["epoch"], "autoBuyIn": auto_buy})
     except Exception as e:
         log.error(f"TradeAI reset FAIL: {e}")
         return jsonify({"error": str(e)})
@@ -3403,9 +4242,8 @@ def refresh_ticker_news(ticker):
 # ── Market-day Scheduler ──────────────────────────────────────────────────────
 # All times US-Eastern. On market days:
 #   sell-only stop checks  :20/:40 during the 9/10/11am hours (post-9:30 only)
-#   full Recommend         10:00, 11:00
-#   price refresh + Dream  13:30  (Dream takes ~75 min → done ~14:45)
-#   Identify→Fetch→Analyze→Recommend  15:00  (Recommend lands ~15:15, pre-close)
+#   hourly refresh→Fetch→Rule assess→Recommend during market hours
+#   price refresh + Dream→Identify→Fetch→Rule assess after the close
 ET = ZoneInfo("America/New_York")
 SCHEDULER_CONFIG_PATH = "output/scheduler_config.json"
 SCHEDULER_STATE_PATH  = "output/scheduler_state.json"
@@ -3415,8 +4253,9 @@ SCHEDULER_DEFAULTS = {
     "sellCheckHours":   [9, 10, 11],
     "sellCheckMinutes": [20, 40],
     "recommendTimes":   ["10:00", "11:00"],
+    "macroTime":        "13:00",  # daily — before dream/chain so the macro risk gate has today's data
     "dreamTime":        "13:30",
-    "chainTime":        "15:00",
+    "tuningTime":       "16:15",  # Friday only — weekly missed-gainer tuning check
     "marketHolidays": [
         "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
         "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
@@ -3448,6 +4287,15 @@ def _sched_wait_idle(max_wait_sec=1800):
         waited += 10
     return not fetch_status.get("running")
 
+def _sched_tuning_check():
+    """Weekly: does the shadow-snapshot history make a strong enough case
+    for a specific Identify config relaxation? Only ever records a pending
+    proposal — see /tradeai/tuning/approve."""
+    try:
+        _check_tuning_candidate()
+    except Exception as e:
+        log.error(f"[Tuning] scheduled check FAIL: {e}")
+
 def _sched_dream_scan():
     """Scheduled dream scan — skip if one already ran in the last few hours
     (e.g. manually this morning) to avoid a redundant 75-minute Yahoo sweep."""
@@ -3464,15 +4312,8 @@ def _sched_dream_scan():
             pass
     run_dream_scan("scheduler")
 
-def _sched_analyze():
-    """Scheduled AI analyze — skip if assessments were already generated today
-    (e.g. a manual morning run), protecting the daily Gemini budget."""
-    analyzed_at = (load_json(TRADE_AI_CANDIDATES_PATH, {}).get("aiAnalyzedAt") or "")
-    today = datetime.now(TZ).strftime("%Y-%m-%d")
-    if analyzed_at[:10] == today:
-        log.info(f"[Scheduler] analyze skipped — already ran today ({analyzed_at})")
-        return
-    run_tradeai_analyze()
+def _clear_reset_pending():
+    save_json(RESET_PENDING_PATH, {"status": "none"})
 
 def _sched_run_steps(job_name, steps):
     """Run pipeline steps sequentially; one scheduled job at a time."""
@@ -3515,18 +4356,38 @@ def _scheduler_loop():
                 slots.append((f"sellCheck-{hhmm}", "sellCheck",
                               [("sell-check", lambda: run_tradeai_sell_check("scheduler"))]))
             if hhmm in cfg.get("recommendTimes", []):
-                slots.append((f"recommend-{hhmm}", "fullRecommend",
-                              [("recommend", run_tradeai_recommend)]))
+                reset_pending = load_json(RESET_PENDING_PATH, {"status": "none"}).get("status") == "pending"
+                if reset_pending:
+                    # Account was reset with auto buy-in requested — this is the
+                    # first Recommend slot since then (always 10am/11am, so the
+                    # "only buy between 10am-3pm" condition holds automatically).
+                    # Candidates were wiped by the reset, so run the full chain
+                    # from dream-scan, not just the normal 3 steps.
+                    slots.append((f"recommend-{hhmm}", "resetBuyIn",
+                                  [("dream-scan", _sched_dream_scan),
+                                   ("identify", run_tradeai_identify),
+                                   ("fetch", run_tradeai_fetch),
+                                   ("rule-assess", run_tradeai_analyze),
+                                   ("recommend", run_tradeai_recommend),
+                                   ("clear-reset-pending", _clear_reset_pending)]))
+                else:
+                    slots.append((f"recommend-{hhmm}", "hourlyRecommend",
+                                  [("price-refresh", run_tradeai_price_refresh),
+                                   ("rule-assess", run_tradeai_analyze),
+                                   ("recommend", run_tradeai_recommend)]))
+            if hhmm == cfg.get("macroTime"):
+                slots.append((f"macro-{hhmm}", "macroRefresh",
+                              [("macro-refresh", run_macro_refresh)]))
             if hhmm == cfg.get("dreamTime") and not early_close:
-                slots.append((f"dream-{hhmm}", "dreamScan",
+                slots.append((f"dream-{hhmm}", "dreamPreparation",
                               [("price-refresh", lambda: run_price_refresh("scheduler")),
-                               ("dream-scan", _sched_dream_scan)]))
-            if hhmm == cfg.get("chainTime") and not early_close:
-                slots.append((f"chain-{hhmm}", "afternoonChain",
-                              [("identify", run_tradeai_identify),
+                               ("dream-scan", _sched_dream_scan),
+                               ("identify", run_tradeai_identify),
                                ("fetch", run_tradeai_fetch),
-                               ("analyze", _sched_analyze),
-                               ("recommend", run_tradeai_recommend)]))
+                               ("rule-assess", run_tradeai_analyze)]))
+            if hhmm == cfg.get("tuningTime") and now_et.weekday() == 4:  # Friday
+                slots.append((f"tuning-{today}", "tuningCheck",
+                              [("tuning-analysis", _sched_tuning_check)]))
 
             for slot_key, job_name, steps in slots:
                 key = f"{today}-{slot_key}"
@@ -3559,8 +4420,6 @@ def admin_scheduler():
                 saved["recommendTimes"] = [norm_time(t) for t in body["recommendTimes"]]
             if "dreamTime" in body:
                 saved["dreamTime"] = norm_time(body["dreamTime"])
-            if "chainTime" in body:
-                saved["chainTime"] = norm_time(body["chainTime"])
             if "sellCheckHours" in body:
                 hours = sorted({int(h) for h in body["sellCheckHours"]})
                 if any(h < 0 or h > 23 for h in hours):
@@ -3825,10 +4684,8 @@ def signal_history():
     return jsonify(data)
 
 if __name__ == "__main__":
-    # Different port from the US repo (5050) so both can run side by side.
-    # NOT 5060/5061 — both are on Chrome/Safari's blocked "unsafe ports"
-    # list (reserved for SIP), so the browser refuses to connect at all.
     # use_reloader=False is required: the reloader forks a second process that
     # re-executes this module, doubling every background thread (scheduler,
-    # startup refresh) and causing duplicate scheduled runs.
-    app.run(debug=True, port=5090, use_reloader=False)
+    # startup refresh) and causing duplicate scheduled runs — e.g. two
+    # concurrent Analyze passes blowing the 20-request/day Gemini quota.
+    app.run(debug=True, port=5050, use_reloader=False)

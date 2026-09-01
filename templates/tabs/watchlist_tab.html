@@ -405,15 +405,12 @@ async function loadSchedulerStatus() {
         <span>Sell-only stop checks — hours</span>
         <span><input id="schedSellHours" value="${(cfg.sellCheckHours||[]).join(',')}" style="${inp};width:70px"> at minutes <input id="schedSellMins" value="${(cfg.sellCheckMinutes||[]).join(',')}" style="${inp};width:60px"></span>
         <span>${fmt('sellCheck')}</span>
-        <span>Full Recommend (sells + buys)</span>
+        <span>Hourly refresh + rule Recommend (sells + buys)</span>
         <span><input id="schedRecTimes" value="${(cfg.recommendTimes||[]).join(', ')}" style="${inp};width:130px"></span>
         <span>${fmt('fullRecommend')}</span>
-        <span>Price refresh + Dream scan</span>
+        <span>After-close Dream → shortlist → rule assessment</span>
         <span><input id="schedDreamTime" value="${cfg.dreamTime||''}" style="${inp};width:60px"></span>
         <span>${fmt('dreamScan')}</span>
-        <span>Identify→Fetch→Analyze→Recommend</span>
-        <span><input id="schedChainTime" value="${cfg.chainTime||''}" style="${inp};width:60px"></span>
-        <span>${fmt('afternoonChain')}</span>
       </div>
       <button class="btn" style="margin-top:8px" onclick="saveSchedule(this)">SAVE TIMES</button>`;
     const btn = document.getElementById('schedulerToggleBtn');
@@ -435,17 +432,16 @@ async function saveSchedule(btn) {
   const mins     = listOf('schedSellMins').map(Number);
   const recTimes = listOf('schedRecTimes');
   const dream    = document.getElementById('schedDreamTime').value.trim();
-  const chain    = document.getElementById('schedChainTime').value.trim();
   const timeRe = /^([01]?\d|2[0-3]):[0-5]\d$/;
   if (!hours.length || hours.some(h => isNaN(h) || h < 0 || h > 23)) { alert('Sell-check hours must be numbers 0-23 (e.g. 9,10,11)'); return; }
   if (!mins.length || mins.some(m => isNaN(m) || m < 0 || m > 59))   { alert('Sell-check minutes must be numbers 0-59 (e.g. 20,40)'); return; }
   if (!recTimes.length || !recTimes.every(t => timeRe.test(t))) { alert('Recommend times must be HH:MM 24h (e.g. 10:00, 11:00)'); return; }
-  if (!timeRe.test(dream) || !timeRe.test(chain)) { alert('Dream/chain times must be HH:MM 24h (e.g. 13:30)'); return; }
+  if (!timeRe.test(dream)) { alert('Dream time must be HH:MM 24h (e.g. 16:01)'); return; }
   btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
   try {
     const r = await fetch('/admin/scheduler', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream, chainTime: chain })
+      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream })
     });
     const d = await r.json();
     if (d.error) alert('Save failed: ' + d.error);
@@ -521,6 +517,7 @@ async function refreshTickerPrice(ticker, btn) {
 
 let dataLoaded = false;
 let wasRunning = false;
+let dreamScanning = false;
 let gainersMarket = "cdn";
 let pendingReload = false;
 
@@ -601,11 +598,8 @@ function buildDreamHelpHtml() {
     + '<div class="dream-help-section">'
     + '<div class="dream-help-h">📡 SCAN SOURCES</div>'
     + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">Watchlist</span><span class="dream-help-desc">Your current tracked stocks</span></div>'
-    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">Daily Gainer</span><span class="dream-help-desc">Top 10 US + Top 10 TSX movers from today</span></div>'
-    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">ARK ETF</span><span class="dream-help-desc">Holdings from ARKK, ARKG, ARKW, ARKQ, ARKF — Cathie Wood active picks</span></div>'
-    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">Screener</span><span class="dream-help-desc">7 yfinance screens: growth tech, undervalued growth, aggressive small caps, small cap gainers, most actives, day gainers, undervalued large caps</span></div>'
-    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">S&amp;P 500</span><span class="dream-help-desc">All ~500 S&amp;P 500 components scored to find hidden gems</span></div>'
-    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">TSX 60</span><span class="dream-help-desc">All 60 TSX blue chip components</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">Daily Gainer</span><span class="dream-help-desc">Top TSX (CDN) movers from today</span></div>'
+    + '<div class="dream-help-row"><span class="dream-help-badge" style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">TSX Composite</span><span class="dream-help-desc">All ~220 S&amp;P/TSX Composite components scored to find hidden gems</span></div>'
     + '</div>'
     + '<div class="dream-help-section">'
     + '<div class="dream-help-h">🔢 SCORE (100 pts)</div>'
@@ -621,7 +615,7 @@ function buildDreamHelpHtml() {
     + '<div class="dream-help-h">🏅 BADGES &nbsp; &nbsp; ⏱️ TIMING</div>'
     + '<div class="dream-help-row"><span style="font-size:13px;margin-right:6px">🌟</span><span class="dream-help-metric">70–100 Dream</span><span class="dream-help-desc">High conviction candidate</span></div>'
     + '<div class="dream-help-row"><span style="font-size:13px;margin-right:6px">✅</span><span class="dream-help-metric">50–69 Watch</span><span class="dream-help-desc">Monitor for improvement</span></div>'
-    + '<div class="dream-help-row"><span style="font-size:13px;margin-right:6px">⚠️</span><span class="dream-help-metric">Below 50</span><span class="dream-help-desc">Not ready yet · Scan takes 15–20 min for ~650 tickers · Run manually via the button above</span></div>'
+    + '<div class="dream-help-row"><span style="font-size:13px;margin-right:6px">⚠️</span><span class="dream-help-metric">Below 50</span><span class="dream-help-desc">Not ready yet · Scan takes 5–8 min for ~230 tickers · Run manually via the button above</span></div>'
     + '</div>'
     + '</div>';
 }
@@ -726,9 +720,13 @@ async function pollStatus() {
 
     if (wasRunning && !s.running) {
       const wasDream = dreamScanning || (s.message && s.message.toLowerCase().includes('dream'));
-      console.log('[Poll] Operation complete, reloading data | wasDream:' + wasDream + ' activeTab:' + activeTab);
+      const curActiveTab = (document.querySelector('.tab.active') || {}).dataset?.tab;
+      console.log('[Poll] Operation complete, reloading data | wasDream:' + wasDream + ' activeTab:' + curActiveTab);
       dreamScanning = false;
       await loadData();
+      if (typeof loadTradeAI === 'function' && typeof tradeAILoaded !== 'undefined' && tradeAILoaded) {
+        await loadTradeAI(true);
+      }
       if (wasDream) {
         dreamLoaded = false;
         setTimeout(async () => { await loadDream(true); console.log('[Dream] post-scan reload complete'); }, 800);
@@ -1026,7 +1024,6 @@ function showBankGuide(ticker) {
 
 loadData();
 setInterval(pollStatus, 3000);
-updateMacroStatusBadge();
 
   {%- endraw %}
 </script>

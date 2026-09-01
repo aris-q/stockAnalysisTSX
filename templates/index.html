@@ -10,11 +10,11 @@
       --bg: #0a0a0f;
       --surface: #111118;
       --surface2: #1a1a24;
-      --border: #2a2a3a;
+      --border: rgba(74, 222, 128, 0.35);
       --accent: #c8f135;
       --accent2: #7c6af7;
       --text: #e8e8f0;
-      --muted: #6b6b80;
+      --muted: #ffffff;
       --up: #4ade80;
       --down: #f87171;
       --warn: #fbbf24;
@@ -1103,6 +1103,7 @@
     </div>
   </div>
   <div class="header-actions">
+    <span id="macroStatusBadge" onclick="showTab('macro', document.querySelector('.tab[data-tab=&quot;macro&quot;]'));loadMacro();" title="Click to view the Macro tab" style="font-size:11px;padding:4px 10px;margin-right:6px;border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace;white-space:nowrap">📊 MACRO: —</span>
     <div id="lastUpdated" style="font-size:11px;color:var(--muted);margin-right:6px"></div>
     <button onclick="toggleLogPanel()" style="font-size:11px;padding:5px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">📋 LOG</button>
   </div>
@@ -1168,7 +1169,7 @@
   <div class="tab" onclick="showTab('macro', this);loadMacro();" data-tab="macro">MACRO</div>
   <div class="tab" onclick="showTab('admin', this)" data-tab="admin">ADMIN</div>
   <div class="tab" onclick="showTab('dream', this);loadDream();" data-tab="dream">🌟 DREAM</div>
-  <div class="tab" onclick="showTab('tradeai', this);loadTradeAI();" data-tab="tradeai">🤖 TRADEAI</div>
+  <div class="tab" onclick="showTab('tradeai', this);loadTradeAI(true);" data-tab="tradeai">🤖 TRADEAI</div>
   <div class="tab" onclick="showTab('valsummary', this);loadValSummary();" data-tab="valsummary">📈 VAL SUMMARY</div>
   <div class="tab" onclick="showTab('signal', this);loadSignal();" data-tab="signal">✅ VALIDATION</div>
 </div>

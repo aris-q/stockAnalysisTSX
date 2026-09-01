@@ -62,9 +62,9 @@ def fetch_prev_closes(tickers):
     return closes
 
 
-def fetch_daily_gainers():
+def fetch_daily_gainers(include_cdn=True):
     us_gainers = fetch_us_gainers()
-    cdn_gainers = fetch_cdn_gainers()
+    cdn_gainers = fetch_cdn_gainers() if include_cdn else []
     return {"us": us_gainers, "cdn": cdn_gainers}
 
 
@@ -319,26 +319,6 @@ def fetch_yfinance(ticker):
         log.error(f"yfinance FAIL: {ticker} | {e}")
         return None
 
-
-# def fetch_daily_gainers():
-#     try:
-#         screener = yf.screen("day_gainers")
-#         quotes = screener.get("quotes", [])
-#         gainers = [
-#             {
-#                 "ticker": q.get("symbol"),
-#                 "percentGain": round(q.get("regularMarketChangePercent", 0), 2),
-#                 "price": q.get("regularMarketPrice"),
-#                 "volume": q.get("regularMarketVolume"),
-#             }
-#             for q in quotes
-#             if q.get("symbol", "").endswith(".TO")
-#         ][:10]
-#         log.info(f"Daily gainers (.TO) fetched: {len(gainers)}")
-#         return gainers
-#     except Exception as e:
-#         log.error(f"Daily gainers FAIL: {e}")
-#         return []
 
 def clean_float(v):
     if v is None:
@@ -922,12 +902,48 @@ def score_dream_stock(ticker, info, hist, financials):
             elif 35 <= rsi < 45:
                 score += 10
                 flags_good.append(f"RSI {rsi} — building momentum")
+            elif 65 < rsi <= 70:
+                # Own tier — still strong momentum, not yet overbought. Was
+                # previously falling through to "weak momentum" (dead zone).
+                score += 12
+                flags_good.append(f"RSI {rsi} — strong momentum, approaching overbought")
             elif rsi > 70:
                 score += 5
                 flags_warn.append(f"RSI {rsi} — overbought, risky entry")
             else:
                 flags_warn.append(f"RSI {rsi} — weak momentum")
             breakdown["rsi"] = rsi
+
+            # Volume ratio — today's volume vs trailing 20-day average
+            # (surge/breakout signal, same formula as fetch_trade_detail's).
+            # Not scored yet — a raw signal for the Identify bucket rules
+            # and the tuning-proposal pipeline to evaluate against outcomes.
+            volume_ratio = None
+            try:
+                if 'Volume' in hist.columns and len(hist) >= 2:
+                    vol_today = float(hist['Volume'].iloc[-1])
+                    vol_window = hist['Volume'].iloc[-21:-1] if len(hist) >= 21 else hist['Volume'].iloc[:-1]
+                    vol_avg = float(vol_window.mean()) if len(vol_window) > 0 else None
+                    if vol_avg and vol_avg > 0:
+                        volume_ratio = round(vol_today / vol_avg, 2)
+            except Exception:
+                pass
+            breakdown["volumeRatio"] = volume_ratio
+
+            # Range expansion — today's High-Low vs trailing 14-day average
+            # true range. >1 means today's range is wider than normal, an
+            # early breakout/volatility-expansion tell.
+            range_expansion = None
+            try:
+                if {'High', 'Low'}.issubset(hist.columns) and len(hist) >= 15:
+                    today_range = float(hist['High'].iloc[-1] - hist['Low'].iloc[-1])
+                    range_window = (hist['High'] - hist['Low']).iloc[-15:-1]
+                    range_avg = float(range_window.mean()) if len(range_window) > 0 else None
+                    if range_avg and range_avg > 0:
+                        range_expansion = round(today_range / range_avg, 2)
+            except Exception:
+                pass
+            breakdown["rangeExpansion"] = range_expansion
         else:
             breakdown["rsi"] = None
 
@@ -960,7 +976,7 @@ def score_dream_stock(ticker, info, hist, financials):
         total_debt = info.get("totalDebt")
         fcf = info.get("freeCashflow")
         bs_score = 0
-        if total_cash and total_debt:
+        if total_cash is not None and total_debt is not None:
             net_cash = total_cash - total_debt
             if net_cash > 0:
                 bs_score += 8
@@ -1026,8 +1042,30 @@ def score_dream_stock(ticker, info, hist, financials):
 
         score = min(100, score)
 
+        # Data completeness: how many of the 8 scoring components had real
+        # data to work with, vs. silently defaulting to "no points". Carried
+        # forward (not folded into the score) so downstream stages can
+        # require a floor before a half-blank ticker competes for a bucket.
+        completeness_checks = [
+            rev_growth is not None,
+            gross_margin is not None,
+            rsi is not None,
+            ma50 is not None,
+            (total_cash is not None and total_debt is not None),
+            inst_pct is not None,
+            mcap is not None,
+            (insider_net is not None or short_float is not None),
+        ]
+        breakdown["dataCompleteness"] = round(sum(completeness_checks) / len(completeness_checks), 2)
+
     except Exception as e:
         log.warning(f"Score calc FAIL: {ticker} | {e}")
+        # Partial score is worse than no score — a half-computed sum looks
+        # like a real (low) ranking instead of a failure. Surface it as
+        # incomplete so it's excluded from bucket selection, not silently
+        # ranked against fully-scored tickers.
+        score = None
+        flags_warn.append("SCORE_INCOMPLETE")
 
     return score, breakdown, flags_good, flags_warn
 
@@ -1203,7 +1241,9 @@ def fetch_dream_candidates(watchlist_tickers, gainer_tickers, existing_candidate
                 stats["recovered"] += 1
             continue
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
+    # score can be None (SCORE_INCOMPLETE) — sort those to the bottom instead
+    # of crashing on a None-vs-int comparison.
+    candidates.sort(key=lambda x: x["score"] if x["score"] is not None else -1, reverse=True)
     log.info(
         f"=== Dream Scan complete: {len(candidates)} scored | "
         f"quarterly:{stats['quarterly']} annual:{stats['annual']} "
@@ -1440,174 +1480,3 @@ def fetch_trade_detail(ticker):
 def fetch_ticker_news(ticker):
     """Fetch latest news for any ticker using same pattern as fetch_news(). Returns list of articles."""
     return fetch_news(ticker)
-
-
-# ── TRADEAI: GEMINI AI ANALYSIS ───────────────────────────────────────────────
-
-from ai_summary import _call_gemini as _shared_call_gemini
-
-def _call_gemini_fetcher(prompt, system=None, max_tokens=2048):
-    """Routes through ai_summary._call_gemini so all Gemini calls share one throttle/retry policy."""
-    return _shared_call_gemini(system or "", prompt)
-
-
-
-def fetch_ai_analyze(ticker, detail, news_items, macro, ollama_url=None, ollama_model=None):
-    """Send ticker data to Gemini and return AI assessment dict."""
-
-    # Build news block
-    news_block = ""
-    if news_items:
-        news_block = "\n".join([
-            f"- [{n.get('pubDate','')[:10]}] {n.get('title','')} ({n.get('provider','')})"
-            for n in news_items[:8]
-        ])
-    else:
-        news_block = "No recent news available."
-
-    # Build macro block — full raw indicators + headlines (no AI summary)
-    macro_block = ""
-    if macro:
-        indicators = macro.get("indicators", {})
-        macro_lines = []
-        for k, v in indicators.items():
-            if isinstance(v, dict):
-                val  = v.get("value")
-                chg  = v.get("change")
-                lbl  = v.get("label", k)
-                unit = v.get("unit", "")
-                if val is not None:
-                    chg_str = f" (chg: {chg:+.2f}{unit})" if chg is not None else ""
-                    macro_lines.append(f"- {lbl}: {val}{unit}{chg_str}")
-            else:
-                if v is not None:
-                    macro_lines.append(f"- {k}: {v}")
-        macro_block = "\n".join(macro_lines) if macro_lines else "No macro data."
-        headlines = macro.get("headlines", [])
-        if headlines:
-            macro_block += "\n\nMarket Headlines:\n" + "\n".join(
-                f"- [{h.get('publishedAt','')[:10]}] {h.get('title','')} ({h.get('source','')})"
-                for h in headlines[:5]
-            )
-        fetched_at = macro.get("fetchedAt", "")
-        if fetched_at:
-            macro_block = f"[Macro data as of {fetched_at}]\n" + macro_block
-    else:
-        macro_block = "No macro data available."
-
-    # Build financials block
-    fin_block = f"""
-Price: {detail.get('price')}
-RSI14: {detail.get('rsi14')}
-MA50: {detail.get('ma50')}
-1d Change: {detail.get('change1d')}%
-7d Change: {detail.get('change7d')}%
-30d Change: {detail.get('change30d')}%
-Revenue Growth: {detail.get('revenueGrowth')}%
-Gross Margin: {detail.get('grossMargin')}%
-FCF: {detail.get('fcf')}
-P/E: {detail.get('peRatio')}
-Forward P/E: {detail.get('forwardPE')}
-ROE: {detail.get('returnOnEquity')}%
-Debt/Equity: {detail.get('debtToEquity')}
-Analyst Target: {detail.get('analystTarget')} (Upside: {detail.get('analystUpside')}%)
-Analyst Rec: {detail.get('recommendation')}
-Institutional %: {detail.get('institutionalPct')}%
-Insider Activity (90d): {detail.get('insiderNet') or 'Unknown'} (buys: {detail.get('insiderBuys90d')} sh, sells: {detail.get('insiderSells90d')} sh)
-Next Earnings: {detail.get('earningsDate') or 'Unknown'}
-52w High: {detail.get('week52High')} | Price vs 52w High: {detail.get('priceVs52wHigh')}%
-Sector: {detail.get('sector')} | Industry: {detail.get('industry')}
-""".strip()
-
-    description = (detail.get("description") or "")[:300]
-
-    cohort_block = detail.get("_cohort") or ""
-    cohort_section = f"""
-THE COMPETING CANDIDATES IN THIS BATCH (you are scoring {ticker} against these):
-{cohort_block}
-""" if cohort_block else ""
-
-    prompt = f"""You are a stock analyst ranking candidates for a portfolio that can only hold the top 5.
-Analyze {ticker} and score it RELATIVE to the other candidates in this batch. Focus on TRAJECTORY over current achievement — a company improving rapidly from a low base is more interesting than one plateauing at a high score.
-
-COMPANY: {detail.get('name', ticker)} ({ticker})
-{description}
-
-FINANCIALS:
-{fin_block}
-{cohort_section}
-RECENT NEWS (last 7 days):
-{news_block}
-
-MACRO CONTEXT:
-{macro_block}
-
-Respond in this exact format:
-STAGE: [Early-Stage / Growth / Mature / Declining]
-TRAJECTORY: [Accelerating / Stable / Decelerating]
-SENTIMENT: [Bullish / Neutral / Bearish]
-NEWS_SENTIMENT: [Bullish / Neutral / Bearish — based only on the recent news above, not overall outlook]
-SCORE: [0-100 integer, your conviction score RELATIVE to this batch]
-CONFIDENCE: [High / Medium / Low — how much reliable data supports this score]
-BUY_SIGNAL: [Strong Buy / Buy / Hold / Avoid]
-REASONING: [3-5 sentences covering trajectory, key catalysts or risks, and why this is or isn't worth buying now]
-FORECAST_REASON: [1 sentence explaining the most likely price direction tomorrow based on RSI, BB%, momentum, and macro]
-
-Scoring calibration — this matters more than anything else:
-- Your scores exist to RANK candidates. A batch where everything scores 70-85 is useless. Spread scores across the full 0-100 range.
-- Anchors: 90+ = exceptional, top pick of the batch, rare. 70-89 = clearly better than most of the batch. 40-69 = middle of the pack, unremarkable. 20-39 = weak vs the batch. <20 = clear avoid.
-- Strong Buy is scarce: at most 1-2 stocks in a batch of 20 deserve it. Most candidates are Hold. "Decent company, nothing special vs the others" = Hold, not Buy.
-- Being agreeable helps nobody: an uncritical Buy on a mediocre stock loses real money. When in doubt, score LOWER.
-- SCORE and BUY_SIGNAL must be consistent: Strong Buy>=80, Buy 60-79, Hold 40-59, Avoid<40. If your instinct disagrees, adjust SCORE, not BUY_SIGNAL.
-- If data is thin or contradictory, say so in CONFIDENCE and REASONING rather than guessing.
-"""
-
-    try:
-        raw = _call_gemini_fetcher(prompt, max_tokens=1024)
-        log.info(f"[AI Analyze] {ticker} | raw response length: {len(raw)}")
-
-        # Parse structured response
-        result = {"raw": raw, "ticker": ticker, "promptSent": prompt}
-        for line in raw.splitlines():
-            line = line.strip()
-            if line.startswith("STAGE:"):
-                result["stage"] = line.split(":", 1)[1].strip()
-            elif line.startswith("TRAJECTORY:"):
-                result["trajectory"] = line.split(":", 1)[1].strip()
-            elif line.startswith("NEWS_SENTIMENT:"):
-                result["newsSentiment"] = line.split(":", 1)[1].strip()
-            elif line.startswith("SENTIMENT:"):
-                result["sentiment"] = line.split(":", 1)[1].strip()
-            elif line.startswith("SCORE:"):
-                try:
-                    result["aiScore"] = int(line.split(":", 1)[1].strip())
-                except Exception:
-                    result["aiScore"] = None
-            elif line.startswith("CONFIDENCE:"):
-                result["confidence"] = line.split(":", 1)[1].strip()
-            elif line.startswith("BUY_SIGNAL:"):
-                result["buySignal"] = line.split(":", 1)[1].strip()
-            elif line.startswith("REASONING:"):
-                result["reasoning"] = line.split(":", 1)[1].strip()
-            elif line.startswith("FORECAST_REASON:"):
-                result["forecastReason"] = line.split(":", 1)[1].strip()
-
-        # ── Validation: SCORE/BUY_SIGNAL band consistency ─────────────────
-        score = result.get("aiScore")
-        signal = result.get("buySignal")
-        band_map = {"Strong Buy": (80, 100), "Buy": (60, 79), "Hold": (40, 59), "Avoid": (0, 39)}
-        result["scoreSignalMismatch"] = False
-        if score is not None and signal in band_map:
-            lo, hi = band_map[signal]
-            if not (lo <= score <= hi):
-                result["scoreSignalMismatch"] = True
-                log.warning(f"[AI Analyze] {ticker} | SCORE/BUY_SIGNAL mismatch: score={score} signal={signal}")
-
-        if score is None or signal not in band_map:
-            log.warning(f"[AI Analyze] {ticker} | invalid/missing output: score={score} signal={signal}")
-
-        return result
-
-    except Exception as e:
-        log.error(f"[AI Analyze] FAIL: {ticker} | {e}")
-        return {"ticker": ticker, "error": str(e), "aiScore": None, "buySignal": "Unknown"}

@@ -10,13 +10,11 @@ GEMINI_MODEL   = "gemini-2.5-flash"
 
 
 def _call_gemini(system_prompt, user_prompt):
-    """AI scoring is disabled in this build — TSX candidates are ranked on
-    dream score + technicals only, no LLM call. Callers still build their
-    full prompt beforehand (so it can be shown in the UI for reference, e.g.
-    the TradeAI candidate detail panel); this just returns nothing instead of
-    making a network call. Every caller already treats a parse failure here
-    as "no AI data" and degrades gracefully, so no other file needs to
-    change. To re-enable AI scoring, restore the google-genai call here."""
+    """Gemini is disabled — no longer required for now. Returns "" instead
+    of calling out; every caller (generate_summary/generate_recommendations/
+    generate_followup/generate_news_impact) already treats a parse failure
+    here as "no AI data" and degrades to its own fallback, so nothing else
+    needs to change. To re-enable, restore the google-genai call here."""
     return ""
 
 
