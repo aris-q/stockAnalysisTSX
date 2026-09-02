@@ -62,6 +62,33 @@ def fetch_prev_closes(tickers):
     return closes
 
 
+def fetch_index_trend_signal(ticker="SPY", period_days=200):
+    """Trend/regime filter: is `ticker` currently trading above its own
+    N-day simple moving average? A well-known, simple way to sidestep the
+    worst of a sustained downtrend (distinct from the VIX gate, which reacts
+    to short-term fear spikes, and the macro gate, which reacts to
+    structural signals like yield-curve inversion)."""
+    try:
+        hist = yf.Ticker(ticker).history(period=f"{period_days + 30}d")
+        if len(hist) < period_days:
+            return {"available": False}
+        close = hist["Close"]
+        sma = close.rolling(period_days).mean().iloc[-1]
+        last = float(close.iloc[-1])
+        if sma is None or math.isnan(float(sma)):
+            return {"available": False}
+        sma = float(sma)
+        return {
+            "available": True, "ticker": ticker,
+            "lastClose": round(last, 2), "sma": round(sma, 2),
+            "aboveSma": last >= sma,
+            "pctFromSma": round((last - sma) / sma * 100, 2),
+        }
+    except Exception as e:
+        log.warning(f"fetch_index_trend_signal FAIL: {ticker} | {e}")
+        return {"available": False}
+
+
 def fetch_daily_gainers(include_cdn=True):
     us_gainers = fetch_us_gainers()
     cdn_gainers = fetch_cdn_gainers() if include_cdn else []

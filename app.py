@@ -47,7 +47,7 @@ def _epoch_for_date(date_str, epochs):
         else:
             break
     return matched
-from fetcher import fetch_yfinance, fetch_daily_gainers, fetch_news, fetch_price_context, fetch_price_only, fetch_macro_data, fetch_dream_candidates, fetch_trade_detail, fetch_ticker_news, fetch_live_prices, fetch_prev_closes
+from fetcher import fetch_yfinance, fetch_daily_gainers, fetch_news, fetch_price_context, fetch_price_only, fetch_macro_data, fetch_dream_candidates, fetch_trade_detail, fetch_ticker_news, fetch_live_prices, fetch_prev_closes, fetch_index_trend_signal
 from compute import process_watchlist
 from ai_summary import generate_summary, generate_recommendations, generate_followup, generate_news_impact
 from refresh_manager import check_what_needs_refresh, needs_news_refresh, now, hours_since
@@ -1819,7 +1819,10 @@ SCORING_DEFAULTS = {
     },
     "regime": {
         "vixNoBuyAbove": 30,
-        "macroRiskGateEnabled": True
+        "macroRiskGateEnabled": True,
+        "trendFilterEnabled": True,
+        "trendFilterTicker": "SPY",
+        "trendFilterDays": 200
     },
     "selfLearning": {
         "autoRollback": True,
@@ -2989,6 +2992,21 @@ def run_tradeai_recommend():
                 log.warning(f"TradeAI REGIME GATE: macro risk-off ({reason_str}) — no new buys this run (sells unaffected)")
                 skip_reasons.append({"ticker": "*", "reason": f"Macro risk-off: {reason_str} — regime gate blocked all new buys"})
                 qualified = []
+            elif bool(REGIME_CFG.get("trendFilterEnabled", True)):
+                # Trend regime gate: same additive pattern as VIX/macro above —
+                # only evaluated when neither of those already blocked buys.
+                # Pauses new buys during a sustained downtrend (index below its
+                # own long-run moving average), separate from short-term fear
+                # (VIX) or structural risk (macro headlines/yield curve).
+                trend = fetch_index_trend_signal(
+                    REGIME_CFG.get("trendFilterTicker", "SPY"),
+                    int(REGIME_CFG.get("trendFilterDays", 200)))
+                if trend.get("available") and not trend["aboveSma"]:
+                    reason_str = (f"{trend['ticker']} ${trend['lastClose']} is {abs(trend['pctFromSma'])}% "
+                                  f"below its {REGIME_CFG.get('trendFilterDays', 200)}-day average ${trend['sma']}")
+                    log.warning(f"TradeAI REGIME GATE: trend filter ({reason_str}) — no new buys this run (sells unaffected)")
+                    skip_reasons.append({"ticker": "*", "reason": f"Trend filter: {reason_str} — regime gate blocked all new buys"})
+                    qualified = []
 
         slots_to_fill = max(0, max_slots - held_count)
         qualified_sorted = sorted(qualified, key=lambda x: x.get("composite", 0), reverse=True)
