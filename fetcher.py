@@ -1312,6 +1312,25 @@ def fetch_trade_detail(ticker):
         except Exception as e:
             log.warning(f"fetch_trade_detail BB FAIL: {ticker} | {e}")
 
+        # ATR14 (Average True Range) — feeds the volatility-adjusted stop-loss:
+        # a stock's own typical daily range, not a one-size-fits-all flat %.
+        atr14 = None
+        atr14_pct = None
+        try:
+            if len(hist) >= 15:
+                high, low, close = hist['High'], hist['Low'], hist['Close']
+                prev_close = close.shift(1)
+                true_range = (high - low).combine((high - prev_close).abs(), max) \
+                                          .combine((low - prev_close).abs(), max)
+                _atr = true_range.rolling(14).mean().iloc[-1]
+                if not math.isnan(float(_atr)):
+                    atr14 = round(float(_atr), 4)
+                    last_price = float(close.iloc[-1])
+                    if last_price > 0:
+                        atr14_pct = round(atr14 / last_price * 100, 2)
+        except Exception as e:
+            log.warning(f"fetch_trade_detail ATR14 FAIL: {ticker} | {e}")
+
         # Volume ratio — today's volume vs 20-day average (surge/breakout signal)
         volume_ratio = None
         try:
@@ -1433,6 +1452,8 @@ def fetch_trade_detail(ticker):
             "ma20": ma20,
             "ma50": ma50,
             "bbPercent": bb_percent,
+            "atr14": atr14,
+            "atr14Pct": atr14_pct,
             "change1d": change1d,
             "change2d": change2d,
             "change3d": change3d,

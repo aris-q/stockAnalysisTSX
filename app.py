@@ -1801,13 +1801,14 @@ SCORING_DEFAULTS = {
         "neutralZone": 1.0
     },
     "sellThresholds": {
-        "hardSellFloor":    25,
-        "softSellFloor":    50,
-        "stopLossHard":     8.0,
-        "stopLossSoft":     6.0,
-        "trailingStopPeak": 10.0,
-        "dailyDropStop":    8.0,
-        "minHoldDays":      3
+        "hardSellFloor":     25,
+        "softSellFloor":     50,
+        "stopLossHard":      10.0,  # ceiling for the ATR-based stop below — worst case allowed regardless of volatility
+        "atrStopMultiplier": 2.0,   # effective stop = min(atrStopMultiplier * ticker's own ATR14%, stopLossHard)
+        "stopLossSoft":      6.0,
+        "trailingStopPeak":  10.0,
+        "dailyDropStop":     8.0,
+        "minHoldDays":       3
     },
     "execution": {
         "slippagePct":         0.2,
@@ -2088,6 +2089,20 @@ def _days_held(pos):
         return (datetime.now(TZ) - dt).total_seconds() / 86400.0
     except Exception:
         return None
+
+
+def _effective_stop_loss_pct(ticker, details, sell_cfg):
+    """Volatility-adjusted hard stop: min(atrMultiplier x the ticker's own
+    ATR14, hard cap). Tighter for calm stocks, looser for volatile ones, but
+    never worse than the hard cap regardless of what ATR says. Falls back to
+    the hard cap itself when ATR data isn't available (conservative — treat
+    unknown volatility as the worst case, not an arbitrary guess)."""
+    hard_cap = float(sell_cfg.get("stopLossHard", 10.0))
+    multiplier = float(sell_cfg.get("atrStopMultiplier", 2.0))
+    atr_pct = (details.get(ticker) or {}).get("atr14Pct")
+    if atr_pct is None:
+        return hard_cap
+    return min(multiplier * atr_pct, hard_cap)
 
 
 def load_scoring_config():
@@ -2774,7 +2789,7 @@ def run_tradeai_recommend():
             day_change_pct    = ((current_price - prev_close) / prev_close * 100) if current_price and prev_close else None
 
             # ── Stop-loss checks (price-based, highest priority) ──────────────
-            stop_loss_hard  = SELL_CFG.get("stopLossHard", 8.0)
+            stop_loss_hard  = _effective_stop_loss_pct(ticker, details, SELL_CFG)
             stop_loss_soft  = SELL_CFG.get("stopLossSoft", 6.0)
             trailing_pct    = SELL_CFG.get("trailingStopPeak", 10.0)
             daily_drop_stop = SELL_CFG.get("dailyDropStop", 8.0)
@@ -2783,7 +2798,9 @@ def run_tradeai_recommend():
             stop_loss_reason    = ""
             if pct_from_purchase <= -stop_loss_hard:
                 stop_loss_triggered = True
-                stop_loss_reason = f"Stop-loss triggered: down {abs(pct_from_purchase):.1f}% from purchase ${purchase_price:.2f} (hard stop at -{stop_loss_hard}%)"
+                atr_pct = (details.get(ticker) or {}).get("atr14Pct")
+                atr_note = f", ATR-based ({SELL_CFG.get('atrStopMultiplier', 2.0)}x{atr_pct}%)" if atr_pct is not None else ", ATR unavailable — used hard cap"
+                stop_loss_reason = f"Stop-loss triggered: down {abs(pct_from_purchase):.1f}% from purchase ${purchase_price:.2f} (stop at -{stop_loss_hard:.1f}%{atr_note})"
             elif day_change_pct is not None and day_change_pct <= -daily_drop_stop:
                 stop_loss_triggered = True
                 stop_loss_reason = f"Daily-drop stop triggered: down {abs(day_change_pct):.1f}% vs yesterday's close ${prev_close:.2f} (stop at -{daily_drop_stop}%)"
@@ -3321,14 +3338,16 @@ def run_tradeai_sell_check(trigger="manual"):
             prev_close        = prev_closes.get(ticker)
             day_change_pct    = ((current_price - prev_close) / prev_close * 100) if prev_close else None
 
-            stop_loss_hard  = SELL_CFG.get("stopLossHard", 8.0)
+            stop_loss_hard  = _effective_stop_loss_pct(ticker, details, SELL_CFG)
             stop_loss_soft  = SELL_CFG.get("stopLossSoft", 6.0)
             trailing_pct    = SELL_CFG.get("trailingStopPeak", 10.0)
             daily_drop_stop = SELL_CFG.get("dailyDropStop", 8.0)
 
             reason = ""
             if pct_from_purchase <= -stop_loss_hard:
-                reason = f"Stop-loss triggered: down {abs(pct_from_purchase):.1f}% from purchase ${purchase_price:.2f} (hard stop at -{stop_loss_hard}%)"
+                atr_pct = (details.get(ticker) or {}).get("atr14Pct")
+                atr_note = f", ATR-based ({SELL_CFG.get('atrStopMultiplier', 2.0)}x{atr_pct}%)" if atr_pct is not None else ", ATR unavailable — used hard cap"
+                reason = f"Stop-loss triggered: down {abs(pct_from_purchase):.1f}% from purchase ${purchase_price:.2f} (stop at -{stop_loss_hard:.1f}%{atr_note})"
             elif day_change_pct is not None and day_change_pct <= -daily_drop_stop:
                 reason = f"Daily-drop stop triggered: down {abs(day_change_pct):.1f}% vs yesterday's close ${prev_close:.2f} (stop at -{daily_drop_stop}%)"
             elif pct_from_purchase <= -stop_loss_soft and has_ai and composite < 50:

@@ -683,7 +683,8 @@ async function toggleScoringMatrix() {
         ${field('matrixSmartRule', 'Smart Money rule', weights.SmartMoney?.ai ?? .55)}
       </div>
       <div><div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">SELL RULES</div>
-        ${field('matrixHardStop', 'Hard stop %', sell.stopLossHard ?? 8)}
+        ${field('matrixHardStop', 'Hard stop ceiling % (ATR-based below this)', sell.stopLossHard ?? 10)}
+        ${field('matrixAtrMult', 'ATR stop multiplier', sell.atrStopMultiplier ?? 2)}
         ${field('matrixDailyStop', 'Daily-drop stop %', sell.dailyDropStop ?? 8)}
         ${field('matrixSoftStop', 'Soft stop %', sell.stopLossSoft ?? 6)}
         ${field('matrixTrailStop', 'Trailing stop %', sell.trailingStopPeak ?? 10)}
@@ -715,7 +716,7 @@ async function saveScoringMatrix() {
     weights.Momentum.dream = number('matrixMomentumDream'); weights.Momentum.ai = number('matrixMomentumRule');
     weights.Reversal.dream = number('matrixReversalDream'); weights.Reversal.ai = number('matrixReversalRule');
     weights.SmartMoney.dream = number('matrixSmartDream'); weights.SmartMoney.ai = number('matrixSmartRule');
-    sell.stopLossHard = number('matrixHardStop'); sell.dailyDropStop = number('matrixDailyStop');
+    sell.stopLossHard = number('matrixHardStop'); sell.atrStopMultiplier = number('matrixAtrMult'); sell.dailyDropStop = number('matrixDailyStop');
     sell.stopLossSoft = number('matrixSoftStop'); sell.trailingStopPeak = number('matrixTrailStop');
     sell.softSellFloor = number('matrixSoftFloor'); sell.minHoldDays = number('matrixHoldDays');
     if (![pm.minBuyComposite, pm.slots, pm.maxDeployPct].every(Number.isFinite)) throw new Error('Enter valid numbers');
