@@ -329,7 +329,16 @@ def _cap_filtered_candidates(candidates_sorted, holdings, details, identify_rule
     the slot. `exclude_ticker` lets a rotation sell free its own bucket/
     sector before the replacement is picked. Returns the full filtered list
     in order — callers slice off however many slots they actually need."""
-    max_per_bucket    = int(identify_rules.get("maxPerBucketFinal", 3))
+    # maxPerBucketFinal can be a flat int (same cap for every bucket) or a
+    # {bucket: cap} dict with an optional "_default" for buckets not listed —
+    # lets a proven bucket (e.g. SmartMoney) get more of the limited final
+    # slots than a bucket with a thinner track record, without shutting the
+    # others out entirely.
+    mpb_cfg = identify_rules.get("maxPerBucketFinal", 3)
+    def _cap_for_bucket(bucket):
+        if isinstance(mpb_cfg, dict):
+            return int(mpb_cfg.get(bucket, mpb_cfg.get("_default", 3)))
+        return int(mpb_cfg)
     hard_block_sector = bool(identify_rules.get("hardBlockSectorDiversity", False))
 
     bucket_counts = {}
@@ -346,7 +355,7 @@ def _cap_filtered_candidates(candidates_sorted, holdings, details, identify_rule
     kept = []
     for c in candidates_sorted:
         bucket = c.get("bucket", "Dream")
-        if bucket_counts.get(bucket, 0) >= max_per_bucket:
+        if bucket_counts.get(bucket, 0) >= _cap_for_bucket(bucket):
             continue
         sector = details.get(c["ticker"], {}).get("sector") or ""
         if hard_block_sector and sector and sector in held_sectors:
@@ -1750,22 +1759,25 @@ SCORING_DEFAULTS = {
         "Unknown": 10
     },
     "bucketWeights": {
-        "Momentum":   {"dream": 0.15, "ai": 0.65},
-        "Reversal":   {"dream": 0.15, "ai": 0.65},
-        "SmartMoney": {"dream": 0.30, "ai": 0.55},
-        "Dream":      {"dream": 0.25, "ai": 0.65}
+        "Momentum":      {"dream": 0.15, "ai": 0.65},
+        "Reversal":      {"dream": 0.15, "ai": 0.65},
+        "SmartMoney":    {"dream": 0.30, "ai": 0.55},
+        "SmartMoney+": {"dream": 0.30, "ai": 0.55},
+        "Dream":         {"dream": 0.25, "ai": 0.65}
     },
     "trajectoryBonus": {
-        "Momentum":   {"Accelerating": 20, "Stable": 8,  "Decelerating": 0},
-        "Reversal":   {"Accelerating": 0,  "Stable": 0,  "Decelerating": 0},
-        "SmartMoney": {"Accelerating": 10, "Stable": 0,  "Decelerating": 0},
-        "Dream":      {"Accelerating": 12, "Stable": 0,  "Decelerating": 0}
+        "Momentum":      {"Accelerating": 20, "Stable": 8,  "Decelerating": 0},
+        "Reversal":      {"Accelerating": 0,  "Stable": 0,  "Decelerating": 0},
+        "SmartMoney":    {"Accelerating": 10, "Stable": 0,  "Decelerating": 0},
+        "SmartMoney+": {"Accelerating": 10, "Stable": 0,  "Decelerating": 0},
+        "Dream":         {"Accelerating": 12, "Stable": 0,  "Decelerating": 0}
     },
     "stageBonus": {
-        "Momentum":   {"Early-Stage": 0,  "Growth": 8,  "Mature": 5,  "Declining": 0},
-        "Reversal":   {"Early-Stage": 0,  "Growth": 0,  "Mature": 0,  "Declining": 0},
-        "SmartMoney": {"Early-Stage": 15, "Growth": 10, "Mature": 0,  "Declining": 0},
-        "Dream":      {"Early-Stage": 8,  "Growth": 4,  "Mature": 0,  "Declining": 0}
+        "Momentum":      {"Early-Stage": 0,  "Growth": 8,  "Mature": 5,  "Declining": 0},
+        "Reversal":      {"Early-Stage": 0,  "Growth": 0,  "Mature": 0,  "Declining": 0},
+        "SmartMoney":    {"Early-Stage": 15, "Growth": 10, "Mature": 0,  "Declining": 0},
+        "SmartMoney+": {"Early-Stage": 15, "Growth": 10, "Mature": 0,  "Declining": 0},
+        "Dream":         {"Early-Stage": 8,  "Growth": 4,  "Mature": 0,  "Declining": 0}
     },
     "sharedBonuses": {
         "volumeSurgeHigh":    10,
@@ -1858,9 +1870,16 @@ SCORING_DEFAULTS = {
         # compete for bucket slots against fully-scored ones. See
         # score_dream_stock's dataCompleteness field.
         "dataCompletenessFloor": 0.6,
-        # Max tickers any single bucket can contribute to the final 6 buys —
-        # stops one strategy (e.g. SmartMoney) from sweeping every slot.
-        "maxPerBucketFinal": 3,
+        # Max tickers any single bucket can contribute to the final buy
+        # slots. Per-bucket dict (not a flat cap): SmartMoney and SmartMoney+
+        # get more room (SmartMoney on an earned 11-trade track record;
+        # SmartMoney+ by inheriting SmartMoney's own validated fundamental
+        # screen, even though it has no closed trades of its own yet — a
+        # deliberate judgment call, not evidence-backed like SmartMoney's).
+        # The rest stay capped tighter to limit exposure to thinner-evidence
+        # buckets and keep some diversification. "_default" covers any
+        # bucket not listed here.
+        "maxPerBucketFinal": {"SmartMoney": 5, "SmartMoney+": 5, "Momentum": 2, "Reversal": 2, "Dream": 2, "_default": 2},
         # Hard-block a second buy in an already-held sector at final
         # selection, instead of only soft-penalizing it in the composite.
         "hardBlockSectorDiversity": False,
@@ -2292,6 +2311,34 @@ def run_tradeai_identify():
             reason = f"Smart Money: rev growth {rev}%, margin {gm}% — strong fundamentals, not yet consensus"
             result.append({"ticker": ticker, "reason": reason, "source": c.get("source", "Dream"), "bucket": "SmartMoney"})
         log.info(f"[TradeAI Identify] Bucket 3 SmartMoney: {[r['ticker'] for r in result if r.get('bucket')=='SmartMoney']}")
+
+        # ── BUCKET 3b: SMART MONEY+ (8 slots) ─────────────────────────────────
+        # Same fundamental screen as SmartMoney (margin + revenue growth), but
+        # for candidates whose dream score is ABOVE SmartMoney's 75 ceiling —
+        # i.e. the fundamentals earned them a spot on their own merits, they're
+        # just no longer "under the radar." Exists so these don't fall through
+        # to the Dream/Filler catch-all, which has no real thesis and (so far)
+        # the weakest track record of any bucket.
+        smart_plus_pool = [
+            c for c in candidates
+            if c["ticker"] not in seen
+            and bd(c, "grossMargin") is not None
+            and bd(c, "grossMargin") >= 40
+            and bd(c, "revenueGrowth") is not None
+            and bd(c, "revenueGrowth") >= 15
+            and c.get("score", 0) > 75
+        ]
+        smart_plus_pool.sort(key=lambda c: bd(c, "revenueGrowth") or 0, reverse=True)
+        for c in smart_plus_pool[:8]:
+            if len(result) >= CANDIDATE_SLOTS: break
+            ticker = c["ticker"]
+            seen.add(ticker)
+            rev = bd(c, "revenueGrowth")
+            gm = bd(c, "grossMargin")
+            score = c.get("score", 0)
+            reason = f"Smart Money+: rev growth {rev}%, margin {gm}%, dream {score} — strong fundamentals AND already a top scorer"
+            result.append({"ticker": ticker, "reason": reason, "source": c.get("source", "Dream"), "bucket": "SmartMoney+"})
+        log.info(f"[TradeAI Identify] Bucket 3b SmartMoney+: {[r['ticker'] for r in result if r.get('bucket')=='SmartMoney+']}")
 
         # ── FILLER: top dream scorers if any bucket came up short ─────────────
         candidate_count = len(result)

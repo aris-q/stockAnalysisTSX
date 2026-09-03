@@ -930,7 +930,7 @@ function renderTradeAI(data) {
             ${hasAI ? `<div style="display:flex;gap:6px;align-items:center;margin-top:4px">${signalBadge(ai.buySignal)}<span style="font-size:10px;color:var(--muted)">${trajectoryIcon(ai.trajectory)} ${ai.trajectory||''} · ${ai.stage||''}</span>${sentimentIcon(ai.newsSentiment) ? `<span title="News sentiment: ${ai.newsSentiment}" style="font-size:11px">${sentimentIcon(ai.newsSentiment)}</span>` : ''}</div>` : ''}
           </div>
           <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
-            ${(()=>{const bkt=item.bucket||'';const bktColors={'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','Insider':'#f97316','Account':'#4ade80','Dream':'#ffffff'};const bc=bktColors[bkt]||'#ffffff';return bkt?`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt.toUpperCase()}</span>`:''})()}
+            ${(()=>{const bkt=item.bucket||'';const bktColors={'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','SmartMoney+':'#facc15','Insider':'#f97316','Account':'#4ade80','Dream':'#ffffff'};const bc=bktColors[bkt]||'#ffffff';return bkt?`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt.toUpperCase()}</span>`:''})()}
             ${hasAI && ai.aiScore != null ? `<span style="font-size:12px;font-weight:800;color:var(--accent);font-family:'DM Mono',monospace">${ai.aiScore}<span style="font-size:9px;color:var(--muted)">/100</span></span>` : ''}
             <span class="trade-candidate-source">${item.source || ''}</span>
             <button onclick="event.stopPropagation();refreshTickerNews('${item.ticker}', this)" style="font-size:9px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">🔄 NEWS</button>
@@ -1291,7 +1291,7 @@ function renderTradeAIRecommend(rec, identified) {
   const candMap = {};
   (identified || []).forEach(item => { candMap[item.ticker] = item; });
 
-  const bktColors = {'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','Insider':'#f97316','Account':'#4ade80','Dream':'#ffffff'};
+  const bktColors = {'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','SmartMoney+':'#facc15','Insider':'#f97316','Account':'#4ade80','Dream':'#ffffff'};
   function strategyBadge(ticker) {
     const cand = candMap[ticker];
     if (!cand) return '';
