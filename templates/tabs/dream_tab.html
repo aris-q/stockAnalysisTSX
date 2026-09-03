@@ -218,32 +218,47 @@ function renderDream(data) {
       + '<td style="font-size:11px">' + trendStr + '</td>'
       + '</tr>'
       + '<tr id="dream-detail-' + safeId + '" style="display:none"><td colspan="10" style="padding:0">'
-      + '<div class="dream-detail">'
-      + '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px">'
-      + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
-      + '<span style="font-weight:800;font-size:15px">' + c.ticker + '</span>'
-      + '<span class="dream-badge dream-badge-source">' + c.source + '</span>'
-      + '<span class="dream-badge dream-badge-sector">' + (c.sector || 'Unknown') + '</span>'
-      + '<span class="dream-badge dream-badge-sector">' + (c.industry || '') + '</span>'
-      + (c.price ? '<span style="font-size:13px;font-family:\'DM Mono\',monospace;color:var(--text)">$' + c.price + '</span>' : '')
-      + '</div>'
-      + addBtn
-      + '</div>'
-      + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:10px">'
-      + '<div>' + flagsGoodHtml + '</div>'
-      + '<div>' + flagsWarnHtml + '</div>'
-      + '</div>'
-      + (instNames ? '<div class="dream-inst" style="margin-bottom:8px">🏦 <strong>Top Institutions:</strong> ' + instNames + '</div>' : '')
-      + (c.insiderNet ? '<div style="font-size:11px;margin-bottom:6px">👤 <strong>Insider Activity (90d):</strong> <span style="color:' + (c.insiderNet === 'Net Buyer' ? 'var(--up)' : c.insiderNet === 'Net Seller' ? 'var(--down)' : 'var(--muted)') + ';font-weight:700">' + c.insiderNet + '</span>' + (c.insiderBuys90d || c.insiderSells90d ? ' · Buys: ' + (c.insiderBuys90d||0).toLocaleString() + ' · Sells: ' + (c.insiderSells90d||0).toLocaleString() + ' shares' : '') + '</div>' : '')
-      + (c.shortFloat != null ? '<div style="font-size:11px;margin-bottom:6px">📉 <strong>Short Float:</strong> <span style="color:' + (c.shortFloat > 20 ? 'var(--down)' : 'var(--muted)') + ';font-weight:700">' + c.shortFloat + '%</span>' + (c.shortFloat > 20 ? ' — high short interest' : '') + '</div>' : '')
-      + (c.description ? '<div class="dream-desc">' + c.description + '</div>' : '')
-      + buildDreamFinancials(c)
-      + '</div>'
+      + _dreamDetailHtml(c, addBtn, flagsGoodHtml, flagsWarnHtml, instNames)
       + '</td></tr>';
   });
 
   html += '</tbody></table></div>';
   return html;
+}
+
+// Extracted so the same candidate-detail markup can be reused outside the
+// Dream tab's own table (e.g. TradeAI tab's "view in Dream Scan" modal),
+// not just this table's expandable rows.
+function _dreamDetailHtml(c, addBtn, flagsGoodHtml, flagsWarnHtml, instNames) {
+  if (flagsGoodHtml === undefined) flagsGoodHtml = (c.flagsGood || []).map(function(f) { return '<div class="dream-flag-good">✅ ' + f + '</div>'; }).join('');
+  if (flagsWarnHtml === undefined) flagsWarnHtml = (c.flagsWarn || []).map(function(f) { return '<div class="dream-flag-warn">⚠️ ' + f + '</div>'; }).join('');
+  if (instNames === undefined) instNames = (c.institutions || []).map(function(inst) { return inst.name + (inst.pct ? ' ' + inst.pct : ''); }).join(', ');
+  if (addBtn === undefined) {
+    addBtn = c.source === 'Watchlist'
+      ? '<span style="font-size:11px;color:var(--muted)">✓ In Watchlist</span>'
+      : '<a href="/add?ticker=' + c.ticker + '" onclick="event.stopPropagation()" style="font-size:11px;padding:3px 10px;background:rgba(74,222,128,0.12);border:1px solid rgba(74,222,128,0.35);border-radius:4px;color:var(--up);text-decoration:none;font-weight:700">+ Add to Watchlist</a>';
+  }
+  return '<div class="dream-detail">'
+    + '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px">'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+    + '<span style="font-weight:800;font-size:15px">' + c.ticker + '</span>'
+    + '<span class="dream-badge dream-badge-source">' + c.source + '</span>'
+    + '<span class="dream-badge dream-badge-sector">' + (c.sector || 'Unknown') + '</span>'
+    + '<span class="dream-badge dream-badge-sector">' + (c.industry || '') + '</span>'
+    + (c.price ? '<span style="font-size:13px;font-family:\'DM Mono\',monospace;color:var(--text)">$' + c.price + '</span>' : '')
+    + '</div>'
+    + addBtn
+    + '</div>'
+    + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:10px">'
+    + '<div>' + flagsGoodHtml + '</div>'
+    + '<div>' + flagsWarnHtml + '</div>'
+    + '</div>'
+    + (instNames ? '<div class="dream-inst" style="margin-bottom:8px">🏦 <strong>Top Institutions:</strong> ' + instNames + '</div>' : '')
+    + (c.insiderNet ? '<div style="font-size:11px;margin-bottom:6px">👤 <strong>Insider Activity (90d):</strong> <span style="color:' + (c.insiderNet === 'Net Buyer' ? 'var(--up)' : c.insiderNet === 'Net Seller' ? 'var(--down)' : 'var(--muted)') + ';font-weight:700">' + c.insiderNet + '</span>' + (c.insiderBuys90d || c.insiderSells90d ? ' · Buys: ' + (c.insiderBuys90d||0).toLocaleString() + ' · Sells: ' + (c.insiderSells90d||0).toLocaleString() + ' shares' : '') + '</div>' : '')
+    + (c.shortFloat != null ? '<div style="font-size:11px;margin-bottom:6px">📉 <strong>Short Float:</strong> <span style="color:' + (c.shortFloat > 20 ? 'var(--down)' : 'var(--muted)') + ';font-weight:700">' + c.shortFloat + '%</span>' + (c.shortFloat > 20 ? ' — high short interest' : '') + '</div>' : '')
+    + (c.description ? '<div class="dream-desc">' + c.description + '</div>' : '')
+    + buildDreamFinancials(c)
+    + '</div>';
 }
 
 // Build Key Metrics + Quarterly/Annual Income & Cash Flow tables for a dream candidate,

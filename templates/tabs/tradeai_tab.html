@@ -220,6 +220,33 @@ function closeNewsWarningModal() {
   if (modal) modal.classList.remove('visible');
 }
 
+async function openDreamDetailModal(ticker) {
+  const modal = document.getElementById('dreamDetailModal');
+  const title = document.getElementById('dreamDetailModalTitle');
+  const body = document.getElementById('dreamDetailModalBody');
+  if (!modal || !body) return;
+  if (title) title.textContent = '🌟 ' + ticker + ' — Dream Scan Detail';
+  body.innerHTML = '<div class="loading">Loading...</div>';
+  modal.classList.add('visible');
+  try {
+    const data = await fetch('/dream').then(r => r.json());
+    const c = (data.candidates || []).find(x => x.ticker === ticker);
+    if (!c) {
+      body.innerHTML = `<div style="color:var(--muted);padding:16px">${ticker} isn't in the current Dream Scan universe (outside the scan, or dropped since it was last identified).</div>`;
+      return;
+    }
+    body.innerHTML = (typeof _dreamDetailHtml === 'function') ? _dreamDetailHtml(c) : '<div style="color:var(--muted);padding:16px">Dream detail renderer not available.</div>';
+  } catch(e) {
+    body.innerHTML = '<span style="color:var(--down)">Failed to load Dream Scan data.</span>';
+    console.error('[DreamDetail] load FAIL:', e);
+  }
+}
+
+function closeDreamDetailModal() {
+  const modal = document.getElementById('dreamDetailModal');
+  if (modal) modal.classList.remove('visible');
+}
+
 // Re-fetches every tab that shows account-derived numbers (holdings P&L,
 // version asset/account returns) — called after anything that refreshes
 // prices, so those numbers never sit stale until a tab is manually reopened.
@@ -650,6 +677,15 @@ function startTradeAIRefresh() {
   }, 60000);
 }
 
+function toggleTradeSection(bodyId, arrowId) {
+  const body = document.getElementById(bodyId);
+  const arrow = document.getElementById(arrowId);
+  if (!body) return;
+  const opening = body.style.display === 'none';
+  body.style.display = opening ? 'block' : 'none';
+  if (arrow) arrow.textContent = opening ? '▾ collapse' : '▸ expand';
+}
+
 async function toggleScoringMatrix() {
   const body = document.getElementById('scoringMatrixBody');
   const arrow = document.getElementById('scoringMatrixArrow');
@@ -851,8 +887,9 @@ function renderTradeAI(data) {
         const sentiment = (aiAssessments[h.ticker] || {}).newsSentiment;
         const sentIcon = sentimentIcon(sentiment);
         const sentBadge = sentIcon ? ` <span title="News sentiment: ${sentiment}" style="font-size:11px">${sentIcon}</span>` : '';
+        const holdIndustry = (details[h.ticker] || {}).industry || '';
         return `<tr${isWarned ? ' style="background:rgba(248,113,113,0.08);box-shadow:inset 3px 0 0 var(--down)"' : ''}>
-          <td><span style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px">${h.ticker}</span>${sentBadge}${isWarned ? ` <span onclick="event.stopPropagation();openNewsWarningDetail('${tickerSafe}')" title="Severe news: ${(warn.keyword||'').replace(/"/g,'')} — click for details" style="cursor:pointer;font-size:12px">🚨</span>` : ''}</td>
+          <td><span onclick="openDreamDetailModal('${tickerSafe}')" title="${holdIndustry ? holdIndustry + ' — click' : 'Click'} for Dream Scan detail" style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px">${h.ticker}</span>${sentBadge}${isWarned ? ` <span onclick="event.stopPropagation();openNewsWarningDetail('${tickerSafe}')" title="Severe news: ${(warn.keyword||'').replace(/"/g,'')} — click for details" style="cursor:pointer;font-size:12px">🚨</span>` : ''}</td>
           <td>${h.shares}</td>
           <td>${fmt$(h.purchasePrice)}</td>
           <td>${fmt$(h.previousClose)}</td>
@@ -918,7 +955,7 @@ function renderTradeAI(data) {
         return `
         <div class="trade-candidate-row" onclick="toggleTradeDetail('tai-${i}')">
           <div style="min-width:175px">
-            <div class="trade-candidate-ticker" style="margin-bottom:4px">${item.ticker}</div>
+            <div class="trade-candidate-ticker" style="margin-bottom:4px;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px;display:inline-block" onclick="event.stopPropagation();openDreamDetailModal('${item.ticker.replace(/'/g, "\\'")}')" title="${(details[item.ticker]||{}).industry ? (details[item.ticker]||{}).industry + ' — click' : 'Click'} for Dream Scan detail">${item.ticker}</div>
             ` + pipeRow('①','IDENTIFY', data.identifiedAt, '') + `
             ` + pipeRow('②','FETCH INFO', data.detailsFetchedAt, '') + `
             ` + pipeRow('③','MACRO', data.macroFetchedAt, '') + `
@@ -944,9 +981,11 @@ function renderTradeAI(data) {
         </div>`;
       }).join('') + `</div>`;
 
-  const recHtml = lastRec
-    ? renderTradeAIRecommend(lastRec, identified)
+  const recParts = lastRec ? renderTradeAIRecommend(lastRec, identified, holdings) : null;
+  const recHtml = recParts ? recParts.recommendHtml
     : `<div style="color:var(--muted);padding:16px">No recommendation yet. Complete all steps then click Recommend.</div>`;
+  const scoreTableHtml = recParts ? recParts.scoreTableHtml
+    : `<div style="color:var(--muted);padding:16px">No scores yet. Complete all steps then click Recommend.</div>`;
 
   // Signal forecast today snapshot
   const todayFc = (() => { try { const d = new Date().toISOString().slice(0,10); return null; } catch(e){ return null; } })();
@@ -1056,30 +1095,6 @@ function renderTradeAI(data) {
     </div>
   </div>
 
-  <!-- RECENT ACTIVITY — sourced from the raw transaction log, so sells from
-       the sell-check cycle / rotation / manual force-sell show up immediately,
-       not only after the next Recommend run repopulates lastRecommend. -->
-  <div class="trade-section">
-    <div class="trade-section-header">
-      <div>
-        <div class="trade-section-title">📜 RECENT ACTIVITY</div>
-        <div class="trade-section-sub">Last 15 trades, most recent first · buy &amp; sell details incl. gain/loss</div>
-      </div>
-    </div>
-    ${renderRecentActivity(transactions)}
-  </div>
-
-  <!-- IDENTIFY / CANDIDATES SECTION -->
-  <div class="trade-section">
-    <div class="trade-section-header">
-      <div>
-        <div class="trade-section-title">CANDIDATES</div>
-        <div class="trade-section-sub">Holdings + top dream scorers · max 30${data.identifiedAt ? ' · last run: ' + data.identifiedAt : ''}</div>
-      </div>
-    </div>
-    ${identifiedHtml}
-  </div>
-
   <!-- RECOMMEND SUMMARY SECTION -->
   <div class="trade-section">
     <div class="trade-section-header">
@@ -1089,6 +1104,52 @@ function renderTradeAI(data) {
       </div>
     </div>
     ${recHtml}
+  </div>
+
+  <!-- RECENT ACTIVITY — sourced from the raw transaction log, so sells from
+       the sell-check cycle / rotation / manual force-sell show up immediately,
+       not only after the next Recommend run repopulates lastRecommend.
+       Collapsible, default collapsed — same pattern as Scoring Matrix. -->
+  <div class="trade-section">
+    <div class="trade-section-header" onclick="toggleTradeSection('recentActivityBody','recentActivityArrow')" style="cursor:pointer;user-select:none">
+      <div>
+        <div class="trade-section-title">📜 RECENT ACTIVITY</div>
+        <div class="trade-section-sub">Last 15 trades, most recent first · buy &amp; sell details incl. gain/loss</div>
+      </div>
+      <span id="recentActivityArrow" style="color:var(--muted);font-size:12px">▸ expand</span>
+    </div>
+    <div id="recentActivityBody" style="display:none">
+      ${renderRecentActivity(transactions)}
+    </div>
+  </div>
+
+  <!-- RULE COMPOSITE SCORES — split out of Last Recommendation so it can
+       collapse independently; same data as before (lastRecommend.scored). -->
+  <div class="trade-section">
+    <div class="trade-section-header" onclick="toggleTradeSection('ruleScoresBody','ruleScoresArrow')" style="cursor:pointer;user-select:none">
+      <div>
+        <div class="trade-section-title">🧮 RULE COMPOSITE SCORES</div>
+        <div class="trade-section-sub">Every candidate scored in the last Recommend cycle</div>
+      </div>
+      <span id="ruleScoresArrow" style="color:var(--muted);font-size:12px">▸ expand</span>
+    </div>
+    <div id="ruleScoresBody" style="display:none">
+      ${scoreTableHtml}
+    </div>
+  </div>
+
+  <!-- IDENTIFY / CANDIDATES SECTION -->
+  <div class="trade-section">
+    <div class="trade-section-header" onclick="toggleTradeSection('candidatesBody','candidatesArrow')" style="cursor:pointer;user-select:none">
+      <div>
+        <div class="trade-section-title">CANDIDATES</div>
+        <div class="trade-section-sub">Holdings + top dream scorers · max 30${data.identifiedAt ? ' · last run: ' + data.identifiedAt : ''}</div>
+      </div>
+      <span id="candidatesArrow" style="color:var(--muted);font-size:12px">▸ expand</span>
+    </div>
+    <div id="candidatesBody" style="display:none">
+      ${identifiedHtml}
+    </div>
   </div>
 
   <!-- SEVERE NEWS WARNING MODAL -->
@@ -1102,6 +1163,20 @@ function renderTradeAI(data) {
         <button class="modal-close" onclick="closeNewsWarningModal()">✕</button>
       </div>
       <div id="newsWarningModalBody"></div>
+    </div>
+  </div>
+
+  <!-- DREAM SCAN DETAIL MODAL — same per-ticker detail as the Dream tab -->
+  <div class="modal-overlay" id="dreamDetailModal" onclick="if(event.target===this)closeDreamDetailModal()">
+    <div class="modal" style="width:760px;max-height:80vh;overflow-y:auto">
+      <div class="modal-header">
+        <div>
+          <div class="modal-title" id="dreamDetailModalTitle">🌟 Dream Scan Detail</div>
+          <div class="modal-subtitle">Same data as the Dream tab — fundamentals, flags, financials</div>
+        </div>
+        <button class="modal-close" onclick="closeDreamDetailModal()">✕</button>
+      </div>
+      <div id="dreamDetailModalBody"></div>
     </div>
   </div>
 
@@ -1282,7 +1357,7 @@ function renderRecentActivity(transactions, limit) {
     </div>`;
 }
 
-function renderTradeAIRecommend(rec, identified) {
+function renderTradeAIRecommend(rec, identified, holdings) {
   const buys = rec.buys || [];
   const sells = rec.sells || [];
   const scored = rec.scored || [];
@@ -1290,17 +1365,24 @@ function renderTradeAIRecommend(rec, identified) {
   // Build lookup: ticker → {bucket, source} from identified candidates
   const candMap = {};
   (identified || []).forEach(item => { candMap[item.ticker] = item; });
+  // A held ticker's real bucket (as of when it was bought) is a permanent
+  // fact recorded on the holding itself — a much better fallback than the
+  // scored row's generic "Dream" placeholder for tickers that have simply
+  // fallen off today's regenerated Identify shortlist.
+  const heldBucketMap = {};
+  (holdings || []).forEach(h => { const b = (h.factors || {}).bucket; if (b) heldBucketMap[h.ticker] = b; });
 
   const bktColors = {'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','SmartMoney+':'#facc15','Insider':'#f97316','Account':'#4ade80','Dream':'#ffffff'};
   function strategyBadge(ticker) {
     const cand = candMap[ticker];
-    if (!cand) return '';
+    const bkt = (cand && cand.bucket) || heldBucketMap[ticker];
+    if (!bkt && !(cand && cand.source)) return '';
     const parts = [];
-    if (cand.bucket) {
-      const bc = bktColors[cand.bucket] || '#ffffff';
-      parts.push(`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${cand.bucket.toUpperCase()}</span>`);
+    if (bkt) {
+      const bc = bktColors[bkt] || '#ffffff';
+      parts.push(`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt.toUpperCase()}</span>`);
     }
-    if (cand.source) {
+    if (cand && cand.source) {
       parts.push(`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">${cand.source}</span>`);
     }
     return parts.join(' ');
@@ -1336,7 +1418,13 @@ function renderTradeAIRecommend(rec, identified) {
   const scoreRows = scored.map((s, i) => {
     const c = sigColors[s.buySignal] || '#ffffff';
     const cand = candMap[s.ticker];
-    const bkt = cand && cand.bucket ? cand.bucket : '—';
+    // Fall back to the held position's real recorded bucket, then the
+    // scored row's own bucket (the backend defaults a held-but-unidentified
+    // ticker to "Dream" there for scoring purposes only — not its real
+    // bucket) — rather than blanking out. A held ticker's strategy is a
+    // permanent historical fact, not something that should vanish because
+    // Identify regenerated today's candidate list.
+    const bkt = (cand && cand.bucket) || heldBucketMap[s.ticker] || s.bucket || '—';
     const src = cand && cand.source ? cand.source : '—';
     const bc = bktColors[bkt] || '#ffffff';
     return `<tr>
@@ -1354,7 +1442,7 @@ function renderTradeAIRecommend(rec, identified) {
     </tr>`;
   }).join('');
 
-  return `
+  const recommendHtml = `
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
       <div>
         <div style="font-size:10px;letter-spacing:1px;color:var(--up);margin-bottom:10px">BUYS EXECUTED</div>
@@ -1364,14 +1452,15 @@ function renderTradeAIRecommend(rec, identified) {
         <div style="font-size:10px;letter-spacing:1px;color:var(--down);margin-bottom:10px">SELLS EXECUTED</div>
         ${sellCards}
       </div>
-    </div>
-    <div style="font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:10px">RULE COMPOSITE SCORES</div>
+    </div>`;
+  const scoreTableHtml = `
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden">
       <table class="trade-txn-table">
         <thead><tr><th>#</th><th>TICKER</th><th>STRATEGY</th><th>SOURCE</th><th>DREAM</th><th>AI</th><th>SIGNAL</th><th>TRAJECTORY</th><th>STAGE</th><th>COMPOSITE</th><th>STATUS</th></tr></thead>
         <tbody>${scoreRows}</tbody>
       </table>
     </div>`;
+  return { recommendHtml, scoreTableHtml };
 }
 
 async function runTradeAIOp(op, btn) {
