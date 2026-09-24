@@ -306,6 +306,16 @@ def bump_recommend_version(changes, label="", config_snapshot=None, based_on=Non
         entry["assetAtStartCapturedAt"] = ts()
     except Exception as se:
         log.warning(f"[RecVersion] assetAtStart snapshot FAIL for v{new_v}: {se}")
+    # Same idea for TSX Composite/TSX 60 — captured once, here, so "is THIS
+    # version beating the index" never needs an arbitrary reset-point
+    # comparison; it's always scoped to the exact window the version was
+    # actually live. (Ported from stock-analysis, adapted to TSX/TSX60.)
+    try:
+        idx_prices = fetch_live_prices([BENCHMARK_TICKERS["TSX"], BENCHMARK_TICKERS["TSX60"]])
+        entry["tsxAtStart"] = idx_prices.get(BENCHMARK_TICKERS["TSX"])
+        entry["tsx60AtStart"] = idx_prices.get(BENCHMARK_TICKERS["TSX60"])
+    except Exception as se:
+        log.warning(f"[RecVersion] TSX/TSX60 snapshot FAIL for v{new_v}: {se}")
     db["versions"].append(entry)
     save_json(RECOMMEND_VERSIONS_PATH, db)
     log.info(f"[RecVersion] bumped to v{new_v} ({label}): {changes}")
@@ -568,6 +578,191 @@ def _refresh_benchmarks():
     return benchmarks
 
 
+# ═══════════════════════════ ACCOUNT TRACKER ═══════════════════════════
+# Whole-account value vs. the TSX Composite / TSX 60 since the current
+# account period started (ported from stock-analysis, adapted to this
+# repo's TSX/TSX 60 benchmarks in place of SPY/Nasdaq).
+ACCOUNT_TRACKER_PATH = "output/account_tracker.json"
+
+def _replay_balance_and_holdings(transactions, as_of_date_str, starting_balance):
+    """Reconstruct {balance, holdings: {ticker: shares}} as of the end of
+    as_of_date_str (YYYY-MM-DD) by replaying every transaction up to and
+    including that date, starting from starting_balance and no holdings.
+    Used to mark the account to market on a PAST date — the only way to
+    get an actual account-value time series when no daily snapshot was
+    being recorded at the time."""
+    balance = starting_balance
+    holdings = {}
+    for t in sorted(transactions, key=lambda x: x.get("date", "")):
+        if (t.get("date") or "")[:10] > as_of_date_str:
+            break
+        ticker, shares = t.get("ticker"), t.get("shares") or 0
+        if t.get("action") == "BUY":
+            holdings[ticker] = holdings.get(ticker, 0) + shares
+            balance -= t.get("amount") or 0
+        elif t.get("action") == "SELL":
+            holdings[ticker] = holdings.get(ticker, 0) - shares
+            if holdings.get(ticker, 0) <= 0:
+                holdings.pop(ticker, None)
+            balance += t.get("amount") or 0
+    return balance, holdings
+
+
+def _close_on_or_before(daily_closes, date_obj):
+    """Latest (date, close) from a _daily_closes() list at or before
+    date_obj — a held ticker/index may not have traded exactly on the
+    reconstruction date (holiday, gap in data)."""
+    candidates = [(d, c) for d, c in daily_closes if d <= date_obj]
+    return candidates[-1][1] if candidates else None
+
+
+def _update_account_tracker():
+    """Portfolio value vs. the TSX Composite / TSX 60, tracked daily since
+    the start of the CURRENT account period (the earliest transaction still
+    on record — a reset wipes trades_ai.json's transaction list, so this
+    naturally starts a fresh comparison rather than conflating pre/post-
+    reset performance). Backfills any trading day between that start and
+    yesterday using historical closes (nothing was being snapshotted at the
+    time), then records today live. Safe to call repeatedly — today's entry
+    is always replaced, not appended again."""
+    import yfinance as yf
+    trades = load_trades_ai()
+    transactions = trades.get("transactions", [])
+    if not transactions:
+        return None
+    period_start = min(t["date"][:10] for t in transactions if t.get("date"))
+    starting_balance = None
+    first_tx = min((t for t in transactions if t.get("date", "")[:10] == period_start), key=lambda t: t["date"])
+    if first_tx.get("action") == "BUY":
+        starting_balance = round((first_tx.get("balance") or 0) + (first_tx.get("amount") or 0), 2)
+    else:
+        starting_balance = round((first_tx.get("balance") or 0) - (first_tx.get("amount") or 0), 2)
+
+    db = load_json(ACCOUNT_TRACKER_PATH, {"periodStart": None, "snapshots": []})
+    if db.get("periodStart") != period_start:
+        # New account period (reset since last run) — start over.
+        db = {"periodStart": period_start, "snapshots": []}
+
+    today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+    existing_dates = {s["date"] for s in db["snapshots"] if s["date"] != today_str}
+    start_date = datetime.strptime(period_start, "%Y-%m-%d").date()
+    end_date = datetime.now(TZ).date() - timedelta(days=1)  # backfill through yesterday; today done live below
+    missing_days = []
+    d = start_date
+    while d <= end_date:
+        if d.weekday() < 5 and str(d) not in existing_dates:  # trading days only
+            missing_days.append(d)
+        d += timedelta(days=1)
+
+    if missing_days:
+        tickers = {t["ticker"] for t in transactions if t.get("ticker")}
+        history_period = f"{(datetime.now(TZ).date() - start_date).days + 5}d"
+        closes_by_ticker = {}
+        for tk in tickers | {BENCHMARK_TICKERS["TSX"], BENCHMARK_TICKERS["TSX60"]}:
+            try:
+                closes_by_ticker[tk] = _daily_closes(yf.Ticker(tk).history(period=history_period))
+            except Exception as e:
+                log.warning(f"[AccountTracker] history FAIL: {tk} | {e}")
+                closes_by_ticker[tk] = []
+        tsx_closes = closes_by_ticker.get(BENCHMARK_TICKERS["TSX"], [])
+        tsx60_closes = closes_by_ticker.get(BENCHMARK_TICKERS["TSX60"], [])
+
+        for day in missing_days:
+            day_str = str(day)
+            balance, holdings = _replay_balance_and_holdings(transactions, day_str, starting_balance)
+            value = balance
+            ok = True
+            for ticker, shares in holdings.items():
+                close = _close_on_or_before(closes_by_ticker.get(ticker, []), day)
+                if close is None:
+                    ok = False
+                    break
+                value += shares * close
+            tsx_close = _close_on_or_before(tsx_closes, day)
+            tsx60_close = _close_on_or_before(tsx60_closes, day)
+            if ok and tsx_close and tsx60_close:
+                db["snapshots"].append({
+                    "date": day_str, "accountValue": round(value, 2),
+                    "tsxClose": tsx_close, "tsx60Close": tsx60_close,
+                })
+
+    # Today, live.
+    live_tickers = list({t["ticker"] for t in transactions if t.get("ticker")}
+                         | {BENCHMARK_TICKERS["TSX"], BENCHMARK_TICKERS["TSX60"]})
+    live_prices = fetch_live_prices(live_tickers) if live_tickers else {}
+    balance, holdings = _replay_balance_and_holdings(transactions, today_str, starting_balance)
+    value = balance
+    ok = True
+    for ticker, shares in holdings.items():
+        price = live_prices.get(ticker)
+        if price is None:
+            ok = False
+            break
+        value += shares * price
+    tsx_now = live_prices.get(BENCHMARK_TICKERS["TSX"])
+    tsx60_now = live_prices.get(BENCHMARK_TICKERS["TSX60"])
+    if ok and tsx_now and tsx60_now:
+        db["snapshots"] = [s for s in db["snapshots"] if s["date"] != today_str]
+        db["snapshots"].append({"date": today_str, "accountValue": round(value, 2),
+                                 "tsxClose": tsx_now, "tsx60Close": tsx60_now})
+
+    db["snapshots"].sort(key=lambda s: s["date"])
+    save_json(ACCOUNT_TRACKER_PATH, db)
+    return db
+
+
+ACCOUNT_TRACKER_WINDOWS = [
+    ("today", 1), ("week", 7), ("month", 30), ("year", 365), ("allTime", None),
+]
+
+def _account_tracker_summary():
+    """Cumulative % return for the account vs. TSX Composite vs. TSX 60 over
+    several lookback windows (day/week/month/year/all-time since the
+    account period started), from whatever's already recorded — read-only,
+    no fetches (see _update_account_tracker for the write side). A window
+    with no snapshot far enough back yet (e.g. asking for "month" with only
+    4 days of history) returns None for that window rather than silently
+    duplicating all-time's number."""
+    db = load_json(ACCOUNT_TRACKER_PATH, {"periodStart": None, "snapshots": []})
+    snaps = db.get("snapshots", [])
+    if len(snaps) < 1:
+        return None
+    by_date = {s["date"]: s for s in snaps}
+    dates = sorted(by_date.keys())
+    last = by_date[dates[-1]]
+    last_date = datetime.strptime(dates[-1], "%Y-%m-%d").date()
+
+    def pct(a, b):
+        return round((b - a) / a * 100, 2) if a else None
+
+    def window(days_back):
+        if days_back is None:
+            base_date = dates[0]
+        else:
+            target = last_date - timedelta(days=days_back)
+            candidates = [d for d in dates if d <= str(target)]
+            if not candidates:
+                return None
+            base_date = candidates[-1]
+        base = by_date[base_date]
+        n_trading_days = dates.index(dates[-1]) - dates.index(base_date)
+        return {
+            "fromDate": base_date, "tradingDays": n_trading_days,
+            "accountReturnPct": pct(base["accountValue"], last["accountValue"]),
+            "tsxReturnPct": pct(base["tsxClose"], last["tsxClose"]),
+            "tsx60ReturnPct": pct(base["tsx60Close"], last["tsx60Close"]),
+        }
+
+    windows = {name: window(days_back) for name, days_back in ACCOUNT_TRACKER_WINDOWS}
+    return {
+        "periodStart": db.get("periodStart"),
+        "asOf": dates[-1],
+        "days": len(dates),
+        "windows": windows,
+        "snapshots": snaps,
+    }
+
+
 def _resolve_holding_price(ticker, pos, wl_map, details, dream_map):
     """Best-available current price for a held ticker: prefer the watchlist
     price when fresher than the Fetch Info detail price, else fall back
@@ -659,6 +854,45 @@ def _version_asset_stats(holdings, price_map, current_version):
         }
     return result
 
+
+def _version_vs_index_stats(versions_db, live_prices=None):
+    """TSX Composite/TSX 60 return over the EXACT date range each version
+    was live — the per-version complement to accountReturnPct/
+    _version_asset_stats. Answers "is THIS version beating the index," not
+    "is the whole account beating the index since some arbitrary reset
+    point" (which a reset invalidates every time it happens). Uses
+    tsxAtStart/tsx60AtStart captured once at version-creation time (see
+    bump_recommend_version) — a retired version's window is therefore
+    frozen forever once the next version starts, same as assetAtEnd; only
+    the current (last) version's end boundary is live. (Ported from
+    stock-analysis, adapted to TSX/TSX60 in place of SPY/Nasdaq.)"""
+    versions = versions_db.get("versions", [])
+    if not versions:
+        return {}
+    live_prices = live_prices or {}
+    tsx_now = live_prices.get(BENCHMARK_TICKERS["TSX"])
+    tsx60_now = live_prices.get(BENCHMARK_TICKERS["TSX60"])
+    result = {}
+    for i, v in enumerate(versions):
+        tsx_start, tsx60_start = v.get("tsxAtStart"), v.get("tsx60AtStart")
+        if not tsx_start or not tsx60_start:
+            continue  # predates this tracking — nothing to compare
+        is_current = (i == len(versions) - 1)
+        if is_current:
+            tsx_end, tsx60_end = tsx_now, tsx60_now
+        else:
+            nxt = versions[i + 1]
+            tsx_end, tsx60_end = nxt.get("tsxAtStart"), nxt.get("tsx60AtStart")
+        if not tsx_end or not tsx60_end:
+            continue
+        result[v["version"]] = {
+            "tsxReturnPct": round((tsx_end - tsx_start) / tsx_start * 100, 2),
+            "tsx60ReturnPct": round((tsx60_end - tsx60_start) / tsx60_start * 100, 2),
+        }
+    return result
+
+
+ROLLBACK_PROPOSAL_PATH = "output/rollback_proposal.json"
 
 # Registry of protective changes that apply immediately to whatever version
 # is live (entry guards / regime gates added directly to SCORING_DEFAULTS,
@@ -1672,6 +1906,18 @@ def macro_refresh():
     t.start()
     log.info("Macro refresh triggered via UI")
     return jsonify({"status": "started"})
+
+
+@app.route("/tradeai/account_tracker/run", methods=["POST"])
+def tradeai_account_tracker_run():
+    """Manual trigger — pure computation (transaction replay + a handful of
+    live/historical price fetches), fast enough to run synchronously."""
+    try:
+        _update_account_tracker()
+        return jsonify({"status": "ok", "summary": _account_tracker_summary()})
+    except Exception as e:
+        log.error(f"[AccountTracker] manual run FAIL: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 # ── MARKET ALERT ──────────────────────────────────────────────────────────────
@@ -4142,6 +4388,18 @@ def tradeai_stats():
         log.info(f"[Versions] backfilled assetAtStart for v{latest_v['version']}: ${latest_v['assetAtStart']}")
     current_total_asset = _snapshot_total_asset()
 
+    # Same backfill idea for TSX/TSX60 (see bump_recommend_version) — only
+    # meaningful for the CURRENT version, backfilled with today's price as
+    # an approximation of "start." A retired version missing this predates
+    # the tracking entirely and is intentionally left without an index
+    # comparison rather than guessed at. (Ported from stock-analysis.)
+    index_live_prices = fetch_live_prices([BENCHMARK_TICKERS["TSX"], BENCHMARK_TICKERS["TSX60"]])
+    if not latest_v.get("tsxAtStart"):
+        latest_v["tsxAtStart"] = index_live_prices.get(BENCHMARK_TICKERS["TSX"])
+        latest_v["tsx60AtStart"] = index_live_prices.get(BENCHMARK_TICKERS["TSX60"])
+        save_json(RECOMMEND_VERSIONS_PATH, versions_db)
+    version_vs_index = _version_vs_index_stats(versions_db, index_live_prices)
+
     by_version_rows = {}
     for o in outcomes:
         by_version_rows.setdefault(o.get("recVersion", 1), []).append(o)
@@ -4170,10 +4428,30 @@ def tradeai_stats():
 
         # Account-level return: whole portfolio, independent of trade count.
         asset_at_start = v.get("assetAtStart")
-        asset_at_end = versions_db["versions"][i + 1].get("assetAtStart") if i + 1 < len(versions_db["versions"]) else current_total_asset
+        if i + 1 < len(versions_db["versions"]):
+            nxt = versions_db["versions"][i + 1]
+            # If the NEXT version's assetAtStart was re-anchored by a reset
+            # (see _reanchor_current_version_on_reset), it reflects the
+            # post-reset balance, not where THIS retiring version's book
+            # actually stood the moment it was superseded — that's
+            # assetAtStartOriginal, captured before any reset touched it.
+            # Falling back to the (possibly re-anchored) assetAtStart would
+            # silently reintroduce the same pre/post-reset mismatch bug one
+            # version earlier. (Ported from stock-analysis.)
+            asset_at_end = nxt.get("assetAtStartOriginal", nxt.get("assetAtStart"))
+        else:
+            asset_at_end = current_total_asset
         entry["assetAtEnd"] = asset_at_end
         entry["accountReturnPct"] = (round((asset_at_end - asset_at_start) / asset_at_start * 100, 2)
                                       if asset_at_start else None)
+        vs_index = version_vs_index.get(v["version"])
+        entry["vsIndex"] = vs_index
+        if vs_index and entry["accountReturnPct"] is not None:
+            entry["vsIndex"] = {
+                **vs_index,
+                "vsTsxPct": round(entry["accountReturnPct"] - vs_index["tsxReturnPct"], 2),
+                "vsTsx60Pct": round(entry["accountReturnPct"] - vs_index["tsx60ReturnPct"], 2),
+            }
 
         if vasset and prev_asset and vasset["totalReturnPct"] is not None and prev_asset["totalReturnPct"] is not None:
             entry["improvement"] = {
@@ -4417,6 +4695,42 @@ def tradeai_version_rollback():
         return jsonify({"error": str(e)}), 500
 
 
+def _reanchor_current_version_on_reset(new_balance):
+    """A reset breaks the version tracker's assetAtStart/tsxAtStart chain —
+    accountReturnPct for the CURRENT version would otherwise compare its
+    PRE-reset starting asset against the POST-reset current asset (two
+    different starting points, not a real performance number). Re-anchors
+    the current version's start snapshot to right after the reset — its
+    scoring config didn't change, just the account balance — so
+    accountReturnPct going forward measures "since the last reset OR since
+    this version started, whichever is more recent," matching how the
+    whole-account tracker (account_tracker.json) already behaves. The
+    original creation-time snapshot is preserved (never overwritten) so
+    nothing is silently lost, and every re-anchor is logged. (Ported from
+    stock-analysis, where this fixed a version showing a bogus -16% return
+    purely from an untracked reset, not real trading.)"""
+    try:
+        db = load_recommend_versions()
+        v = db["versions"][-1]
+        if v.get("assetAtStartOriginal") is None:
+            v["assetAtStartOriginal"] = v.get("assetAtStart")
+            v["assetAtStartOriginalCapturedAt"] = v.get("assetAtStartCapturedAt")
+        idx_prices = fetch_live_prices([BENCHMARK_TICKERS["TSX"], BENCHMARK_TICKERS["TSX60"]])
+        reset_anchors = v.setdefault("resetAnchors", [])
+        reset_anchors.append({
+            "at": ts(), "previousAssetAtStart": v.get("assetAtStart"),
+            "newAssetAtStart": new_balance,
+        })
+        v["assetAtStart"] = new_balance
+        v["assetAtStartCapturedAt"] = ts()
+        v["tsxAtStart"] = idx_prices.get(BENCHMARK_TICKERS["TSX"])
+        v["tsx60AtStart"] = idx_prices.get(BENCHMARK_TICKERS["TSX60"])
+        save_json(RECOMMEND_VERSIONS_PATH, db)
+        log.info(f"[RecVersion] re-anchored v{v['version']} on reset — assetAtStart now ${new_balance:,.2f}")
+    except Exception as e:
+        log.warning(f"[RecVersion] re-anchor on reset FAIL: {e}")
+
+
 @app.route("/tradeai/reset", methods=["POST"])
 def tradeai_reset():
     try:
@@ -4425,6 +4739,7 @@ def tradeai_reset():
         auto_buy = bool(body.get("autoBuyIn", False))
         save_json(TRADES_AI_PATH, {"balance": balance, "holdings": {}, "transactions": []})
         save_json(TRADE_AI_CANDIDATES_PATH, {})
+        _reanchor_current_version_on_reset(balance)
         epoch = _record_new_epoch(balance, label=body.get("label"))
         if auto_buy:
             save_json(RESET_PENDING_PATH, {

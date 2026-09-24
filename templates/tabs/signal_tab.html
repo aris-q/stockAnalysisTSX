@@ -21,8 +21,8 @@ async function renderValidation() {
   } catch(e) {
     el.innerHTML = `<div style="color:var(--down);padding:20px;line-height:1.8">
       <div style="font-weight:700;margin-bottom:8px">❌ Failed to load validation data</div>
-      <div style="font-size:11px;color:var(--muted)">${e.message}</div>
-      <div style="font-size:11px;color:var(--muted);margin-top:8px">💡 If this is the first time loading, restart your Flask server so it picks up the new /tradeai/stats route.</div>
+      <div style="font-size:16px;color:var(--muted)">${e.message}</div>
+      <div style="font-size:16px;color:var(--muted);margin-top:8px">💡 If this is the first time loading, restart your Flask server so it picks up the new /tradeai/stats route.</div>
     </div>`;
   }
 }
@@ -56,12 +56,12 @@ function buildValidationHTML(stats, trade) {
   const fmtPct = v => v != null ? (v > 0 ? '+' : '') + Number(v).toFixed(2) + '%' : '—';
   const pctColor = v => v > 0 ? 'var(--up)' : (v < 0 ? 'var(--down)' : 'var(--muted)');
   const bktColors = { Momentum:'#fbbf24', Reversal:'#60a5fa', SmartMoney:'#a78bfa', Dream:'#ffffff' };
-  const bktBadge = b => b ? `<span style="font-size:9px;padding:1px 6px;border-radius:4px;background:${(bktColors[b]||'#ffffff')}22;color:${bktColors[b]||'#ffffff'};font-weight:700">${b}</span>` : '—';
+  const bktBadge = b => b ? `<span style="font-size:14px;padding:1px 6px;border-radius:4px;background:${(bktColors[b]||'#ffffff')}22;color:${bktColors[b]||'#ffffff'};font-weight:700">${b}</span>` : '—';
 
   let html = `
   <div style="margin-bottom:20px">
     <div style="font-family:'Syne',sans-serif;font-weight:800;font-size:18px">✅ RECOMMENDATION VALIDATION</div>
-    <div style="font-size:11px;color:var(--muted);margin-top:2px">Every buy carries its score breakdown; every sell logs the outcome. This page grades the Recommend engine against reality.</div>
+    <div style="font-size:16px;color:var(--muted);margin-top:2px">Every buy carries its score breakdown; every sell logs the outcome. This page grades the Recommend engine against reality.</div>
   </div>`;
 
   // ── VERSION HISTORY — what changed, and did it help? ──────────────────────
@@ -73,24 +73,36 @@ function buildValidationHTML(stats, trade) {
       const es = v.exitStats;
       const imp = v.improvement;
       const exitLine = es
-        ? `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:11px;margin-top:4px">
+        ? `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:16px;margin-top:4px">
             <span>exits under this version: <b>${es.n}</b> trade${es.n===1?'':'s'} <span style="color:var(--muted)">(may include positions bought by an earlier version — this version's sell/stop-loss logic decided WHEN to close them)</span></span>
             <span>exit avg: <b style="color:${pctColor(es.expectancyPct)}">${fmtPct(es.expectancyPct)}</b>/trade</span>
             <span>realized on exits: <b style="color:${pctColor(es.totalGainLoss)}">${es.totalGainLoss >= 0 ? '+' : ''}$${es.totalGainLoss.toFixed(2)}</b></span>
           </div>`
-        : `<div style="font-size:11px;color:var(--muted);margin-top:4px">No sells executed while this version was active.</div>`;
-      const accountLine = `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:11px;margin-top:8px">
+        : `<div style="font-size:16px;color:var(--muted);margin-top:4px">No sells executed while this version was active.</div>`;
+      const accountLine = `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:16px;margin-top:8px">
             <span>account return: <b style="color:${v.accountReturnPct != null ? pctColor(v.accountReturnPct) : 'var(--muted)'}">${v.accountReturnPct != null ? fmtPct(v.accountReturnPct) : '—'}</b> <span style="color:var(--muted)">(whole portfolio${v.assetAtStart != null ? ', $' + v.assetAtStart.toLocaleString() + ' → ' + (v.assetAtEnd != null ? '$' + v.assetAtEnd.toLocaleString() : 'now') : ', tracking not available for this version'})</span></span>
           </div>`;
+      // Per-version index comparison — the exact window THIS version was
+      // live, not the whole-account "since reset" number (which a reset
+      // invalidates every time it happens). vsIndex is null for versions
+      // that predate this tracking. (Ported from stock-analysis, adapted
+      // to TSX Composite/TSX 60 in place of SPY/Nasdaq.)
+      const vsIdx = v.vsIndex;
+      const vsIndexLine = vsIdx
+        ? `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:16px;margin-top:4px">
+            <span>vs TSX Composite: <b style="color:${pctColor(vsIdx.vsTsxPct)}">${vsIdx.vsTsxPct>=0?'+':''}${vsIdx.vsTsxPct}pt</b> <span style="color:var(--muted)">(TSX ${fmtPct(vsIdx.tsxReturnPct)} over the same window)</span></span>
+            <span>vs TSX 60: <b style="color:${pctColor(vsIdx.vsTsx60Pct)}">${vsIdx.vsTsx60Pct>=0?'+':''}${vsIdx.vsTsx60Pct}pt</b> <span style="color:var(--muted)">(${fmtPct(vsIdx.tsx60ReturnPct)})</span></span>
+          </div>`
+        : `<div style="font-size:16px;color:var(--muted);margin-top:4px">No index comparison available for this version (predates tracking).</div>`;
       const assetLine = a
-        ? `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:11px;margin-top:4px">
+        ? `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:16px;margin-top:4px">
             <span>buys: <b>${a.totalN}</b> <span style="color:var(--muted)">(${a.closedN} closed, ${a.openN} open)</span></span>
             <span>asset return (this version's trades): <b style="color:${pctColor(a.totalReturnPct)}">${fmtPct(a.totalReturnPct)}</b> on $${a.totalCost.toFixed(0)} deployed</span>
             <span>total P&amp;L: <b style="color:${pctColor(a.totalPnl)}">${a.totalPnl >= 0 ? '+' : ''}$${a.totalPnl.toFixed(2)}</b> <span style="color:var(--muted)">($${a.closedPnl.toFixed(2)} realized + $${a.openPnl.toFixed(2)} unrealized)</span></span>
           </div>`
-        : `<div style="font-size:11px;color:var(--muted);margin-top:4px">No buys under this version yet — account return above still reflects whole-portfolio drift.</div>`;
+        : `<div style="font-size:16px;color:var(--muted);margin-top:4px">No buys under this version yet — account return above still reflects whole-portfolio drift.</div>`;
       const statLine = s
-        ? `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:10px;margin-top:4px;color:var(--muted)">
+        ? `<div style="display:flex;gap:18px;flex-wrap:wrap;font-family:'DM Mono',monospace;font-size:15px;margin-top:4px;color:var(--muted)">
             <span>closed-trade avg: ${fmtPct(s.expectancyPct)}/trade</span>
             <span>win rate: ${s.winRate != null ? s.winRate + '%' : '—'}</span>
             ${s.excessExpectancyPct != null ? `<span>vs SPY (closed only): ${fmtPct(s.excessExpectancyPct)}/trade</span>` : ''}
@@ -101,22 +113,22 @@ function buildValidationHTML(stats, trade) {
         const better = imp.returnDelta > 0;
         const arrow = better ? '▲' : (imp.returnDelta < 0 ? '▼' : '＝');
         const col = better ? 'var(--up)' : (imp.returnDelta < 0 ? 'var(--down)' : 'var(--muted)');
-        impLine = `<div style="margin-top:8px;padding:8px 12px;border-radius:6px;background:${better?'rgba(74,222,128,0.08)':'rgba(239,68,68,0.08)'};border:1px solid ${col};font-size:11px">
+        impLine = `<div style="margin-top:8px;padding:8px 12px;border-radius:6px;background:${better?'rgba(74,222,128,0.08)':'rgba(239,68,68,0.08)'};border:1px solid ${col};font-size:16px">
           <span style="color:${col};font-weight:700">${arrow} vs v${imp.vsVersion}: ${imp.returnDelta > 0 ? '+' : ''}${imp.returnDelta}% asset return (realized+unrealized vs capital deployed)</span>
           ${imp.reliable ? '' : '<span style="color:var(--warn);margin-left:8px">⚠ small sample — needs 10+ buys on both versions to be trusted</span>'}
         </div>`;
       }
       const statusChips = {
-        'champion':          '<span style="font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(251,191,36,0.15);color:#fbbf24;font-weight:700">🏆 CHAMPION</span>',
-        'testing':           '<span style="font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(96,165,250,0.15);color:#60a5fa;font-weight:700">🧪 TESTING</span>',
-        'retired':           '<span style="font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(107,114,128,0.15);color:#ffffff;font-weight:700">RETIRED</span>',
-        'insufficient-data': '<span style="font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(107,114,128,0.15);color:#ffffff;font-weight:700">NO DATA</span>',
+        'champion':          '<span style="font-size:14px;padding:2px 8px;border-radius:4px;background:rgba(251,191,36,0.15);color:#fbbf24;font-weight:700">🏆 CHAMPION</span>',
+        'testing':           '<span style="font-size:14px;padding:2px 8px;border-radius:4px;background:rgba(96,165,250,0.15);color:#60a5fa;font-weight:700">🧪 TESTING</span>',
+        'retired':           '<span style="font-size:14px;padding:2px 8px;border-radius:4px;background:rgba(107,114,128,0.15);color:#ffffff;font-weight:700">RETIRED</span>',
+        'insufficient-data': '<span style="font-size:14px;padding:2px 8px;border-radius:4px;background:rgba(107,114,128,0.15);color:#ffffff;font-weight:700">NO DATA</span>',
       };
       const rollbackBtn = (!v.current && v.hasConfig)
-        ? `<button onclick="event.stopPropagation();rollbackToVersion(${v.version}, this)" style="margin-left:auto;font-size:10px;padding:3px 10px;background:transparent;border:1px solid var(--warn);border-radius:5px;color:var(--warn);cursor:pointer;font-family:'DM Mono',monospace;font-weight:700">⏪ ROLLBACK TO THIS CONFIG</button>`
-        : (!v.current && !v.hasConfig ? '<span style="margin-left:auto;font-size:9px;color:var(--muted)">no config saved</span>' : '');
+        ? `<button onclick="event.stopPropagation();rollbackToVersion(${v.version}, this)" style="margin-left:auto;font-size:15px;padding:3px 10px;background:transparent;border:1px solid var(--warn);border-radius:5px;color:var(--warn);cursor:pointer;font-family:'DM Mono',monospace;font-weight:700">⏪ ROLLBACK TO THIS CONFIG</button>`
+        : (!v.current && !v.hasConfig ? '<span style="margin-left:auto;font-size:14px;color:var(--muted)">no config saved</span>' : '');
       const warnLine = v.warning
-        ? `<div style="margin-top:6px;font-size:10px;color:var(--warn)">⚠ ${v.warning}</div>` : '';
+        ? `<div style="margin-top:6px;font-size:15px;color:var(--warn)">⚠ ${v.warning}</div>` : '';
 
       // Newest version (idx 0) starts expanded; older ones start collapsed —
       // a click on the header toggles the body without re-fetching anything.
@@ -131,22 +143,23 @@ function buildValidationHTML(stats, trade) {
 
       return `<div style="border:1px solid ${v.status === 'champion' ? '#fbbf24' : (v.current ? 'var(--accent)' : 'var(--border)')};border-radius:10px;padding:14px 16px;margin-bottom:10px;background:var(--surface)">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;cursor:pointer" onclick="toggleVersionCard(${v.version})">
-          <span id="${arrowId}" style="color:var(--muted);font-size:11px;width:12px">${expanded ? '▾' : '▸'}</span>
+          <span id="${arrowId}" style="color:var(--muted);font-size:16px;width:12px">${expanded ? '▾' : '▸'}</span>
           <span style="font-family:'DM Mono',monospace;font-weight:800;font-size:14px;color:${v.current ? 'var(--accent)' : 'var(--text)'}">v${v.version}</span>
-          <span style="font-weight:700;font-size:12px">${v.label || ''}</span>
-          <span style="font-size:10px;color:var(--muted)">${v.date || ''}</span>
-          ${v.basedOn ? '<span style="font-size:9px;color:var(--muted)">↩ config of v' + v.basedOn + '</span>' : ''}
-          ${v.current ? '<span style="font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(200,241,53,0.15);color:var(--accent);font-weight:700">CURRENT</span>' : ''}
+          <span style="font-weight:700;font-size:17px">${v.label || ''}</span>
+          <span style="font-size:15px;color:var(--muted)">${v.date || ''}</span>
+          ${v.basedOn ? '<span style="font-size:14px;color:var(--muted)">↩ config of v' + v.basedOn + '</span>' : ''}
+          ${v.current ? '<span style="font-size:14px;padding:2px 8px;border-radius:4px;background:rgba(200,241,53,0.15);color:var(--accent);font-weight:700">CURRENT</span>' : ''}
           ${statusChips[v.status] || ''}
-          ${!expanded ? `<span style="font-size:10px;color:var(--muted);font-family:'DM Mono',monospace">${summaryBits}</span>` : ''}
+          ${!expanded ? `<span style="font-size:15px;color:var(--muted);font-family:'DM Mono',monospace">${summaryBits}</span>` : ''}
           ${rollbackBtn}
         </div>
         <div id="${bodyId}" style="display:${expanded ? 'block' : 'none'}">
-          <ul style="margin:8px 0 0 16px;padding:0;font-size:11px;color:var(--muted);line-height:1.7">
+          <ul style="margin:8px 0 0 16px;padding:0;font-size:16px;color:var(--muted);line-height:1.7">
             ${(v.changes || []).map(ch => '<li>' + ch + '</li>').join('')}
           </ul>
           ${warnLine}
           ${accountLine}
+          ${vsIndexLine}
           ${assetLine}
           ${exitLine}
           ${statLine}
@@ -159,15 +172,15 @@ function buildValidationHTML(stats, trade) {
       ? `Champion: <b style="color:#fbbf24">v${stats.championVersion}</b> — the best proven config. `
       : `No champion yet — a version needs ${sl.minTrades || 10}+ buys to be judged. `;
     html += `<div style="margin-bottom:22px">
-      <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">RECOMMEND ENGINE — VERSION HISTORY (currently v${stats.currentVersion})</div>
-      <div style="padding:10px 14px;margin-bottom:10px;background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.25);border-radius:8px;font-size:11px;line-height:1.6">
+      <div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">RECOMMEND ENGINE — VERSION HISTORY (currently v${stats.currentVersion})</div>
+      <div style="padding:10px 14px;margin-bottom:10px;background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.25);border-radius:8px;font-size:16px;line-height:1.6">
         <b>🔒 SELF-LEARNING POLICY:</b> ${champLine}
         After <b>${sl.minTrades || 10}</b> buys, the current version's dollar-weighted asset return (realized+unrealized) is compared to the champion; if it lags by more than <b>${sl.rollbackThresholdPct || 1}%</b>, a rollback is ${sl.autoRollback ? '<b>proposed for your approval</b>' : 'not proposed (detection is OFF)'} — nothing changes automatically. The champion only changes when beaten on equal evidence — the ratchet moves up, never back and forth. The version log is append-only: rollbacks create a new version, so every experiment stays on record.
       </div>
       ${buildRollbackBanner(stats.rollbackProposal)}
       ${buildTuningBanner(stats.tuningProposal)}
       ${vCards}
-      <div style="font-size:10px;color:var(--muted);margin-top:4px">A new version is logged automatically whenever the Scoring Matrix is changed; each version stores its full config. Each closed trade is credited to the version that bought it.</div>
+      <div style="font-size:15px;color:var(--muted);margin-top:4px">A new version is logged automatically whenever the Scoring Matrix is changed; each version stores its full config. Each closed trade is credited to the version that bought it.</div>
     </div>`;
   }
 
@@ -188,15 +201,15 @@ function buildValidationHTML(stats, trade) {
       </tr>`;
     }).join('');
     html += `<div style="margin-bottom:22px">
-      <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">OPEN POSITIONS — RECOMMENDATIONS IN FLIGHT</div>
-      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+      <div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">OPEN POSITIONS — RECOMMENDATIONS IN FLIGHT</div>
+      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:16px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
         <thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">
           <th style="padding:7px 10px;text-align:left">TICKER</th><th style="padding:7px 10px;text-align:left">BUCKET</th>
           <th style="padding:7px 10px;text-align:right">SCORE@BUY</th><th style="padding:7px 10px;text-align:left">SIGNAL@BUY</th>
           <th style="padding:7px 10px;text-align:right">BUY PRICE</th><th style="padding:7px 10px;text-align:right">NOW</th>
           <th style="padding:7px 10px;text-align:right">P&amp;L</th><th style="padding:7px 10px;text-align:left">BOUGHT</th>
         </tr></thead><tbody>${rows}</tbody></table></div>
-      <div style="font-size:10px;color:var(--muted);margin-top:4px">SCORE@BUY shows "—" for positions bought before factor tracking was added.</div>
+      <div style="font-size:15px;color:var(--muted);margin-top:4px">SCORE@BUY shows "—" for positions bought before factor tracking was added.</div>
     </div>`;
   }
 
@@ -213,19 +226,19 @@ function buildValidationHTML(stats, trade) {
         <td style="padding:6px 10px;text-align:right;color:${pctColor(b.avgExcessPct)}">${fmtPct(b.avgExcessPct)}</td>
       </tr>`).join('');
     html += `<div style="margin-bottom:22px">
-      <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">SHADOW VALIDATION — ALL SCORED CANDIDATES (5-DAY FORWARD, NO TRADING RISK)</div>
-      <div style="display:flex;gap:18px;flex-wrap:wrap;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:8px;font-family:'DM Mono',monospace;font-size:11px">
+      <div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">SHADOW VALIDATION — ALL SCORED CANDIDATES (5-DAY FORWARD, NO TRADING RISK)</div>
+      <div style="display:flex;gap:18px;flex-wrap:wrap;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:8px;font-family:'DM Mono',monospace;font-size:16px">
         <span>graded: <b>${sh.graded}</b> candidate-days over <b>${sh.snapshots}</b> snapshots</span>
         <span>top-5 picks: <b style="color:${pctColor(sh.top5AvgExcessPct)}">${fmtPct(sh.top5AvgExcessPct)}</b> vs SPY</span>
         <span>the rest: <b style="color:${pctColor(sh.restAvgExcessPct)}">${fmtPct(sh.restAvgExcessPct)}</b> vs SPY</span>
         ${edge != null ? `<span>selection edge: <b style="color:${pctColor(edge)}">${fmtPct(edge)}</b></span>` : ''}
       </div>
-      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:16px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
         <thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">
           <th style="padding:6px 10px;text-align:left">COMPOSITE AT SCORING</th><th style="padding:6px 10px;text-align:right">N</th>
           <th style="padding:6px 10px;text-align:right">AVG 5D RETURN</th><th style="padding:6px 10px;text-align:right">VS SPY</th>
         </tr></thead><tbody>${bandRows}</tbody></table></div>
-      <div style="font-size:10px;color:var(--muted);margin-top:4px">If higher composite bands don't show higher forward returns here, the scoring matrix isn't ranking predictively — this table learns ~20× faster than waiting for real trades.</div>
+      <div style="font-size:15px;color:var(--muted);margin-top:4px">If higher composite bands don't show higher forward returns here, the scoring matrix isn't ranking predictively — this table learns ~20× faster than waiting for real trades.</div>
     </div>`;
   }
 
@@ -247,8 +260,8 @@ function buildValidationHTML(stats, trade) {
     qualified_not_bought: '#60a5fa',
   };
   html += `<div style="margin-bottom:22px">
-    <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:2px">MISSED GAINERS — 5%+ DAYS ON TICKERS NOT BOUGHT (LAST 30 DAYS)</div>
-    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">This is the evidence base for tuning proposals above — every non-bought ticker with a real single-day 5%+ move, and how far it got in the pipeline before being dropped.</div>`;
+    <div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:2px">MISSED GAINERS — 5%+ DAYS ON TICKERS NOT BOUGHT (LAST 30 DAYS)</div>
+    <div style="font-size:15px;color:var(--muted);margin-bottom:8px">This is the evidence base for tuning proposals above — every non-bought ticker with a real single-day 5%+ move, and how far it got in the pipeline before being dropped.</div>`;
   if (missed.length) {
     const rows = missed.map(m => {
       const oc = outcomeColors[m.outcome] || '#ffffff';
@@ -256,7 +269,7 @@ function buildValidationHTML(stats, trade) {
       return `<tr style="border-bottom:1px solid var(--border)">
         <td style="padding:7px 10px;font-weight:700">${m.ticker}</td>
         <td style="padding:7px 10px">${bktBadge(m.bucket)}</td>
-        <td style="padding:7px 10px"><span style="font-size:9px;padding:2px 8px;border-radius:4px;background:${oc}22;color:${oc};font-weight:700">${ol}</span></td>
+        <td style="padding:7px 10px"><span style="font-size:14px;padding:2px 8px;border-radius:4px;background:${oc}22;color:${oc};font-weight:700">${ol}</span></td>
         <td style="padding:7px 10px;text-align:right;font-weight:700;color:var(--up)">+${m.maxDailyGainPct}%</td>
         <td style="padding:7px 10px;color:var(--muted)">${m.maxDailyGainDate || '—'}</td>
         <td style="padding:7px 10px;text-align:right">${m.dreamScore != null ? m.dreamScore : '—'}</td>
@@ -265,7 +278,7 @@ function buildValidationHTML(stats, trade) {
         <td style="padding:7px 10px;color:var(--muted)">${m.snapshotDate || '—'}</td>
       </tr>`;
     }).join('');
-    html += `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+    html += `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:16px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
       <thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">
         <th style="padding:7px 10px;text-align:left">TICKER</th><th style="padding:7px 10px;text-align:left">BUCKET</th>
         <th style="padding:7px 10px;text-align:left">WHY MISSED</th><th style="padding:7px 10px;text-align:right">MAX DAY</th>
@@ -274,7 +287,7 @@ function buildValidationHTML(stats, trade) {
         <th style="padding:7px 10px;text-align:left">SCANNED</th>
       </tr></thead><tbody>${rows}</tbody></table></div>`;
   } else {
-    html += `<div style="color:var(--muted);font-size:12px;padding:16px;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+    html += `<div style="color:var(--muted);font-size:17px;padding:16px;background:var(--surface);border:1px solid var(--border);border-radius:8px">
       No missed 5%+ gainers recorded yet — needs a few weeks of graded shadow snapshots (see Shadow Validation above) before this fills in.
     </div>`;
   }
@@ -298,8 +311,8 @@ function buildValidationHTML(stats, trade) {
       </tr>`;
     }).join('');
     html += `<div style="margin-bottom:22px">
-      <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">CLOSED TRADES — LAST ${recent.length}</div>
-      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+      <div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">CLOSED TRADES — LAST ${recent.length}</div>
+      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:16px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
         <thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">
           <th style="padding:7px 10px;text-align:left">TICKER</th><th style="padding:7px 10px;text-align:left">BUCKET</th>
           <th style="padding:7px 10px;text-align:right">SCORE@BUY</th><th style="padding:7px 10px;text-align:left">SIGNAL@BUY</th>
@@ -309,7 +322,7 @@ function buildValidationHTML(stats, trade) {
         </tr></thead><tbody>${rows}</tbody></table></div>
     </div>`;
   } else {
-    html += `<div style="color:var(--muted);font-size:12px;padding:16px;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+    html += `<div style="color:var(--muted);font-size:17px;padding:16px;background:var(--surface);border:1px solid var(--border);border-radius:8px">
       No closed trades logged yet. Outcomes are recorded automatically every time TradeAI sells a position — check back after the next few Recommend cycles.
     </div>`;
   }

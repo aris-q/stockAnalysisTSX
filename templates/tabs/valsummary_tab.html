@@ -18,7 +18,7 @@ async function loadValSummary(force) {
 
 function _vsTile(label, val, color) {
   return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;text-align:center">
-    <div style="font-size:10px;color:var(--muted);letter-spacing:0.6px;margin-bottom:5px">${label}</div>
+    <div style="font-size:15px;color:var(--muted);letter-spacing:0.6px;margin-bottom:5px">${label}</div>
     <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:800;${color ? 'color:'+color : ''}">${val != null ? val : '—'}</div>
   </div>`;
 }
@@ -31,15 +31,15 @@ function buildValSummaryHTML(d) {
   const fmtPct = v => v != null ? (v > 0 ? '+' : '') + Number(v).toFixed(2) + '%' : '—';
   const pctColor = v => v > 0 ? 'var(--up)' : (v < 0 ? 'var(--down)' : 'var(--muted)');
   const statusChips = {
-    'champion': '<span style="font-size:10px;padding:3px 10px;border-radius:5px;background:rgba(251,191,36,0.15);color:#fbbf24;font-weight:700">🏆 CHAMPION</span>',
-    'testing':  '<span style="font-size:10px;padding:3px 10px;border-radius:5px;background:rgba(96,165,250,0.15);color:#60a5fa;font-weight:700">🧪 TESTING</span>',
-    'retired':  '<span style="font-size:10px;padding:3px 10px;border-radius:5px;background:rgba(107,114,128,0.15);color:#ffffff;font-weight:700">RETIRED</span>',
-    'insufficient-data': '<span style="font-size:10px;padding:3px 10px;border-radius:5px;background:rgba(107,114,128,0.15);color:#ffffff;font-weight:700">NO DATA</span>',
+    'champion': '<span style="font-size:15px;padding:3px 10px;border-radius:5px;background:rgba(251,191,36,0.15);color:#fbbf24;font-weight:700">🏆 CHAMPION</span>',
+    'testing':  '<span style="font-size:15px;padding:3px 10px;border-radius:5px;background:rgba(96,165,250,0.15);color:#60a5fa;font-weight:700">🧪 TESTING</span>',
+    'retired':  '<span style="font-size:15px;padding:3px 10px;border-radius:5px;background:rgba(107,114,128,0.15);color:#ffffff;font-weight:700">RETIRED</span>',
+    'insufficient-data': '<span style="font-size:15px;padding:3px 10px;border-radius:5px;background:rgba(107,114,128,0.15);color:#ffffff;font-weight:700">NO DATA</span>',
   };
 
   let html = `<div style="margin-bottom:20px">
     <div style="font-family:'Syne',sans-serif;font-weight:800;font-size:18px">📈 VALIDATION SUMMARY</div>
-    <div style="font-size:11px;color:var(--muted);margin-top:2px">Where the engine stands right now — full breakdowns live in the ✅ VALIDATION tab.</div>
+    <div style="font-size:16px;color:var(--muted);margin-top:2px">Where the engine stands right now — full breakdowns live in the ✅ VALIDATION tab.</div>
   </div>`;
 
   // ── CURRENT VERSION HERO ───────────────────────────────────────────────────
@@ -54,11 +54,11 @@ function buildValSummaryHTML(d) {
         <span style="font-family:'Syne',sans-serif;font-size:30px;font-weight:800;color:var(--accent)">v${cur.version}</span>
         <div>
           <div style="font-weight:700;font-size:14px">${cur.label || ''}</div>
-          <div style="font-size:10px;color:var(--muted)">active since ${cur.date || '—'}</div>
+          <div style="font-size:15px;color:var(--muted)">active since ${cur.date || '—'}</div>
         </div>
         <span style="margin-left:auto">${statusChips[cur.status] || ''}</span>
       </div>
-      <ul style="margin:0 0 12px 16px;padding:0;font-size:11px;color:var(--muted);line-height:1.7">
+      <ul style="margin:0 0 12px 16px;padding:0;font-size:16px;color:var(--muted);line-height:1.7">
         ${changes.slice(0,4).map(c => '<li>' + c + '</li>').join('')}
         ${changes.length > 4 ? `<li style="list-style:none;color:var(--muted)">… +${changes.length-4} more (see Validation tab)</li>` : ''}
       </ul>
@@ -74,22 +74,22 @@ function buildValSummaryHTML(d) {
         <div style="flex:1;height:8px;background:var(--surface2);border-radius:4px;overflow:hidden">
           <div style="width:${progress}%;height:100%;background:${progress >= 100 ? 'var(--accent)' : '#60a5fa'};border-radius:4px"></div>
         </div>
-        <div style="font-size:10px;color:var(--muted);white-space:nowrap">
+        <div style="font-size:15px;color:var(--muted);white-space:nowrap">
           ${n}/${minN} buys to judgment ${progress >= 100 ? '— comparable to champion now' : ''}
         </div>
       </div>
-      <div style="font-size:10px;color:var(--muted);margin-top:8px">ACCOUNT RETURN = whole-portfolio equity change since this version started (${cur.assetAtStart != null ? '$'+cur.assetAtStart.toLocaleString() : '—'} → now) — always available, even with zero trades under this version. ASSET RETURN = realized P&amp;L (closed trades) + unrealized P&amp;L (still-open positions bought under this version), against capital deployed — the champion/rollback decision uses this one when enough buys exist.</div>
+      <div style="font-size:15px;color:var(--muted);margin-top:8px">ACCOUNT RETURN = whole-portfolio equity change since this version started (${cur.assetAtStart != null ? '$'+cur.assetAtStart.toLocaleString() : '—'} → now) — always available, even with zero trades under this version. ASSET RETURN = realized P&amp;L (closed trades) + unrealized P&amp;L (still-open positions bought under this version), against capital deployed — the champion/rollback decision uses this one when enough buys exist.</div>
     </div>`;
   }
 
   // ── VERSION COMPARISON CHART — dollar-weighted asset return, zero baseline ─
   const withStats = versions.filter(v => v.assetStats && v.assetStats.totalReturnPct != null);
   html += `<div style="border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:16px;background:var(--surface)">
-    <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:2px">ASSET RETURN BY VERSION</div>
-    <div style="font-size:10px;color:var(--muted);margin-bottom:12px">Realized + unrealized P&amp;L against capital deployed, credited to each engine version (includes still-open positions). Bars above the line make money; below lose it.</div>`;
+    <div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:2px">ASSET RETURN BY VERSION</div>
+    <div style="font-size:15px;color:var(--muted);margin-bottom:12px">Realized + unrealized P&amp;L against capital deployed, credited to each engine version (includes still-open positions). Bars above the line make money; below lose it.</div>`;
 
   if (!withStats.length) {
-    html += `<div style="color:var(--muted);font-size:12px;padding:16px 0">No buys logged yet — the chart appears after the first purchase.</div>`;
+    html += `<div style="color:var(--muted);font-size:17px;padding:16px 0">No buys logged yet — the chart appears after the first purchase.</div>`;
   } else {
     const W = 640, H = 230, padT = 26, padB = 44, padL = 8, padR = 8;
     const zeroableMax = Math.max(1, ...withStats.map(v => Math.abs(v.assetStats.totalReturnPct)));
@@ -139,7 +139,7 @@ function buildValSummaryHTML(d) {
         <text x="${padL + 2}" y="${zeroY - 5}" font-size="9" fill="var(--muted)" font-family="DM Mono,monospace">0%</text>
         ${bars}${labels}${hits}
       </svg>
-      <div id="vsTooltip" style="display:none;position:absolute;pointer-events:none;background:#1f1f2e;border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:11px;line-height:1.6;z-index:50;max-width:260px"></div>
+      <div id="vsTooltip" style="display:none;position:absolute;pointer-events:none;background:#1f1f2e;border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:16px;line-height:1.6;z-index:50;max-width:260px"></div>
     </div>`;
   }
   html += `</div>`;
@@ -151,8 +151,8 @@ function buildValSummaryHTML(d) {
   if (anyVersionData) {
     const tableVersions = versions.slice().reverse(); // newest first
     html += `<div style="border:1px solid var(--border);border-radius:12px;padding:14px 18px;background:var(--surface)">
-      <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">ALL VERSIONS — TABLE (LATEST FIRST)</div>
-      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'DM Mono',monospace">
+      <div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">ALL VERSIONS — TABLE (LATEST FIRST)</div>
+      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:16px;font-family:'DM Mono',monospace">
         <thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">
           <th style="padding:6px 10px;text-align:left">VERSION</th><th style="padding:6px 10px;text-align:left">STATUS</th>
           <th style="padding:6px 10px;text-align:right">ACCOUNT RETURN</th>
@@ -175,7 +175,7 @@ function buildValSummaryHTML(d) {
           </tr>`;
         }).join('')}
         </tbody></table></div>
-      <div style="font-size:10px;color:var(--muted);margin-top:6px">ACCOUNT RETURN = whole-portfolio equity change since the version started — always available, even with zero trades under that version. ASSET RETURN needs ${minN}+ buys (closed+open) of its own before it's reliable and is what the champion/rollback decision uses. CLOSED AVG is the average %/trade across closed sells only — shown for context.</div>
+      <div style="font-size:15px;color:var(--muted);margin-top:6px">ACCOUNT RETURN = whole-portfolio equity change since the version started — always available, even with zero trades under that version. ASSET RETURN needs ${minN}+ buys (closed+open) of its own before it's reliable and is what the champion/rollback decision uses. CLOSED AVG is the average %/trade across closed sells only — shown for context.</div>
     </div>`;
   }
 
