@@ -489,17 +489,41 @@ def fetch_price_only(ticker):
 
 # ── MACRO DATA ────────────────────────────────────────────────────────────────
 
+# FOMC decision dates (rate announcement day only, the second day of each
+# 2-day meeting). The Fed publishes roughly a year out and each date is
+# "tentative until confirmed at the meeting immediately preceding it," so
+# this needs a manual refresh periodically (at least once a year).
+FOMC_MEETING_DATES = [
+    "2026-09-16", "2026-10-28", "2026-12-09",
+    "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09",
+    "2027-07-28", "2027-09-15", "2027-10-27", "2027-12-08",
+]
+
+def _next_fomc_date():
+    today = datetime.now().strftime("%Y-%m-%d")
+    future = sorted(d for d in FOMC_MEETING_DATES if d > today)
+    return future[0] if future else None
+
 FRED_SERIES = {
-    "fed_rate":       {"id": "FEDFUNDS",   "label": "Fed Funds Rate",      "unit": "%"},
-    "cpi":            {"id": "CPIAUCSL",   "label": "CPI (YoY)",           "unit": "%",  "yoy": True},
-    "unemployment":   {"id": "UNRATE",     "label": "Unemployment Rate",   "unit": "%"},
-    "gdp_growth":     {"id": "A191RL1Q225SBEA", "label": "GDP Growth",     "unit": "%"},
+    "fed_rate":       {"id": "FEDFUNDS",   "label": "Fed Funds Rate",      "unit": "%", "fomcCalendar": True},
+    "cpi":            {"id": "CPIAUCSL",   "label": "CPI (YoY)",           "unit": "%",  "yoy": True, "releaseId": 10},
+    "unemployment":   {"id": "UNRATE",     "label": "Unemployment Rate",   "unit": "%",  "releaseId": 50},
+    "gdp_growth":     {"id": "A191RL1Q225SBEA", "label": "GDP Growth",     "unit": "%",  "releaseId": 53},
     "ten_yr_yield":   {"id": "DGS10",      "label": "10-Yr Treasury Yield","unit": "%"},
     "two_yr_yield":   {"id": "DGS2",       "label": "2-Yr Treasury Yield", "unit": "%"},
     "vix":            {"id": "VIXCLS",     "label": "VIX (Fear Index)",    "unit": ""},
     "dollar_index":   {"id": "DTWEXBGS",   "label": "USD Dollar Index",    "unit": ""},
     "oil_wti":        {"id": "DCOILWTICO", "label": "WTI Crude Oil",       "unit": "$"},
     "sp500":          {"id": "SP500",      "label": "S&P 500",             "unit": ""},
+    "nasdaq100":      {"id": "NASDAQ100",  "label": "Nasdaq 100",          "unit": ""},
+    # The monthly jobs report — markets react to the month-over-month
+    # change in payroll count, not the raw employment level, so this reads
+    # very differently from every other series above (see the "diff" branch
+    # in fetch_macro_data below).
+    "nonfarm_payrolls": {"id": "PAYEMS",    "label": "Nonfarm Payrolls (m/m)", "unit": "k", "diff": True, "releaseId": 50},
+    "jobless_claims":   {"id": "ICSA",      "label": "Initial Jobless Claims", "unit": "k", "scale": 0.001, "releaseId": 180},
+    "core_pce":         {"id": "PCEPILFE",  "label": "Core PCE (YoY)",         "unit": "%", "yoy": True, "releaseId": 54},
+    "consumer_sentiment": {"id": "UMCSENT", "label": "Consumer Sentiment (U Mich)", "unit": "", "releaseId": 91},
 }
 
 def fetch_fred_series(series_id, api_key, limit=2):
@@ -517,24 +541,91 @@ def fetch_fred_series(series_id, api_key, limit=2):
         log.warning(f"FRED FAIL: {series_id} | {e}")
         return []
 
+def fetch_next_release_date(release_id, api_key):
+    """Next-scheduled date for a FRED "release" (the actual calendar event,
+    e.g. BLS's monthly Employment Situation report — shared by both
+    unemployment and nonfarm_payrolls, which come from the same release).
+    FRED tracks releases separately from series because market-moving
+    indicators publish on a schedule (Nonfarm Payrolls: ~first Friday of
+    the month) that has nothing to do with which month's data it covers —
+    that's the "date" field on the observation itself, handled elsewhere.
+    Desc-sorted with a generous limit so the window reliably straddles
+    today regardless of how far out FRED has already scheduled releases."""
+    try:
+        url = (
+            f"https://api.stlouisfed.org/fred/release/dates?release_id={release_id}"
+            f"&api_key={api_key}&file_type=json&sort_order=desc"
+            f"&include_release_dates_with_no_data=true&limit=20"
+        )
+        r = requests.get(url, timeout=10)
+        dates = sorted(x["date"] for x in r.json().get("release_dates", []))
+        today = datetime.now().strftime("%Y-%m-%d")
+        future = [d for d in dates if d > today]
+        return future[0] if future else None
+    except Exception as e:
+        log.warning(f"FRED release-dates FAIL: {release_id} | {e}")
+        return None
+
 def fetch_macro_data(fred_api_key, newsapi_key=None):
     log.info("=== Macro fetch started ===")
     indicators = {}
 
     for key, cfg in FRED_SERIES.items():
-        obs = fetch_fred_series(cfg["id"], fred_api_key, limit=14 if cfg.get("yoy") else 2)
+        # "diff" (Nonfarm Payrolls) needs 3 raw levels to show both this
+        # month's m/m change and whether that change grew or shrank vs
+        # last month's; "yoy" needs 13 to reach back a full year.
+        # yoy needs obs[12]/[13] (this month's and last month's year-ago
+        # comparison) — request a few extra since FRED occasionally has a
+        # blank/pending revision in the window that fetch_fred_series drops.
+        limit = 3 if cfg.get("diff") else (16 if cfg.get("yoy") else 2)
+        obs = fetch_fred_series(cfg["id"], fred_api_key, limit=limit)
+        release_extra = {}
+        if cfg.get("releaseId"):
+            release_extra = {"nextRelease": fetch_next_release_date(cfg["releaseId"], fred_api_key)}
+        elif cfg.get("fomcCalendar"):
+            release_extra = {"nextRelease": _next_fomc_date()}
         if not obs:
-            indicators[key] = {"label": cfg["label"], "value": None, "date": None, "unit": cfg["unit"], "change": None}
+            indicators[key] = {"label": cfg["label"], "value": None, "date": None, "unit": cfg["unit"], "change": None, **release_extra}
             continue
         try:
-            latest = float(obs[0]["value"])
-            prev   = float(obs[1]["value"]) if len(obs) > 1 else None
-            # YoY calculation (CPI: compare to 12 months ago = ~obs[12])
-            if cfg.get("yoy") and len(obs) >= 13:
-                year_ago = float(obs[12]["value"])
-                change = round(((latest - year_ago) / year_ago) * 100, 2)
-            else:
-                change = round(latest - prev, 2) if prev is not None else None
+            scale = cfg.get("scale", 1)
+            latest = float(obs[0]["value"]) * scale
+            prev   = float(obs[1]["value"]) * scale if len(obs) > 1 else None
+            if cfg.get("diff") and prev is not None:
+                # Value shown IS the month-over-month change (what actually
+                # moves markets); "change" is that change accelerating (+)
+                # or decelerating (-) vs the prior month's change.
+                value = round(latest - prev, 2)
+                prior_diff = None
+                if len(obs) > 2:
+                    prior_month = float(obs[2]["value"]) * scale
+                    prior_diff = round(prev - prior_month, 2)
+                change = round(value - prior_diff, 2) if prior_diff is not None else None
+                indicators[key] = {
+                    "label": cfg["label"], "value": value, "prev": prior_diff,
+                    "change": change, "date": obs[0]["date"], "unit": cfg["unit"],
+                    **release_extra,
+                }
+                log.info(f"FRED OK: {key} | {value} ({obs[0]['date']})")
+                continue
+            # YoY calculation (CPI: compare to 12 months ago = ~obs[12]). The
+            # index level itself (latest) is meaningless on its own — show
+            # the YoY% as "value" (matching the "(YoY)" label), and "change"
+            # as this month's YoY% vs last month's, i.e. inflation
+            # accelerating (+) or cooling (-) — not the raw level delta.
+            if cfg.get("yoy") and len(obs) >= 14:
+                year_ago = float(obs[12]["value"]) * scale
+                year_ago_prev = float(obs[13]["value"]) * scale
+                yoy_now = round(((latest - year_ago) / year_ago) * 100, 2)
+                yoy_prev = round(((prev - year_ago_prev) / year_ago_prev) * 100, 2)
+                indicators[key] = {
+                    "label": cfg["label"], "value": yoy_now, "prev": yoy_prev,
+                    "change": round(yoy_now - yoy_prev, 2), "date": obs[0]["date"], "unit": cfg["unit"],
+                    **release_extra,
+                }
+                log.info(f"FRED OK: {key} | {yoy_now}% ({obs[0]['date']})")
+                continue
+            change = round(latest - prev, 2) if prev is not None else None
             indicators[key] = {
                 "label":  cfg["label"],
                 "value":  round(latest, 2),
@@ -542,11 +633,12 @@ def fetch_macro_data(fred_api_key, newsapi_key=None):
                 "change": change,
                 "date":   obs[0]["date"],
                 "unit":   cfg["unit"],
+                **release_extra,
             }
             log.info(f"FRED OK: {key} | {latest} ({obs[0]['date']})")
         except Exception as e:
             log.warning(f"FRED parse FAIL: {key} | {e}")
-            indicators[key] = {"label": cfg["label"], "value": None, "date": None, "unit": cfg["unit"], "change": None}
+            indicators[key] = {"label": cfg["label"], "value": None, "date": None, "unit": cfg["unit"], "change": None, **release_extra}
 
     # Yield curve spread
     try:

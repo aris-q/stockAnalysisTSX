@@ -47,7 +47,7 @@ def _epoch_for_date(date_str, epochs):
         else:
             break
     return matched
-from fetcher import fetch_yfinance, fetch_daily_gainers, fetch_news, fetch_price_context, fetch_price_only, fetch_macro_data, fetch_dream_candidates, fetch_trade_detail, fetch_ticker_news, fetch_live_prices, fetch_prev_closes, fetch_index_trend_signal
+from fetcher import fetch_yfinance, fetch_daily_gainers, fetch_news, fetch_price_context, fetch_price_only, fetch_macro_data, fetch_dream_candidates, fetch_trade_detail, fetch_ticker_news, fetch_live_prices, fetch_prev_closes, fetch_index_trend_signal, _next_fomc_date, FOMC_MEETING_DATES
 from compute import process_watchlist
 from ai_summary import generate_summary, generate_recommendations, generate_followup, generate_news_impact
 from refresh_manager import check_what_needs_refresh, needs_news_refresh, now, hours_since
@@ -456,9 +456,16 @@ MACRO_NEGATIVE_WORDS = ("recession", "crash", "selloff", "sell-off", "correction
 MACRO_POSITIVE_WORDS = ("rally", "record high", "soft landing", "rate cut", "growth beat", "strong jobs")
 
 def _macro_risk_signal():
-    """Rule-based macro risk-off read: yield curve inversion + negative
-    keyword density in fetched market headlines. Same additive pattern as
-    the existing VIX regime gate — an extra input to it, not a replacement."""
+    """Rule-based macro risk-off read: yield curve inversion, negative
+    keyword density in fetched market headlines, and four hard economic-
+    data triggers (each individually rare and unambiguous, not a fuzzy
+    blend of every indicator on the Macro tab — most of those, e.g. VIX
+    level or the market-price series, are already covered by the separate
+    VIX/trend gates or don't have a defensible risk-off threshold at all).
+    Same additive pattern as the existing VIX regime gate — an extra input
+    to it, not a replacement. (Ported from stock-analysis — these are US
+    macro triggers; TSX-listed names still trade largely on US Fed/economic
+    data, same as the main account, so no Canada-specific equivalent yet.)"""
     macro = load_json(MACRO_PATH, {})
     indicators = macro.get("indicators", {})
     headlines = macro.get("headlines", [])
@@ -470,15 +477,54 @@ def _macro_risk_signal():
     neg = sum(text.count(w) for w in MACRO_NEGATIVE_WORDS)
     pos = sum(text.count(w) for w in MACRO_POSITIVE_WORDS)
     headline_bearish = neg > pos and neg >= 2  # require 2+ hits, not one stray word
-
-    risk_off = inverted or headline_bearish
     headline_bullish = pos > neg and pos >= 2  # mirror of the bearish check, display-only (no buy boost yet)
+
+    # Payrolls turning negative (outright job losses, not just slower
+    # growth) is a hard, rare, unambiguous recession signal.
+    payrolls = (indicators.get("nonfarm_payrolls") or {}).get("value")
+    payrolls_negative = payrolls is not None and payrolls < 0
+
+    # Unemployment rising fast — a simplified proxy for the Sahm Rule
+    # (a 0.3pt+ single-month jump is itself unusual; the real rule uses a
+    # 3-month average vs. its 12-month low, which would need retained
+    # history this fetch doesn't keep).
+    unemp_chg = (indicators.get("unemployment") or {}).get("change")
+    unemployment_spiking = unemp_chg is not None and unemp_chg >= 0.3
+
+    # Inflation clearly reaccelerating (this month's YoY vs last month's)
+    # feeds the same fear either headline handles — the Fed staying
+    # restrictive/hiking into a slowing economy. CPI and Core PCE share one
+    # trigger since they mostly move together; report separately if not.
+    cpi_chg = (indicators.get("cpi") or {}).get("change")
+    pce_chg = (indicators.get("core_pce") or {}).get("change")
+    inflation_reaccelerating = (cpi_chg is not None and cpi_chg >= 0.3) or (pce_chg is not None and pce_chg >= 0.3)
+
+    # Fed Funds Rate actually moving up — unlike a market series, FEDFUNDS
+    # (the monthly EFFR average) doesn't drift on its own; a rate hike hits
+    # the target within days, so any real m/m rise reflects an actual FOMC
+    # decision, not noise. 0.05pt (5bp) filters out the rare tiny-basis-point
+    # drift within an unchanged target so this doesn't false-trigger every
+    # month the rate merely holds.
+    fed_chg = (indicators.get("fed_rate") or {}).get("change")
+    fed_hiking = fed_chg is not None and fed_chg >= 0.05
+
+    risk_off = inverted or headline_bearish or payrolls_negative or unemployment_spiking or inflation_reaccelerating or fed_hiking
 
     reasons = []
     if inverted:
         reasons.append(f"yield curve inverted ({yc}%)")
     if headline_bearish:
         reasons.append(f"{neg} bearish vs {pos} bullish macro headline keyword hits")
+    if payrolls_negative:
+        reasons.append(f"Nonfarm Payrolls fell {payrolls}k m/m — outright job losses")
+    if unemployment_spiking:
+        reasons.append(f"Unemployment rate jumped +{unemp_chg}pt m/m")
+    if inflation_reaccelerating:
+        which = "CPI" if (cpi_chg is not None and cpi_chg >= 0.3) else "Core PCE"
+        chg = cpi_chg if which == "CPI" else pce_chg
+        reasons.append(f"{which} YoY reaccelerating (+{chg}pt vs last month)")
+    if fed_hiking:
+        reasons.append(f"Fed Funds Rate rose +{fed_chg}pt m/m — tightening")
     if not risk_off and headline_bullish:
         reasons.append(f"{pos} bullish vs {neg} bearish macro headline keyword hits")
 

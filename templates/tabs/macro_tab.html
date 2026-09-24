@@ -69,7 +69,7 @@ async function runMacroAI(btn) {
   btn.textContent = '⏳ Running AI...';
   btn.disabled = true;
   const el = document.getElementById('macroAiResult');
-  if (el) el.innerHTML = '<span style="color:var(--muted);font-size:12px">Generating analysis (may take 30-60s)...</span>';
+  if (el) el.innerHTML = '<span style="color:var(--muted);font-size:17px">Generating analysis (may take 30-60s)...</span>';
   console.log('[Macro] AI summary triggered');
   try {
     const res = await fetch('/macro/ai', {method:'POST'});
@@ -109,9 +109,9 @@ function renderMacro(data) {
   function indColor(key, val, change) {
     if (val === null || val === undefined) return 'macro-neutral';
     // Higher = bad for markets: rates, inflation, unemployment, VIX
-    const higherIsBad = ['fed_rate','cpi','unemployment','vix','two_yr_yield'];
+    const higherIsBad = ['fed_rate','cpi','unemployment','vix','two_yr_yield','jobless_claims','core_pce'];
     // Higher = good: GDP, SP500, dollar
-    const higherIsGood = ['gdp_growth','sp500','dollar_index'];
+    const higherIsGood = ['gdp_growth','sp500','nasdaq100','dollar_index','nonfarm_payrolls','consumer_sentiment'];
     // Yield curve: positive = normal, negative = inverted (bad)
     if (key === 'yield_curve') return val >= 0 ? 'macro-up' : 'macro-down';
     if (key === 'oil_wti') return 'macro-neutral';
@@ -122,7 +122,7 @@ function renderMacro(data) {
   }
 
   // Build indicator cards
-  const CARD_ORDER = ['fed_rate','cpi','unemployment','gdp_growth','ten_yr_yield','two_yr_yield','yield_curve','vix','dollar_index','oil_wti','sp500'];
+  const CARD_ORDER = ['fed_rate','cpi','core_pce','unemployment','nonfarm_payrolls','jobless_claims','consumer_sentiment','gdp_growth','ten_yr_yield','two_yr_yield','yield_curve','vix','dollar_index','oil_wti','sp500','nasdaq100'];
   let cards = '';
   for (const key of CARD_ORDER) {
     const v = ind[key];
@@ -136,11 +136,27 @@ function renderMacro(data) {
     const chgStr = chg !== null ? (chg >= 0 ? '+' : '') + chg + suffix : '';
     const chgColor = colorClass === 'macro-up' ? 'var(--up)' : colorClass === 'macro-down' ? 'var(--down)' : 'var(--muted)';
     const border = colorClass === 'macro-up' ? 'rgba(74,222,128,0.3)' : colorClass === 'macro-down' ? 'rgba(248,113,113,0.3)' : 'var(--border)';
+
+    // Next-release calendar (only present on FRED "release"-backed indicators
+    // — daily market series like VIX/S&P have no report calendar). Colored
+    // green with breathing room (>3 days out), red once close enough to
+    // actually watch for.
+    let releaseHtml = '';
+    if (v.nextRelease) {
+      const daysUntil = Math.ceil((new Date(v.nextRelease + 'T00:00:00') - new Date()) / 86400000);
+      const nextColor = daysUntil > 3 ? 'var(--up)' : 'var(--down)';
+      const releaseLabel = key === 'fed_rate' ? 'Next FOMC' : 'Next release';
+      releaseHtml = '<div class="macro-card-release" style="font-size:15px;color:var(--muted);margin-top:2px">'
+        + releaseLabel + ' <span style="color:' + nextColor + ';font-weight:700">' + v.nextRelease + '</span>'
+        + '</div>';
+    }
+
     cards += '<div class="macro-card" style="border-color:' + border + '">'
       + '<div class="macro-card-label">' + v.label + '</div>'
       + '<div class="macro-card-value ' + colorClass + '">' + prefix + val + suffix + '</div>'
       + (chgStr ? '<div class="macro-card-change" style="color:' + chgColor + '">' + chgStr + ' change</div>' : '')
       + (v.date ? '<div class="macro-card-date">' + v.date + '</div>' : '')
+      + releaseHtml
       + '</div>';
   }
 
@@ -153,18 +169,18 @@ function renderMacro(data) {
       return '<div class="macro-headline">' + title + '<div class="macro-headline-meta">' + (h.source||'') + (d ? ' · ' + d : '') + '</div></div>';
     }).join('');
   } else {
-    newsHtml = '<span style="font-size:12px;color:var(--muted)">No headlines available. Add NEWSAPI_KEY to config.py to enable.</span>';
+    newsHtml = '<span style="font-size:17px;color:var(--muted)">No headlines available. Add NEWSAPI_KEY to config.py to enable.</span>';
   }
 
   const tsLabel = fetchedAt ? '🕐 ' + fetchedAt : 'Never fetched';
 
   return '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:20px">'
-    + '<button onclick="refreshMacro(this)" style="font-size:12px;padding:6px 18px;background:var(--warn);color:#0a0a0f;border:none;border-radius:5px;font-weight:700;cursor:pointer">⚡ Refresh Macro</button>'
-    + '<span style="font-size:11px;color:var(--muted)">' + tsLabel + '</span>'
+    + '<button onclick="refreshMacro(this)" style="font-size:17px;padding:6px 18px;background:var(--warn);color:#0a0a0f;border:none;border-radius:5px;font-weight:700;cursor:pointer">⚡ Refresh Macro</button>'
+    + '<span style="font-size:16px;color:var(--muted)">' + tsLabel + '</span>'
     + '</div>'
 
     + '<div class="macro-section-title">MACRO INDICATORS</div>'
-    + '<div class="macro-grid">' + (cards || '<span style="color:var(--muted);font-size:12px">No data. Run a refresh.</span>') + '</div>'
+    + '<div class="macro-grid">' + (cards || '<span style="color:var(--muted);font-size:17px">No data. Run a refresh.</span>') + '</div>'
 
     + '<div class="macro-section-title">MARKET HEADLINES</div>'
     + '<div style="margin-bottom:24px">' + newsHtml + '</div>';
