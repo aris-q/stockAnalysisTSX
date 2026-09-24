@@ -660,7 +660,138 @@ def _version_asset_stats(holdings, price_map, current_version):
     return result
 
 
-ROLLBACK_PROPOSAL_PATH = "output/rollback_proposal.json"
+# Registry of protective changes that apply immediately to whatever version
+# is live (entry guards / regime gates added directly to SCORING_DEFAULTS,
+# not a scored version bump) — used by _diagnose_version_gap to check
+# whether a version's underperformance predates a fix that would already
+# stop the same trades from happening today. Append here whenever a new
+# safeguard like this ships; nothing else needs to change for the
+# diagnostic to pick it up. (Ported from stock-analysis; dates below are
+# when each safeguard shipped there — this repo just got them.)
+SAFEGUARD_LOG = [
+    {"addedAt": "2026-09-17", "description": "FOMC blackout gate — blocks new buys within fomcBlackoutDays of a scheduled Fed decision"},
+    {"addedAt": "2026-09-17", "description": "Already-down-today entry guard — refuses to buy a ticker already deep into a bad day"},
+    {"addedAt": "2026-09-17", "description": "Overextension penalty — dampens Accelerating + RSI≥75 + 30d change≥25% picks"},
+    {"addedAt": "2026-09-17", "description": "Fed Funds Rate hike trigger added to the macro risk-off gate"},
+]
+
+
+def _diagnose_version_gap(version, outcomes):
+    """Best-effort automated diagnosis of WHY a version's return looks bad —
+    the same kind of investigation a human should do before trusting a
+    rollback signal: is the underperformance a broad, structural pattern
+    across the whole sample, or a correlated cluster of losses from a
+    narrow window (a known event, a bug since fixed) that isn't actually
+    evidence against the version's scoring logic itself? Attached to the
+    rollback proposal so every proposal carries its own "why", not just a
+    bottom-line number.
+
+    Trades are attributed to `version` the same way _version_asset_stats
+    does — by sellRecVersion (who was live when the position closed), not
+    who originally bought it."""
+    v_outs = [o for o in outcomes if o.get("sellRecVersion", o.get("recVersion", 1)) == version]
+    losers = [o for o in v_outs if (o.get("gainLossPct") or 0) <= 0 and o.get("sellDate")]
+    if len(losers) < 2:
+        return None  # not enough losing trades to look for a pattern
+    losers.sort(key=lambda o: o["sellDate"])
+    total_loss_pct = sum(o.get("gainLossPct") or 0 for o in losers)  # negative
+    if total_loss_pct >= 0:
+        return None
+
+    # ── Loss-cluster detection: shortest contiguous date window whose
+    # losing trades account for >=60% of this version's total loss. ──
+    dates = sorted({o["sellDate"][:10] for o in losers})
+    best = None
+    for i in range(len(dates)):
+        for j in range(i, len(dates)):
+            window = set(dates[i:j + 1])
+            w_losers = [o for o in losers if o["sellDate"][:10] in window]
+            w_loss = sum(o.get("gainLossPct") or 0 for o in w_losers)
+            if w_loss <= total_loss_pct * 0.6:  # both negative — captures 60%+ of the loss
+                span = (datetime.strptime(dates[j], "%Y-%m-%d") - datetime.strptime(dates[i], "%Y-%m-%d")).days + 1
+                if best is None or span < best["spanDays"] or (span == best["spanDays"] and len(w_losers) > len(best["trades"])):
+                    best = {"start": dates[i], "end": dates[j], "spanDays": span,
+                            "trades": w_losers, "lossPct": round(w_loss, 2)}
+                break  # smallest j for this i that clears the bar; larger j only widens the window
+    if not best:
+        return None
+
+    cluster = best["trades"]
+    cluster_tickers = [o["ticker"] for o in cluster]
+    share_of_total_loss = round(best["lossPct"] / total_loss_pct * 100, 1)
+
+    # ── Idiosyncratic vs. broad-market: did SPY actually fall too? ──
+    spy_vals = [o.get("spyReturnPct") for o in cluster if o.get("spyReturnPct") is not None]
+    own_vals = [o.get("gainLossPct") for o in cluster if o.get("gainLossPct") is not None]
+    cluster_spy_avg = round(sum(spy_vals) / len(spy_vals), 2) if spy_vals else None
+    cluster_own_avg = round(sum(own_vals) / len(own_vals), 2) if own_vals else None
+    idiosyncratic = (cluster_spy_avg is not None and cluster_own_avg is not None
+                      and abs(cluster_spy_avg) < abs(cluster_own_avg) * 0.3)
+
+    # ── FOMC proximity — only meaningful for dates on/after the earliest
+    # entry in FOMC_MEETING_DATES; older trades simply can't be checked. ──
+    fomc_near = 0
+    for o in cluster:
+        buy_date_str = (o.get("buyDate") or "")[:10]
+        if not buy_date_str:
+            continue
+        try:
+            bd = datetime.strptime(buy_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        for fd_str in FOMC_MEETING_DATES:
+            fd = datetime.strptime(fd_str, "%Y-%m-%d").date()
+            if abs((fd - bd).days) <= 2:
+                fomc_near += 1
+                break
+
+    # ── Shared factor overrepresentation: Accelerating trajectory, high
+    # composite — cheap signal for "these were all the same kind of pick." ──
+    rest = [o for o in v_outs if o not in cluster]
+    def _traj_share(rows):
+        tagged = [o for o in rows if (o.get("factors") or {}).get("trajectory")]
+        if not tagged:
+            return None
+        return round(sum(1 for o in tagged if o["factors"]["trajectory"] == "Accelerating") / len(tagged) * 100, 0)
+    cluster_accel_pct = _traj_share(cluster)
+    rest_accel_pct = _traj_share(rest)
+
+    # ── Safeguards shipped since — does a fix already exist for this? ──
+    relevant_safeguards = []
+    for sg in SAFEGUARD_LOG:
+        added = sg["addedAt"]
+        predates = sum(1 for o in cluster if (o.get("buyDate") or "")[:10] < added)
+        if predates:
+            relevant_safeguards.append({**sg, "clusterTradesBeforeIt": predates})
+
+    lines = [
+        f"{share_of_total_loss}% of v{version}'s total loss came from {len(cluster)} trade(s) "
+        f"between {best['start']} and {best['end']} ({', '.join(cluster_tickers)})."
+    ]
+    if idiosyncratic:
+        lines.append(f"SPY averaged {cluster_spy_avg:+}% on those trades' sell dates while these lost {cluster_own_avg:+}% on average — "
+                      f"idiosyncratic to these picks, not a broad market selloff.")
+    elif cluster_spy_avg is not None:
+        lines.append(f"SPY also averaged {cluster_spy_avg:+}% on those dates — part of a broader market move, not isolated to these picks.")
+    if fomc_near:
+        lines.append(f"{fomc_near}/{len(cluster)} of those trades were bought within 2 days of a scheduled FOMC decision.")
+    if cluster_accel_pct is not None and rest_accel_pct is not None and cluster_accel_pct > rest_accel_pct:
+        lines.append(f"{cluster_accel_pct:.0f}% of the cluster's trades were 'Accelerating' trajectory at buy time, vs {rest_accel_pct:.0f}% for this version's other trades.")
+    if relevant_safeguards:
+        lines.append("Since then, safeguards have shipped that would apply to new trades like these: " +
+                      "; ".join(f"{sg['description']} (added {sg['addedAt']}, predates {sg['clusterTradesBeforeIt']} of these trades)" for sg in relevant_safeguards) + ".")
+
+    return {
+        "clusterStart": best["start"], "clusterEnd": best["end"], "clusterSpanDays": best["spanDays"],
+        "clusterTickers": cluster_tickers, "clusterN": len(cluster), "clusterLossPct": best["lossPct"],
+        "shareOfTotalLossPct": share_of_total_loss,
+        "clusterSpyAvgPct": cluster_spy_avg, "clusterOwnAvgPct": cluster_own_avg, "idiosyncratic": idiosyncratic,
+        "fomcNearCount": fomc_near,
+        "clusterAcceleratingPct": cluster_accel_pct, "restAcceleratingPct": rest_accel_pct,
+        "safeguardsSince": relevant_safeguards,
+        "summary": " ".join(lines),
+    }
+
 
 def _check_rollback_candidate(sl_cfg, holdings=None, live_prices=None):
     """Champion/challenger check: once the current version has enough total
@@ -713,6 +844,13 @@ def _check_rollback_candidate(sl_cfg, holdings=None, live_prices=None):
     if already_pending:
         return existing_proposal
 
+    outcomes = load_json(TRADE_OUTCOMES_PATH, {"outcomes": []}).get("outcomes", [])
+    diagnostics = None
+    try:
+        diagnostics = _diagnose_version_gap(cur["version"], outcomes)
+    except Exception as de:
+        log.warning(f"[SelfLearning] diagnostics FAIL for v{cur['version']}: {de}")
+
     proposal = {
         "status": "pending",
         "currentVersion": cur["version"], "currentLabel": cur.get("label"),
@@ -721,6 +859,7 @@ def _check_rollback_candidate(sl_cfg, holdings=None, live_prices=None):
         "championReturnPct": champ_s["totalReturnPct"], "championN": champ_s["totalN"],
         "gapPct": round(gap, 2), "thresholdPct": thresh,
         "detectedAt": ts(),
+        "diagnostics": diagnostics,
     }
     save_json(ROLLBACK_PROPOSAL_PATH, proposal)
     log.warning(f"[SelfLearning] ROLLBACK PROPOSED: v{cur['version']} ({cur_s['totalReturnPct']}%) vs "
@@ -1880,7 +2019,31 @@ SCORING_DEFAULTS = {
         "macroRiskGateEnabled": True,
         "trendFilterEnabled": True,
         "trendFilterTicker": "SPY",
-        "trendFilterDays": 200
+        "trendFilterDays": 200,
+        # A scheduled FOMC decision moves high-beta/extended names before it
+        # ever shows up as a VIX spike or a realized rate change — the other
+        # gates are all backward-looking, this one is the only
+        # forward-looking one. Blocks new buys for N days up to and
+        # including the decision day itself (see fetcher.FOMC_MEETING_DATES).
+        "fomcBlackoutEnabled": True,
+        "fomcBlackoutDays": 1
+    },
+    # Cross-bucket dampener: a stock that's already run up hard and is
+    # scored "Accelerating" is exactly the extended, high-beta profile that
+    # gets hit hardest in a risk-off wobble — nothing previously penalized
+    # "already extended," only the Reversal bucket rewarded "oversold."
+    "overextension": {
+        "rsiThreshold": 75,
+        "change30dThreshold": 25.0,
+        "penalty": -15
+    },
+    # Qualify-stage guard: refuse to buy a ticker that's already deep into
+    # a bad day — buying at, say, -7% intraday just to get stopped out by
+    # the daily-drop stop an hour later wastes the buy+sell slippage for a
+    # position that never had a chance. Expressed as a fraction of
+    # sellThresholds.dailyDropStop so it scales with that setting.
+    "entryGuards": {
+        "maxAlreadyDownPctOfDailyDropStop": 0.5
     },
     "selfLearning": {
         "autoRollback": True,
@@ -2665,6 +2828,8 @@ def run_tradeai_recommend():
         REGIME_CFG      = cfg.get("regime", {})
         BKT_SC          = cfg.get("breakoutScore", {})
         SD_PENALTY      = cfg.get("sectorDiversity", {}).get("penalty", -15)
+        OVEREXT_CFG     = cfg.get("overextension", {})
+        ENTRY_GUARDS    = cfg.get("entryGuards", {})
         pm              = cfg.get("purchaseMatrix", {})
         max_slots       = int(pm.get("slots", 5))
         identify_rules  = cfg.get("identifyRules", {})
@@ -2705,8 +2870,10 @@ def run_tradeai_recommend():
         if missing_live:
             log.warning(f"TradeAI recommend: no live price for {missing_live} — cached prices will NOT be used for trades")
 
-        # Yesterday's closes for held tickers — powers the daily-drop stop
-        prev_closes = fetch_prev_closes(list(holdings.keys())) if holdings else {}
+        # Yesterday's closes — powers the daily-drop stop for holdings, and
+        # the already-down-today entry guard for buy candidates below.
+        prev_close_tickers = list({*holdings.keys(), *[item["ticker"] for item in scoring_pool]})
+        prev_closes = fetch_prev_closes(prev_close_tickers) if prev_close_tickers else {}
 
         scored = []
         for item in scoring_pool:
@@ -2787,8 +2954,22 @@ def run_tradeai_recommend():
             insider_bonus = (SH.get("insiderNetBuy", 5) if insider_net_status == "Net Buyer"
                              else (SH.get("insiderNetSell", -3) if insider_net_status == "Net Seller" else 0))
 
+            # ── Overextension penalty (all buckets) — Accelerating + deeply
+            # overbought + already run up hard is the exact profile that gets
+            # hit hardest in a risk-off wobble. Only fires alongside
+            # Accelerating so it doesn't punish a stock merely having a good
+            # month — specifically "extended AND still scored like it has
+            # more room to run." (Ported from stock-analysis.)
+            change_30d = detail.get("change30d") or 0
+            overextension_penalty = 0
+            if (trajectory == "Accelerating"
+                    and rsi >= OVEREXT_CFG.get("rsiThreshold", 75)
+                    and change_30d >= OVEREXT_CFG.get("change30dThreshold", 25.0)):
+                overextension_penalty = OVEREXT_CFG.get("penalty", -15)
+                log.info(f"[Overextension] {ticker} RSI:{rsi} change30d:{change_30d}% Accelerating → {overextension_penalty} pts")
+
             # ── Breakout score + sector penalty (all buckets) ─────────────────
-            composite = composite + breakout_score + sector_penalty + insider_bonus
+            composite = composite + breakout_score + sector_penalty + insider_bonus + overextension_penalty
 
             # ── Signal Forecast Boost ─────────────────────────────────────────
             signal_boost = 0
@@ -2820,6 +3001,7 @@ def run_tradeai_recommend():
                 f"traj:{trajectory_bonus} stage:{stage_bonus} "
                 f"vol:{volume_bonus} analyst:{analyst_bonus} news:{news_bonus} "
                 f"breakout:{breakout_score} sector_pen:{sector_penalty} insider:{insider_bonus} "
+                f"overext:{overextension_penalty} "
                 f"fc_dir:{signal_fc_direction} fc_return:{signal_fc_return}% fc_boost:{signal_boost} "
                 f"composite:{composite}"
             )
@@ -2837,6 +3019,7 @@ def run_tradeai_recommend():
                 "reasoning": ai.get("reasoning", ""),
                 "breakoutScore": breakout_score,
                 "sectorPenalty": sector_penalty,
+                "overextensionPenalty": overextension_penalty,
                 "composite": composite,
                 "hasAI": ai.get("aiScore") is not None,
                 "signalFcDirection": signal_fc_direction,
@@ -3043,6 +3226,20 @@ def run_tradeai_recommend():
                 log.warning(f"TradeAI QUALIFY skip (no live price): {ticker} — refusing to buy on cached price")
                 skip_reasons.append({"ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"), "reason": "No live price — cached data only"})
                 continue
+            # Already-down-today guard: refuse to buy a ticker that's deep
+            # into a bad day already — buying at e.g. -7% intraday just to
+            # get stopped out by the daily-drop stop an hour later wastes
+            # the buy+sell slippage on a position that never had a chance.
+            # (Ported from stock-analysis.)
+            prev_close = prev_closes.get(ticker)
+            if prev_close and price:
+                already_down_pct = (prev_close - price) / prev_close * 100
+                guard_pct = SELL_CFG.get("dailyDropStop", 8.0) * ENTRY_GUARDS.get("maxAlreadyDownPctOfDailyDropStop", 0.5)
+                if already_down_pct >= guard_pct:
+                    log.info(f"TradeAI QUALIFY skip (already down {already_down_pct:.1f}% today): {ticker}")
+                    skip_reasons.append({"ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"),
+                                          "reason": f"Already down {already_down_pct:.1f}% vs yesterday's close ${prev_close:.2f} — too close to the daily-drop stop to buy into"})
+                    continue
             # Earnings blackout: buying right before earnings is a coin flip on the gap
             blackout_days = int(pm.get("earningsBlackoutDays", 3))
             e_date_str = details.get(ticker, {}).get("earningsDate")
@@ -3100,6 +3297,27 @@ def run_tradeai_recommend():
                     log.warning(f"TradeAI REGIME GATE: trend filter ({reason_str}) — no new buys this run (sells unaffected)")
                     skip_reasons.append({"ticker": "*", "reason": f"Trend filter: {reason_str} — regime gate blocked all new buys"})
                     qualified = []
+                elif bool(REGIME_CFG.get("fomcBlackoutEnabled", True)):
+                    # FOMC blackout gate: same additive pattern as the three
+                    # above, only evaluated when none of them already
+                    # blocked buys. The other gates are all backward-looking
+                    # (a rate hike that already happened, inflation that
+                    # already reaccelerated, a VIX spike already underway) —
+                    # this is the only forward-looking one. A scheduled Fed
+                    # decision moves high-beta/extended names before it ever
+                    # shows up in those other signals. (Ported from
+                    # stock-analysis, where 5 of 6 closed trades lost 0.5-7%
+                    # on days SPY barely moved, 1-2 days before an FOMC
+                    # decision.)
+                    next_fomc = _next_fomc_date()
+                    if next_fomc:
+                        days_to_fomc = (datetime.strptime(next_fomc, "%Y-%m-%d").date() - datetime.now(TZ).date()).days
+                        blackout_days = int(REGIME_CFG.get("fomcBlackoutDays", 1))
+                        if 0 <= days_to_fomc <= blackout_days:
+                            reason_str = f"FOMC decision in {days_to_fomc} day(s) ({next_fomc})"
+                            log.warning(f"TradeAI REGIME GATE: FOMC blackout ({reason_str}) — no new buys this run (sells unaffected)")
+                            skip_reasons.append({"ticker": "*", "reason": f"FOMC blackout: {reason_str} — regime gate blocked all new buys"})
+                            qualified = []
 
         slots_to_fill = max(0, max_slots - held_count)
         qualified_sorted = sorted(qualified, key=lambda x: x.get("composite", 0), reverse=True)

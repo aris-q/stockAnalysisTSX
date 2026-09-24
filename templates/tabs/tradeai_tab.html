@@ -41,12 +41,42 @@ function buildRollbackBanner(proposal) {
   if (!proposal || proposal.status !== 'pending') return '';
   const upDown = v => v >= 0 ? 'var(--up)' : 'var(--down)';
   const signed = v => (v >= 0 ? '+' : '') + v + '%';
+  const diag = proposal.diagnostics;
+
+  // Auto-diagnosis: is the gap a broad, structural pattern across the whole
+  // sample, or a correlated cluster of losses from a narrow window (a known
+  // event, a bug since fixed)? Same investigation a human would do before
+  // trusting the number — attached so every proposal carries its own "why."
+  // (Ported from stock-analysis.)
+  let diagHtml = '';
+  if (diag && diag.summary) {
+    const tag = diag.idiosyncratic
+      ? '<span style="font-size:14px;padding:2px 8px;border-radius:4px;background:rgba(96,165,250,0.15);color:#60a5fa;font-weight:700">IDIOSYNCRATIC, NOT BROAD MARKET</span>'
+      : '';
+    const fomcTag = diag.fomcNearCount > 0
+      ? `<span style="font-size:14px;padding:2px 8px;border-radius:4px;background:rgba(251,191,36,0.15);color:#fbbf24;font-weight:700">${diag.fomcNearCount}/${diag.clusterN} NEAR FOMC</span>`
+      : '';
+    const safeguardsHtml = (diag.safeguardsSince || []).length
+      ? `<div style="margin-top:8px;padding:8px 10px;background:rgba(74,222,128,0.08);border:1px solid rgba(74,222,128,0.25);border-radius:6px;font-size:16px;color:var(--text)">
+          <b style="color:var(--up)">Since patched:</b> ${diag.safeguardsSince.map(s => `${s.description} <span style="color:var(--muted)">(added ${s.addedAt}, predates ${s.clusterTradesBeforeIt} of these trades)</span>`).join('<br>')}
+        </div>`
+      : '';
+    diagHtml = `<div style="margin-top:4px;margin-bottom:10px">
+      <button onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'block' : 'none'; this.textContent = this.textContent.startsWith('🔍') ? '▲ Hide why' : '🔍 Why?'" style="font-size:15px;padding:4px 10px;background:transparent;border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">🔍 Why?</button>
+      <div style="display:none;margin-top:8px;padding:10px 12px;background:rgba(0,0,0,0.15);border-radius:8px;font-size:16px;line-height:1.7">
+        <div style="margin-bottom:6px">${tag} ${fomcTag}</div>
+        <div style="color:var(--text)">${diag.summary}</div>
+        ${safeguardsHtml}
+      </div>
+    </div>`;
+  }
+
   return `<div id="rollbackBanner" style="border:1px solid var(--warn);border-radius:10px;padding:14px 16px;margin-bottom:16px;background:rgba(251,191,36,0.08)">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
       <span style="font-size:16px">⚠️</span>
-      <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:13px">ROLLBACK RECOMMENDED — your approval needed</span>
+      <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:18px">ROLLBACK RECOMMENDED — your approval needed</span>
     </div>
-    <div style="font-size:12px;color:var(--text);line-height:1.7;margin-bottom:10px">
+    <div style="font-size:17px;color:var(--text);line-height:1.7;margin-bottom:10px">
       Current <b style="color:var(--accent)">v${proposal.currentVersion}</b>${proposal.currentLabel ? ' (' + proposal.currentLabel + ')' : ''} is returning
       <b style="color:${upDown(proposal.currentReturnPct)}">${signed(proposal.currentReturnPct)}</b> on capital deployed over ${proposal.currentN} buys —
       champion <b style="color:#fbbf24">v${proposal.championVersion}</b>${proposal.championLabel ? ' (' + proposal.championLabel + ')' : ''} returned
@@ -54,9 +84,10 @@ function buildRollbackBanner(proposal) {
       a gap of <b style="color:var(--down)">${signed(proposal.gapPct)}</b>, past the ${proposal.thresholdPct}% threshold.
       <span style="color:var(--muted)">Detected ${proposal.detectedAt || ''}.</span>
     </div>
+    ${diagHtml}
     <div style="display:flex;gap:10px;flex-wrap:wrap">
-      <button onclick="approveRollback(this)" style="font-size:11px;padding:7px 16px;background:var(--warn);border:none;border-radius:6px;color:#1a1400;cursor:pointer;font-family:'DM Mono',monospace;font-weight:700">✅ APPROVE ROLLBACK TO v${proposal.championVersion}</button>
-      <button onclick="dismissRollback(this)" style="font-size:11px;padding:7px 16px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">DISMISS</button>
+      <button onclick="approveRollback(this)" style="font-size:16px;padding:7px 16px;background:var(--warn);border:none;border-radius:6px;color:#1a1400;cursor:pointer;font-family:'DM Mono',monospace;font-weight:700">✅ APPROVE ROLLBACK TO v${proposal.championVersion}</button>
+      <button onclick="dismissRollback(this)" style="font-size:16px;padding:7px 16px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">DISMISS</button>
     </div>
   </div>`;
 }
@@ -74,21 +105,21 @@ function buildTuningBanner(proposal) {
   return `<div id="tuningBanner" style="border:1px solid #60a5fa;border-radius:10px;padding:14px 16px;margin-bottom:16px;background:rgba(96,165,250,0.08)">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
       <span style="font-size:16px">🎯</span>
-      <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:13px">CONFIG TUNING PROPOSED — your approval needed</span>
+      <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:18px">CONFIG TUNING PROPOSED — your approval needed</span>
     </div>
-    <div style="font-size:12px;color:var(--text);line-height:1.7;margin-bottom:8px">
+    <div style="font-size:17px;color:var(--text);line-height:1.7;margin-bottom:8px">
       Change: <b style="color:#60a5fa">${keyName}</b>: <b>${c.from}</b> → <b>${c.to}</b>
     </div>
-    <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:8px">${proposal.reason || ''}</div>
-    <div style="font-size:11px;color:var(--text);line-height:1.7;margin-bottom:10px;padding:8px 10px;background:rgba(0,0,0,0.15);border-radius:6px">
+    <div style="font-size:17px;color:var(--muted);line-height:1.6;margin-bottom:8px">${proposal.reason || ''}</div>
+    <div style="font-size:16px;color:var(--text);line-height:1.7;margin-bottom:10px;padding:8px 10px;background:rgba(0,0,0,0.15);border-radius:6px">
       <b>Historical backtest</b> (last ${proposal.windowDays} days, ${proposal.missedGainersAnalyzed} missed ${proposal.gainThresholdPct}%+ gainers, ${proposal.boughtRowsAnalyzed} bought rows analyzed):
       would have caught <b style="color:var(--up)">${f.historicalMissedGainersWouldHaveCaught}/${f.historicalMissedGainersTotal}</b> missed gainers,
       would have excluded <b style="color:${f.currentPicksWouldHaveExcluded > 0 ? 'var(--down)' : 'var(--up)'}">${f.currentPicksWouldHaveExcluded}</b> of what was actually bought.
       <span style="color:var(--muted)">This is a candidate-pool count from real history, not a P&amp;L forecast — treat it as directional evidence.</span>
     </div>
     <div style="display:flex;gap:10px;flex-wrap:wrap">
-      <button onclick="approveTuning(this)" style="font-size:11px;padding:7px 16px;background:#60a5fa;border:none;border-radius:6px;color:#0a1420;cursor:pointer;font-family:'DM Mono',monospace;font-weight:700">✅ APPROVE CHANGE</button>
-      <button onclick="dismissTuning(this)" style="font-size:11px;padding:7px 16px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">DISMISS</button>
+      <button onclick="approveTuning(this)" style="font-size:16px;padding:7px 16px;background:#60a5fa;border:none;border-radius:6px;color:#0a1420;cursor:pointer;font-family:'DM Mono',monospace;font-weight:700">✅ APPROVE CHANGE</button>
+      <button onclick="dismissTuning(this)" style="font-size:16px;padding:7px 16px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">DISMISS</button>
     </div>
   </div>`;
 }
@@ -164,15 +195,15 @@ function _newsWarningCard(w) {
   return `<div style="border:1px solid var(--down);border-radius:10px;padding:14px 16px;margin-bottom:12px;background:rgba(248,113,113,0.06)">
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
       <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:15px;color:var(--down)">${w.ticker}</span>
-      <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(248,113,113,0.2);color:var(--down);font-weight:700;text-transform:uppercase">${w.keyword}</span>
-      <span style="font-size:10px;color:var(--muted);margin-left:auto">${w.detectedAt || ''}</span>
+      <span style="font-size:15px;padding:2px 8px;border-radius:4px;background:rgba(248,113,113,0.2);color:var(--down);font-weight:700;text-transform:uppercase">${w.keyword}</span>
+      <span style="font-size:15px;color:var(--muted);margin-left:auto">${w.detectedAt || ''}</span>
     </div>
-    <div style="font-size:13px;color:var(--text);line-height:1.5;margin-bottom:8px">${(w.headline||'').replace(/</g,'&lt;')}</div>
-    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">${w.provider || 'Unknown source'}${w.pubDate ? ' · ' + w.pubDate : ''}</div>
+    <div style="font-size:18px;color:var(--text);line-height:1.5;margin-bottom:8px">${(w.headline||'').replace(/</g,'&lt;')}</div>
+    <div style="font-size:16px;color:var(--muted);margin-bottom:10px">${w.provider || 'Unknown source'}${w.pubDate ? ' · ' + w.pubDate : ''}</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
-      ${w.url ? `<a href="${w.url}" target="_blank" rel="noopener" style="font-size:11px;padding:6px 14px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--text);text-decoration:none;font-family:'DM Mono',monospace">READ ARTICLE ↗</a>` : ''}
-      <button onclick="forceSellFromWarning('${tickerSafe}')" style="font-size:11px;padding:6px 14px;background:transparent;border:1px solid var(--down);border-radius:6px;color:var(--down);cursor:pointer;font-family:'DM Mono',monospace">SELL NOW</button>
-      <button onclick="dismissNewsWarningUI('${tickerSafe}', this)" style="font-size:11px;padding:6px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace;margin-left:auto">ACKNOWLEDGE — KEEP HOLDING</button>
+      ${w.url ? `<a href="${w.url}" target="_blank" rel="noopener" style="font-size:16px;padding:6px 14px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--text);text-decoration:none;font-family:'DM Mono',monospace">READ ARTICLE ↗</a>` : ''}
+      <button onclick="forceSellFromWarning('${tickerSafe}')" style="font-size:16px;padding:6px 14px;background:transparent;border:1px solid var(--down);border-radius:6px;color:var(--down);cursor:pointer;font-family:'DM Mono',monospace">SELL NOW</button>
+      <button onclick="dismissNewsWarningUI('${tickerSafe}', this)" style="font-size:16px;padding:6px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace;margin-left:auto">ACKNOWLEDGE — KEEP HOLDING</button>
     </div>
   </div>`;
 }
@@ -331,13 +362,13 @@ function renderTrade(data) {
         <div class="trade-candidate-row" onclick="toggleTradeDetail('td-${i}')">
           <div>
             <div class="trade-candidate-ticker">${item.ticker}</div>
-            ${hasDetail ? `<div style="font-size:10px;color:var(--accent);margin-top:2px">● data loaded</div>` : ''}
+            ${hasDetail ? `<div style="font-size:15px;color:var(--accent);margin-top:2px">● data loaded</div>` : ''}
           </div>
           <div class="trade-candidate-reason">${item.reason || '—'}</div>
           <span class="trade-candidate-source">${item.source || ''}</span>
         </div>
         <div class="trade-detail-expand" id="td-${i}">
-          ${hasDetail ? renderTradeDetailExpand(d) : '<div style="color:var(--muted);font-size:11px">No detail fetched yet. Run Fetch Info.</div>'}
+          ${hasDetail ? renderTradeDetailExpand(d) : '<div style="color:var(--muted);font-size:16px">No detail fetched yet. Run Fetch Info.</div>'}
         </div>`;
       }).join('') + `</div>`;
 
@@ -355,7 +386,7 @@ function renderTrade(data) {
         <div class="trade-section-sub">Current holdings & performance</div>
       </div>
       <div style="display:flex;align-items:center;gap:10px">
-        <select id="txnMonthSelect" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:5px 10px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px">
+        <select id="txnMonthSelect" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:5px 10px;color:var(--text);font-family:'DM Mono',monospace;font-size:16px">
           <option value="">— Month —</option>
           ${monthOptions}
         </select>
@@ -372,15 +403,15 @@ function renderTrade(data) {
     </div>
     <div class="trade-summary-bar">
       <div>
-        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">CASH BALANCE</div>
+        <div style="font-size:15px;color:var(--muted);margin-bottom:2px">CASH BALANCE</div>
         <div class="trade-balance-big">${fmt$(balance)}</div>
       </div>
       <div style="text-align:center">
-        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">PORTFOLIO VALUE</div>
+        <div style="font-size:15px;color:var(--muted);margin-bottom:2px">PORTFOLIO VALUE</div>
         <div class="trade-balance-big">${fmt$(totalValue)}</div>
       </div>
       <div style="text-align:right">
-        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">TOTAL P&L</div>
+        <div style="font-size:15px;color:var(--muted);margin-bottom:2px">TOTAL P&L</div>
         <div class="trade-balance-big ${glClass}">${fmt$(totalGL)}</div>
       </div>
     </div>
@@ -459,9 +490,9 @@ function renderTradeDetailExpand(d) {
       <div class="tdm-value">${val}</div>
     </div>`).join('');
   return `
-    <div style="font-size:11px;color:var(--muted);margin-bottom:8px">${d.name || ''} · ${d.sector || ''} · ${d.industry || ''}</div>
+    <div style="font-size:16px;color:var(--muted);margin-bottom:8px">${d.name || ''} · ${d.sector || ''} · ${d.industry || ''}</div>
     <div class="trade-detail-grid" style="grid-template-columns:repeat(6,1fr)">${grid}</div>
-    ${d.description ? `<div style="font-size:11px;color:var(--muted);font-style:italic;margin-top:8px;line-height:1.5">${d.description}</div>` : ''}
+    ${d.description ? `<div style="font-size:16px;color:var(--muted);font-style:italic;margin-top:8px;line-height:1.5">${d.description}</div>` : ''}
   `;
 }
 
@@ -471,27 +502,27 @@ function renderTradeRecommend(rec) {
   const scored = rec.scored || [];
 
   const buyCards = buys.length === 0
-    ? `<div style="color:var(--muted);font-size:11px">No buys executed.</div>`
+    ? `<div style="color:var(--muted);font-size:16px">No buys executed.</div>`
     : buys.map(b => `
       <div class="trade-recommend-card buy">
         <div style="display:flex;align-items:center;margin-bottom:6px">
           <span class="trade-action-badge buy">BUY</span>
           <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:16px">${b.ticker}</span>
         </div>
-        <div style="font-size:12px;color:var(--muted)">${b.shares} shares @ ${fmt$(b.price)} · Cost: ${fmt$(b.amount)} · Balance after: ${fmt$(b.balance)}</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:4px">${b.reason}</div>
+        <div style="font-size:17px;color:var(--muted)">${b.shares} shares @ ${fmt$(b.price)} · Cost: ${fmt$(b.amount)} · Balance after: ${fmt$(b.balance)}</div>
+        <div style="font-size:16px;color:var(--muted);margin-top:4px">${b.reason}</div>
       </div>`).join('');
 
   const sellCards = sells.length === 0
-    ? `<div style="color:var(--muted);font-size:11px">No sells executed.</div>`
+    ? `<div style="color:var(--muted);font-size:16px">No sells executed.</div>`
     : sells.map(s => `
       <div class="trade-recommend-card sell">
         <div style="display:flex;align-items:center;margin-bottom:6px">
           <span class="trade-action-badge sell">SELL</span>
           <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:16px">${s.ticker}</span>
         </div>
-        <div style="font-size:12px;color:var(--muted)">${s.shares} shares @ ${fmt$(s.price)} · Proceeds: ${fmt$(s.amount)} · Balance after: ${fmt$(s.balance)}</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:4px">${s.reason}</div>
+        <div style="font-size:17px;color:var(--muted)">${s.shares} shares @ ${fmt$(s.price)} · Proceeds: ${fmt$(s.amount)} · Balance after: ${fmt$(s.balance)}</div>
+        <div style="font-size:16px;color:var(--muted);margin-top:4px">${s.reason}</div>
       </div>`).join('');
 
   const scoreRows = scored.map((s, i) => `
@@ -507,15 +538,15 @@ function renderTradeRecommend(rec) {
   return `
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
       <div>
-        <div style="font-size:10px;letter-spacing:1px;color:var(--up);margin-bottom:10px">BUYS EXECUTED</div>
+        <div style="font-size:15px;letter-spacing:1px;color:var(--up);margin-bottom:10px">BUYS EXECUTED</div>
         ${buyCards}
       </div>
       <div>
-        <div style="font-size:10px;letter-spacing:1px;color:var(--down);margin-bottom:10px">SELLS EXECUTED</div>
+        <div style="font-size:15px;letter-spacing:1px;color:var(--down);margin-bottom:10px">SELLS EXECUTED</div>
         ${sellCards}
       </div>
     </div>
-    <div style="font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:10px">COMPOSITE SCORES</div>
+    <div style="font-size:15px;letter-spacing:1px;color:var(--muted);margin-bottom:10px">COMPOSITE SCORES</div>
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden">
       <table class="trade-txn-table">
         <thead><tr><th>#</th><th>TICKER</th><th>DREAM</th><th>TECH</th><th>COMPOSITE</th><th>STATUS</th></tr></thead>
@@ -699,10 +730,10 @@ async function toggleScoringMatrix() {
     const pm = cfg.purchaseMatrix || {};
     const sell = cfg.sellThresholds || {};
     const weights = cfg.bucketWeights || {};
-    const input = 'background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:5px 7px;color:var(--text);font-family:\'DM Mono\',monospace;font-size:11px;width:70px';
-    const field = (id, label, value) => `<label style="display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:11px;color:var(--muted)">${label}<input id="${id}" value="${value ?? ''}" style="${input}"></label>`;
+    const input = 'background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:5px 7px;color:var(--text);font-family:\'DM Mono\',monospace;font-size:16px;width:70px';
+    const field = (id, label, value) => `<label style="display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:16px;color:var(--muted)">${label}<input id="${id}" value="${value ?? ''}" style="${input}"></label>`;
     body.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:18px">
-      <div><div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">BUY RULES</div>
+      <div><div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">BUY RULES</div>
         ${field('matrixMinBuy', 'Minimum composite', pm.minBuyComposite ?? 60)}
         ${field('matrixSlots', 'Maximum positions', pm.slots ?? 6)}
         ${field('matrixDeploy', 'Deploy balance %', pm.maxDeployPct ?? 100)}
@@ -710,7 +741,7 @@ async function toggleScoringMatrix() {
         ${field('matrixRotationGap', 'Rotation score advantage', pm.rotationMinScoreGap ?? 15)}
         ${field('matrixRotationCooldown', 'Re-entry cooldown (trading days)', pm.rotationCooldownTradingDays ?? 5)}
       </div>
-      <div><div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">BUCKET WEIGHTS</div>
+      <div><div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">BUCKET WEIGHTS</div>
         ${field('matrixMomentumDream', 'Momentum Dream', weights.Momentum?.dream ?? .15)}
         ${field('matrixMomentumRule', 'Momentum rule', weights.Momentum?.ai ?? .65)}
         ${field('matrixReversalDream', 'Reversal Dream', weights.Reversal?.dream ?? .15)}
@@ -718,7 +749,7 @@ async function toggleScoringMatrix() {
         ${field('matrixSmartDream', 'Smart Money Dream', weights.SmartMoney?.dream ?? .3)}
         ${field('matrixSmartRule', 'Smart Money rule', weights.SmartMoney?.ai ?? .55)}
       </div>
-      <div><div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">SELL RULES</div>
+      <div><div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">SELL RULES</div>
         ${field('matrixHardStop', 'Hard stop ceiling % (ATR-based below this)', sell.stopLossHard ?? 10)}
         ${field('matrixAtrMult', 'ATR stop multiplier', sell.atrStopMultiplier ?? 2)}
         ${field('matrixDailyStop', 'Daily-drop stop %', sell.dailyDropStop ?? 8)}
@@ -729,11 +760,11 @@ async function toggleScoringMatrix() {
       </div>
     </div><div style="display:flex;align-items:center;gap:10px;margin-top:16px;flex-wrap:wrap">
       <button class="btn btn-primary" onclick="saveScoringMatrix()">SAVE MATRIX</button>
-      <span id="matrixSaveStatus" style="font-size:10px;color:var(--muted)"></span>
+      <span id="matrixSaveStatus" style="font-size:15px;color:var(--muted)"></span>
     </div>`;
     body.dataset.loaded = '1';
   } catch (e) {
-    body.innerHTML = '<div style="color:var(--down);font-size:11px">Unable to load scoring config.</div>';
+    body.innerHTML = '<div style="color:var(--down);font-size:16px">Unable to load scoring config.</div>';
     console.error('[ScoringMatrix] load FAIL:', e);
   }
 }
@@ -813,7 +844,7 @@ function renderTradeAI(data) {
     const cls = pct == null ? 'var(--muted)' : (pct >= 0 ? 'var(--up)' : 'var(--down)');
     const txt = pct == null ? '—' : (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
     return `<div style="text-align:center">
-      <div style="font-size:10px;color:var(--muted);margin-bottom:2px">${label}</div>
+      <div style="font-size:15px;color:var(--muted);margin-bottom:2px">${label}</div>
       <div class="trade-balance-big" style="color:${cls}">${txt}</div>
     </div>`;
   }
@@ -830,21 +861,21 @@ function renderTradeAI(data) {
     ? macroSignal.reasons.join('; ')
     : 'No notable macro signal — click to view Macro tab').replace(/"/g, '&quot;');
   const macroBadge = `
-    <button onclick="goToMacroTab()" title="${macroBadgeTitle}" style="display:flex;align-items:center;gap:5px;font-size:10px;font-weight:700;padding:5px 10px;border-radius:6px;border:1px solid ${macroBadgeStyle.c};background:${macroBadgeStyle.bg};color:${macroBadgeStyle.c};cursor:pointer;font-family:'DM Mono',monospace;white-space:nowrap">
+    <button onclick="goToMacroTab()" title="${macroBadgeTitle}" style="display:flex;align-items:center;gap:5px;font-size:15px;font-weight:700;padding:5px 10px;border-radius:6px;border:1px solid ${macroBadgeStyle.c};background:${macroBadgeStyle.bg};color:${macroBadgeStyle.c};cursor:pointer;font-family:'DM Mono',monospace;white-space:nowrap">
       ${macroBadgeStyle.icon} MACRO: ${macroBadgeStyle.label} ▸
     </button>`;
 
   const benchmarkStrip = `
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:12px;display:flex;gap:24px;align-items:center">
-      <div style="font-size:10px;color:var(--muted);letter-spacing:0.5px">TODAY VS MARKET</div>
+      <div style="font-size:15px;color:var(--muted);letter-spacing:0.5px">TODAY VS MARKET</div>
       <div style="text-align:center">
-        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">YOUR ACCOUNT</div>
+        <div style="font-size:15px;color:var(--muted);margin-bottom:2px">YOUR ACCOUNT</div>
         <div class="trade-balance-big" style="color:${acctCls}">${acctTxt}</div>
       </div>
       ${bmTile('TSX Composite', bm.TSX)}
       ${bmTile('TSX 60', bm.TSX60)}
       ${macroBadge}
-      <div style="font-size:10px;color:var(--muted);margin-left:auto">${bm.TSX && bm.TSX.fetchedAt ? 'as of ' + bm.TSX.fetchedAt : 'not yet refreshed — click REFRESH PRICES'}</div>
+      <div style="font-size:15px;color:var(--muted);margin-left:auto">${bm.TSX && bm.TSX.fetchedAt ? 'as of ' + bm.TSX.fetchedAt : 'not yet refreshed — click REFRESH PRICES'}</div>
     </div>`;
 
   // ── SEVERE NEWS WARNING BANNER — flags only, never sells automatically ──
@@ -852,12 +883,12 @@ function renderTradeAI(data) {
     <div id="newsWarningBanner" style="border:1px solid var(--down);border-radius:10px;padding:14px 16px;margin-bottom:12px;background:rgba(248,113,113,0.1);animation:newsWarnPulse 2s ease-in-out infinite">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:${activeWarnings.length ? '10px' : '0'}">
         <span style="font-size:18px">🚨</span>
-        <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:13px;color:var(--down)">SEVERE NEWS DETECTED — ${activeWarnings.length} holding${activeWarnings.length===1?'':'s'} flagged</span>
-        <span style="font-size:11px;color:var(--muted)">Flagged for your review only — nothing is sold automatically.</span>
+        <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:18px;color:var(--down)">SEVERE NEWS DETECTED — ${activeWarnings.length} holding${activeWarnings.length===1?'':'s'} flagged</span>
+        <span style="font-size:16px;color:var(--muted)">Flagged for your review only — nothing is sold automatically.</span>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         ${activeWarnings.map(([tk, w]) => `
-          <button onclick="openNewsWarningDetail('${tk}')" style="display:flex;align-items:center;gap:6px;font-size:11px;padding:6px 12px;background:rgba(248,113,113,0.15);border:1px solid var(--down);border-radius:6px;color:var(--text);cursor:pointer;font-family:'DM Mono',monospace">
+          <button onclick="openNewsWarningDetail('${tk}')" style="display:flex;align-items:center;gap:6px;font-size:16px;padding:6px 12px;background:rgba(248,113,113,0.15);border:1px solid var(--down);border-radius:6px;color:var(--text);cursor:pointer;font-family:'DM Mono',monospace">
             <b style="color:var(--down)">${tk}</b><span style="color:var(--muted)">${w.keyword}</span><span style="color:var(--down)">▸</span>
           </button>`).join('')}
       </div>
@@ -874,22 +905,22 @@ function renderTradeAI(data) {
         function dayPct(val) {
           if (val == null) return '<td style="color:var(--muted);text-align:right">—</td>';
           const cls = val >= 0 ? 'var(--up)' : 'var(--down)';
-          return '<td style="color:' + cls + ';text-align:right;font-family:\'DM Mono\',monospace;font-size:11px">' + (val >= 0 ? '+' : '') + val.toFixed(2) + '%</td>';
+          return '<td style="color:' + cls + ';text-align:right;font-family:\'DM Mono\',monospace;font-size:16px">' + (val >= 0 ? '+' : '') + val.toFixed(2) + '%</td>';
         }
         function dayAmt(val) {
           if (val == null) return '<td style="color:var(--muted);text-align:right">—</td>';
           const cls = val >= 0 ? 'var(--up)' : 'var(--down)';
-          return '<td style="color:' + cls + ';text-align:right;font-family:\'DM Mono\',monospace;font-size:11px">' + (val >= 0 ? '+' : '') + fmt$(val) + '</td>';
+          return '<td style="color:' + cls + ';text-align:right;font-family:\'DM Mono\',monospace;font-size:16px">' + (val >= 0 ? '+' : '') + fmt$(val) + '</td>';
         }
         const tickerSafe = h.ticker.replace(/'/g, "\\'");
         const warn = newsWarnings[h.ticker];
         const isWarned = warn && warn.status === 'active';
         const sentiment = (aiAssessments[h.ticker] || {}).newsSentiment;
         const sentIcon = sentimentIcon(sentiment);
-        const sentBadge = sentIcon ? ` <span title="News sentiment: ${sentiment}" style="font-size:11px">${sentIcon}</span>` : '';
+        const sentBadge = sentIcon ? ` <span title="News sentiment: ${sentiment}" style="font-size:16px">${sentIcon}</span>` : '';
         const holdIndustry = (details[h.ticker] || {}).industry || '';
         return `<tr${isWarned ? ' style="background:rgba(248,113,113,0.08);box-shadow:inset 3px 0 0 var(--down)"' : ''}>
-          <td><span onclick="openDreamDetailModal('${tickerSafe}')" title="${holdIndustry ? holdIndustry + ' — click' : 'Click'} for Dream Scan detail" style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px">${h.ticker}</span>${sentBadge}${isWarned ? ` <span onclick="event.stopPropagation();openNewsWarningDetail('${tickerSafe}')" title="Severe news: ${(warn.keyword||'').replace(/"/g,'')} — click for details" style="cursor:pointer;font-size:12px">🚨</span>` : ''}</td>
+          <td><span onclick="openDreamDetailModal('${tickerSafe}')" title="${holdIndustry ? holdIndustry + ' — click' : 'Click'} for Dream Scan detail" style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px">${h.ticker}</span>${sentBadge}${isWarned ? ` <span onclick="event.stopPropagation();openNewsWarningDetail('${tickerSafe}')" title="Severe news: ${(warn.keyword||'').replace(/"/g,'')} — click for details" style="cursor:pointer;font-size:17px">🚨</span>` : ''}</td>
           <td>${h.shares}</td>
           <td>${fmt$(h.purchasePrice)}</td>
           <td>${fmt$(h.previousClose)}</td>
@@ -898,8 +929,8 @@ function renderTradeAI(data) {
           <td class="${glCls}">${fmt$(gl)}</td>
           <td class="${glCls}">${fmtPct(glPct)}</td>
           ` + dayPct(h.change5d) + dayPct(h.change4d) + dayPct(h.change3d) + dayPct(h.change2d) + dayPct(h.change1d) + `
-          <td style="white-space:nowrap"><button onclick="event.stopPropagation();editHolding('${tickerSafe}',${h.shares},${h.purchasePrice})" style="font-size:10px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer">✏️</button>
-          <button onclick="event.stopPropagation();forceSellHolding('${tickerSafe}',${h.shares})" title="Sell this holding now" style="font-size:10px;padding:2px 7px;margin-left:4px;background:transparent;border:1px solid var(--down);border-radius:4px;color:var(--down);cursor:pointer">SELL</button></td>
+          <td style="white-space:nowrap"><button onclick="event.stopPropagation();editHolding('${tickerSafe}',${h.shares},${h.purchasePrice})" style="font-size:15px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer">✏️</button>
+          <button onclick="event.stopPropagation();forceSellHolding('${tickerSafe}',${h.shares})" title="Sell this holding now" style="font-size:15px;padding:2px 7px;margin-left:4px;background:transparent;border:1px solid var(--down);border-radius:4px;color:var(--down);cursor:pointer">SELL</button></td>
         </tr>`;
       }).join('');
 
@@ -910,7 +941,7 @@ function renderTradeAI(data) {
       'Hold': '#fbbf24', 'Avoid': '#f87171', 'Unknown': '#ffffff'
     };
     const c = colors[sig] || '#ffffff';
-    return `<span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${c}22;color:${c};border:1px solid ${c}44;font-weight:700">${sig||'—'}</span>`;
+    return `<span style="font-size:15px;padding:2px 8px;border-radius:4px;background:${c}22;color:${c};border:1px solid ${c}44;font-weight:700">${sig||'—'}</span>`;
   }
 
   function sentimentIcon(s) {
@@ -942,10 +973,10 @@ function renderTradeAI(data) {
         const recAction = recBuys.includes(item.ticker) ? 'BUY' : recSells.includes(item.ticker) ? 'SELL' : null;
         const recColor  = recAction === 'BUY' ? 'var(--up)' : recAction === 'SELL' ? 'var(--down)' : 'var(--muted)';
         const recExtra = recAction
-          ? '<span style="font-size:9px;font-weight:700;color:' + recColor + '">' + recAction + '</span>' + (inAccount ? ' <span style="font-size:9px;color:var(--up)">★ held</span>' : '')
-          : (inAccount ? '<span style="font-size:9px;color:var(--up)">★ held</span>' : '');
+          ? '<span style="font-size:14px;font-weight:700;color:' + recColor + '">' + recAction + '</span>' + (inAccount ? ' <span style="font-size:14px;color:var(--up)">★ held</span>' : '')
+          : (inAccount ? '<span style="font-size:14px;color:var(--up)">★ held</span>' : '');
         function pipeRow(icon, label, tsVal, extra) {
-          return '<div style="display:flex;align-items:center;gap:5px;font-size:9px;line-height:1.8">'
+          return '<div style="display:flex;align-items:center;gap:5px;font-size:14px;line-height:1.8">'
             + '<span style="color:var(--muted);min-width:10px">' + icon + '</span>'
             + '<span style="color:var(--muted);min-width:62px;letter-spacing:0.3px">' + label + '</span>'
             + '<span style="color:var(--accent);font-family:\'DM Mono\',monospace">' + (tsVal ? tsVal.slice(0,16) : '—') + '</span>'
@@ -964,20 +995,20 @@ function renderTradeAI(data) {
           </div>
           <div style="flex:1">
             <div class="trade-candidate-reason">${item.reason || '—'}</div>
-            ${hasAI ? `<div style="display:flex;gap:6px;align-items:center;margin-top:4px">${signalBadge(ai.buySignal)}<span style="font-size:10px;color:var(--muted)">${trajectoryIcon(ai.trajectory)} ${ai.trajectory||''} · ${ai.stage||''}</span>${sentimentIcon(ai.newsSentiment) ? `<span title="News sentiment: ${ai.newsSentiment}" style="font-size:11px">${sentimentIcon(ai.newsSentiment)}</span>` : ''}</div>` : ''}
+            ${hasAI ? `<div style="display:flex;gap:6px;align-items:center;margin-top:4px">${signalBadge(ai.buySignal)}<span style="font-size:15px;color:var(--muted)">${trajectoryIcon(ai.trajectory)} ${ai.trajectory||''} · ${ai.stage||''}</span>${sentimentIcon(ai.newsSentiment) ? `<span title="News sentiment: ${ai.newsSentiment}" style="font-size:16px">${sentimentIcon(ai.newsSentiment)}</span>` : ''}</div>` : ''}
           </div>
           <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
-            ${(()=>{const bkt=item.bucket||'';const bktColors={'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','SmartMoney+':'#facc15','Insider':'#f97316','Account':'#4ade80','Dream':'#ffffff'};const bc=bktColors[bkt]||'#ffffff';return bkt?`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt.toUpperCase()}</span>`:''})()}
-            ${hasAI && ai.aiScore != null ? `<span style="font-size:12px;font-weight:800;color:var(--accent);font-family:'DM Mono',monospace">${ai.aiScore}<span style="font-size:9px;color:var(--muted)">/100</span></span>` : ''}
+            ${(()=>{const bkt=item.bucket||'';const bktColors={'Momentum':'#fbbf24','Reversal':'#60a5fa','SmartMoney':'#a78bfa','SmartMoney+':'#facc15','Insider':'#f97316','Account':'#4ade80','Dream':'#ffffff'};const bc=bktColors[bkt]||'#ffffff';return bkt?`<span style="font-size:14px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt.toUpperCase()}</span>`:''})()}
+            ${hasAI && ai.aiScore != null ? `<span style="font-size:17px;font-weight:800;color:var(--accent);font-family:'DM Mono',monospace">${ai.aiScore}<span style="font-size:14px;color:var(--muted)">/100</span></span>` : ''}
             <span class="trade-candidate-source">${item.source || ''}</span>
-            <button onclick="event.stopPropagation();refreshTickerNews('${item.ticker}', this)" style="font-size:9px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">🔄 NEWS</button>
-            <span id="news-ts-${item.ticker}" style="font-size:9px;color:var(--muted)">${newsTs ? newsTs.slice(0,16) : 'no news'}</span>
+            <button onclick="event.stopPropagation();refreshTickerNews('${item.ticker}', this)" style="font-size:14px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer;font-family:'DM Mono',monospace">🔄 NEWS</button>
+            <span id="news-ts-${item.ticker}" style="font-size:14px;color:var(--muted)">${newsTs ? newsTs.slice(0,16) : 'no news'}</span>
           </div>
         </div>
         <div class="trade-detail-expand" id="tai-${i}">
-          ${hasDetail ? renderTradeDetailExpand(d) : '<div style="color:var(--muted);font-size:11px;margin-bottom:8px">No detail fetched yet. Run Fetch Info.</div>'}
-          ${hasAI ? `<div style="margin-top:12px;padding:12px 14px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:6px">📋 PROMPT SENT TO AI</div><pre style="font-size:10px;color:var(--muted);white-space:pre-wrap;line-height:1.5;margin:0;font-family:'DM Mono',monospace">${ai.promptSent ? ai.promptSent.replace(/</g,'&lt;').replace(/>/g,'&gt;') : '(prompt not saved — backend did not return promptSent)'}</pre></div>` : ''}
-          ${hasAI ? renderAIAssessment(ai) : '<div style="color:var(--muted);font-size:11px">No AI analysis yet. Run AI Analyze.</div>'}
+          ${hasDetail ? renderTradeDetailExpand(d) : '<div style="color:var(--muted);font-size:16px;margin-bottom:8px">No detail fetched yet. Run Fetch Info.</div>'}
+          ${hasAI ? `<div style="margin-top:12px;padding:12px 14px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:8px"><div style="font-size:15px;letter-spacing:1px;color:var(--muted);margin-bottom:6px">📋 PROMPT SENT TO AI</div><pre style="font-size:15px;color:var(--muted);white-space:pre-wrap;line-height:1.5;margin:0;font-family:'DM Mono',monospace">${ai.promptSent ? ai.promptSent.replace(/</g,'&lt;').replace(/>/g,'&gt;') : '(prompt not saved — backend did not return promptSent)'}</pre></div>` : ''}
+          ${hasAI ? renderAIAssessment(ai) : '<div style="color:var(--muted);font-size:16px">No AI analysis yet. Run AI Analyze.</div>'}
         </div>`;
       }).join('') + `</div>`;
 
@@ -1004,17 +1035,17 @@ function renderTradeAI(data) {
         <button
           id="tai-btn-${ops[i]}"
           onclick="runTradeAIOp('${ops[i]}', this)"
-          style="font-family:'DM Mono',monospace;font-size:12px;font-weight:700;padding:10px 0;border-radius:8px;cursor:pointer;border:2px solid var(--warn);background:rgba(251,191,36,0.08);color:var(--warn);letter-spacing:0.5px;transition:all 0.3s;width:100%">
+          style="font-family:'DM Mono',monospace;font-size:17px;font-weight:700;padding:10px 0;border-radius:8px;cursor:pointer;border:2px solid var(--warn);background:rgba(251,191,36,0.08);color:var(--warn);letter-spacing:0.5px;transition:all 0.3s;width:100%">
           ${labels[i]}
         </button>
-        <div style="font-size:10px;color:var(--muted);text-align:center" id="tai-ts-${ops[i]}">
+        <div style="font-size:15px;color:var(--muted);text-align:center" id="tai-ts-${ops[i]}">
           ${lastTs ? '✓ ' + lastTs : '— not run —'}
         </div>
       </div>`;
     }).join('')}
     <div style="display:flex;flex-direction:column;gap:6px;justify-content:flex-start">
-      <button id="taiStopBtn" onclick="stopOperation()" style="display:none;font-family:'DM Mono',monospace;font-size:12px;font-weight:700;padding:10px 14px;border-radius:8px;cursor:pointer;border:2px solid var(--down);background:rgba(239,68,68,0.12);color:var(--down);letter-spacing:0.5px;white-space:nowrap">🛑 STOP</button>
-      <div style="font-size:10px;color:var(--muted);text-align:center" id="taiStopLabel"></div>
+      <button id="taiStopBtn" onclick="stopOperation()" style="display:none;font-family:'DM Mono',monospace;font-size:17px;font-weight:700;padding:10px 14px;border-radius:8px;cursor:pointer;border:2px solid var(--down);background:rgba(239,68,68,0.12);color:var(--down);letter-spacing:0.5px;white-space:nowrap">🛑 STOP</button>
+      <div style="font-size:15px;color:var(--muted);text-align:center" id="taiStopLabel"></div>
     </div>
   </div>
 
@@ -1025,14 +1056,14 @@ function renderTradeAI(data) {
       <div style="display:flex;align-items:center;gap:10px">
         <span style="font-size:14px">⚙️</span>
         <div>
-          <div style="font-family:'Syne',sans-serif;font-weight:700;font-size:13px">SCORING MATRIX</div>
-          <div style="font-size:10px;color:var(--muted);margin-top:1px">Tweak all weights, bonuses & thresholds used in Recommend scoring</div>
+          <div style="font-family:'Syne',sans-serif;font-weight:700;font-size:18px">SCORING MATRIX</div>
+          <div style="font-size:15px;color:var(--muted);margin-top:1px">Tweak all weights, bonuses & thresholds used in Recommend scoring</div>
         </div>
       </div>
-      <span id="scoringMatrixArrow" style="color:var(--muted);font-size:12px">▸ expand</span>
+      <span id="scoringMatrixArrow" style="color:var(--muted);font-size:17px">▸ expand</span>
     </div>
     <div id="scoringMatrixBody" style="display:none;padding:20px;background:var(--surface2)">
-      <div style="color:var(--muted);font-size:12px">Loading scoring config...</div>
+      <div style="color:var(--muted);font-size:17px">Loading scoring config...</div>
     </div>
   </div>
 
@@ -1047,7 +1078,7 @@ function renderTradeAI(data) {
         <div class="trade-section-sub">AI-driven simulation · separate $100k account</div>
       </div>
       <div style="display:flex;align-items:center;gap:10px">
-        <select id="aiTxnMonthSelect" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:5px 10px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px">
+        <select id="aiTxnMonthSelect" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:5px 10px;color:var(--text);font-family:'DM Mono',monospace;font-size:16px">
           <option value="">— Month —</option>
           ${monthOptions}
         </select>
@@ -1060,7 +1091,7 @@ function renderTradeAI(data) {
       </div>
     </div>
     ${(data.resetPending && data.resetPending.status === 'pending') ? `
-    <div style="border:1px solid var(--warn);border-radius:10px;padding:10px 16px;margin-bottom:12px;background:rgba(251,191,36,0.08);font-size:11px;color:var(--warn)">
+    <div style="border:1px solid var(--warn);border-radius:10px;padding:10px 16px;margin-bottom:12px;background:rgba(251,191,36,0.08);font-size:16px;color:var(--warn)">
       ⏳ Reset queued — will auto dream-scan → identify → analyze → buy-in $${Number(data.resetPending.targetBalance).toLocaleString()} at the next Recommend window (10am/11am ET).
     </div>` : ''}
     ${newsWarningBanner}
@@ -1073,24 +1104,24 @@ function renderTradeAI(data) {
     </div>
     <div class="trade-summary-bar">
       <div>
-        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">CASH BALANCE</div>
+        <div style="font-size:15px;color:var(--muted);margin-bottom:2px">CASH BALANCE</div>
         <div style="display:flex;align-items:center;gap:8px">
           <div class="trade-balance-big">${fmt$(balance)}</div>
-          <button onclick="editBalance(${balance})" style="font-size:10px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer">✏️</button>
+          <button onclick="editBalance(${balance})" style="font-size:15px;padding:2px 7px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer">✏️</button>
         </div>
       </div>
       <div style="text-align:center">
-        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">COST BASIS</div>
+        <div style="font-size:15px;color:var(--muted);margin-bottom:2px">COST BASIS</div>
         <div class="trade-balance-big">${fmt$(totalCost)}</div>
       </div>
       <div style="text-align:center">
-        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">PORTFOLIO VALUE</div>
+        <div style="font-size:15px;color:var(--muted);margin-bottom:2px">PORTFOLIO VALUE</div>
         <div class="trade-balance-big">${fmt$(totalValue)}</div>
       </div>
       <div style="text-align:right">
-        <div style="font-size:10px;color:var(--muted);margin-bottom:2px">TOTAL P&L</div>
+        <div style="font-size:15px;color:var(--muted);margin-bottom:2px">TOTAL P&L</div>
         <div class="trade-balance-big ${glClass}">${fmt$(totalGL)}</div>
-        <div style="font-size:11px;color:var(--${glClass});font-family:'DM Mono',monospace;margin-top:2px">${totalValue > 0 ? ((totalGL/totalValue)*100).toFixed(2) + '% of portfolio' : '—'}</div>
+        <div style="font-size:16px;color:var(--${glClass});font-family:'DM Mono',monospace;margin-top:2px">${totalValue > 0 ? ((totalGL/totalValue)*100).toFixed(2) + '% of portfolio' : '—'}</div>
       </div>
     </div>
   </div>
@@ -1116,7 +1147,7 @@ function renderTradeAI(data) {
         <div class="trade-section-title">📜 RECENT ACTIVITY</div>
         <div class="trade-section-sub">Last 15 trades, most recent first · buy &amp; sell details incl. gain/loss</div>
       </div>
-      <span id="recentActivityArrow" style="color:var(--muted);font-size:12px">▸ expand</span>
+      <span id="recentActivityArrow" style="color:var(--muted);font-size:17px">▸ expand</span>
     </div>
     <div id="recentActivityBody" style="display:none">
       ${renderRecentActivity(transactions)}
@@ -1131,7 +1162,7 @@ function renderTradeAI(data) {
         <div class="trade-section-title">🧮 RULE COMPOSITE SCORES</div>
         <div class="trade-section-sub">Every candidate scored in the last Recommend cycle</div>
       </div>
-      <span id="ruleScoresArrow" style="color:var(--muted);font-size:12px">▸ expand</span>
+      <span id="ruleScoresArrow" style="color:var(--muted);font-size:17px">▸ expand</span>
     </div>
     <div id="ruleScoresBody" style="display:none">
       ${scoreTableHtml}
@@ -1145,7 +1176,7 @@ function renderTradeAI(data) {
         <div class="trade-section-title">CANDIDATES</div>
         <div class="trade-section-sub">Holdings + top dream scorers · max 30${data.identifiedAt ? ' · last run: ' + data.identifiedAt : ''}</div>
       </div>
-      <span id="candidatesArrow" style="color:var(--muted);font-size:12px">▸ expand</span>
+      <span id="candidatesArrow" style="color:var(--muted);font-size:17px">▸ expand</span>
     </div>
     <div id="candidatesBody" style="display:none">
       ${identifiedHtml}
@@ -1202,7 +1233,7 @@ function renderAIAssessment(ai) {
   const c = sigColors[ai.buySignal] || '#ffffff';
   return `
   <div style="margin-top:12px;padding:12px 14px;background:rgba(139,92,246,0.05);border:1px solid rgba(139,92,246,0.2);border-radius:8px">
-    <div style="font-size:10px;letter-spacing:1px;color:#a78bfa;margin-bottom:8px">🤖 AI ASSESSMENT</div>
+    <div style="font-size:15px;letter-spacing:1px;color:#a78bfa;margin-bottom:8px">🤖 AI ASSESSMENT</div>
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px">
       <div class="trade-detail-metric" style="flex:none">
         <div class="tdm-label">BUY SIGNAL</div>
@@ -1233,7 +1264,7 @@ function renderAIAssessment(ai) {
         <div class="tdm-value">${ai.confidence||'—'}</div>
       </div>
     </div>
-    ${ai.reasoning ? `<div style="font-size:11px;color:var(--muted);line-height:1.6;font-style:italic">${ai.reasoning}</div>` : ''}
+    ${ai.reasoning ? `<div style="font-size:16px;color:var(--muted);line-height:1.6;font-style:italic">${ai.reasoning}</div>` : ''}
   </div>`;
 }
 
@@ -1246,18 +1277,18 @@ function showRecommendSummary(rec) {
   const skipRows = skips.map(sk => `
     <div style="padding:10px 14px;border-radius:8px;background:rgba(107,114,128,0.05);border:1px solid rgba(107,114,128,0.2);margin-bottom:6px">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:2px">
-        <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:13px">${sk.ticker}</span>
-        ${sk.bucket ? `<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:rgba(139,92,246,0.1);color:#a78bfa">${sk.bucket}</span>` : ''}
-        <span style="font-size:11px;color:var(--muted)">composite: ${fmtC(sk.composite)}</span>
+        <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:18px">${sk.ticker}</span>
+        ${sk.bucket ? `<span style="font-size:14px;padding:2px 7px;border-radius:4px;background:rgba(139,92,246,0.1);color:#a78bfa">${sk.bucket}</span>` : ''}
+        <span style="font-size:16px;color:var(--muted)">composite: ${fmtC(sk.composite)}</span>
       </div>
-      <div style="font-size:11px;color:var(--muted)">${sk.reason}</div>
+      <div style="font-size:16px;color:var(--muted)">${sk.reason}</div>
     </div>`).join('');
 
   if (!buys.length && !sells.length) {
     const modal = document.getElementById('recommendSummaryModal');
     const body = document.getElementById('recommendSummaryBody');
     body.innerHTML = skips.length
-      ? `<div style="font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:10px">NO TRADES — ${skips.length} CANDIDATES SKIPPED</div>${skipRows}`
+      ? `<div style="font-size:15px;letter-spacing:1px;color:var(--muted);margin-bottom:10px">NO TRADES — ${skips.length} CANDIDATES SKIPPED</div>${skipRows}`
       : '<div style="color:var(--muted);padding:20px;text-align:center">No trades were executed this cycle. No candidate data available.</div>';
     modal.classList.add('visible');
     return;
@@ -1268,31 +1299,31 @@ function showRecommendSummary(rec) {
   const buyRows = buys.map(b => `
     <div style="padding:12px 14px;border-radius:8px;background:rgba(74,222,128,0.05);border:1px solid rgba(74,222,128,0.2);margin-bottom:8px">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
-        <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(74,222,128,0.15);color:#4ade80;font-weight:700">BUY</span>
+        <span style="font-size:15px;padding:2px 8px;border-radius:4px;background:rgba(74,222,128,0.15);color:#4ade80;font-weight:700">BUY</span>
         <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:15px">${b.ticker}</span>
-        <span style="font-size:11px;color:var(--muted)">${b.shares} shares @ ${fmt$(b.price)} · Cost: ${fmt$(b.amount)}</span>
+        <span style="font-size:16px;color:var(--muted)">${b.shares} shares @ ${fmt$(b.price)} · Cost: ${fmt$(b.amount)}</span>
       </div>
-      <div style="font-size:11px;color:var(--muted);line-height:1.6;font-style:italic">${b.reason || '—'}</div>
+      <div style="font-size:16px;color:var(--muted);line-height:1.6;font-style:italic">${b.reason || '—'}</div>
     </div>`).join('');
 
   const sellRows = sells.map(s => `
     <div style="padding:12px 14px;border-radius:8px;background:rgba(248,113,113,0.05);border:1px solid rgba(248,113,113,0.2);margin-bottom:8px">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
-        <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(248,113,113,0.15);color:#f87171;font-weight:700">SELL</span>
+        <span style="font-size:15px;padding:2px 8px;border-radius:4px;background:rgba(248,113,113,0.15);color:#f87171;font-weight:700">SELL</span>
         <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:15px">${s.ticker}</span>
-        <span style="font-size:11px;color:var(--muted)">${s.shares} shares @ ${fmt$(s.price)} · Proceeds: ${fmt$(s.amount)}</span>
+        <span style="font-size:16px;color:var(--muted)">${s.shares} shares @ ${fmt$(s.price)} · Proceeds: ${fmt$(s.amount)}</span>
       </div>
-      <div style="font-size:11px;color:var(--muted);line-height:1.6;font-style:italic">${s.reason || '—'}</div>
+      <div style="font-size:16px;color:var(--muted);line-height:1.6;font-style:italic">${s.reason || '—'}</div>
     </div>`).join('');
 
   const skipSection = skips.length ? `
-    <div style="font-size:10px;letter-spacing:1px;color:var(--muted);margin-top:16px;margin-bottom:10px">⏭️ SKIPPED (${skips.length})</div>${skipRows}` : '';
+    <div style="font-size:15px;letter-spacing:1px;color:var(--muted);margin-top:16px;margin-bottom:10px">⏭️ SKIPPED (${skips.length})</div>${skipRows}` : '';
 
   const modal = document.getElementById('recommendSummaryModal');
   const body = document.getElementById('recommendSummaryBody');
   body.innerHTML = `
-    ${buys.length ? `<div style="font-size:10px;letter-spacing:1px;color:#4ade80;margin-bottom:10px">✅ BOUGHT (${buys.length})</div>${buyRows}` : '<div style="color:var(--muted);font-size:11px;margin-bottom:16px">No buys executed.</div>'}
-    ${sells.length ? `<div style="font-size:10px;letter-spacing:1px;color:#f87171;margin-top:16px;margin-bottom:10px">🔴 SOLD (${sells.length})</div>${sellRows}` : '<div style="color:var(--muted);font-size:11px">No sells executed.</div>'}
+    ${buys.length ? `<div style="font-size:15px;letter-spacing:1px;color:#4ade80;margin-bottom:10px">✅ BOUGHT (${buys.length})</div>${buyRows}` : '<div style="color:var(--muted);font-size:16px;margin-bottom:16px">No buys executed.</div>'}
+    ${sells.length ? `<div style="font-size:15px;letter-spacing:1px;color:#f87171;margin-top:16px;margin-bottom:10px">🔴 SOLD (${sells.length})</div>${sellRows}` : '<div style="color:var(--muted);font-size:16px">No sells executed.</div>'}
     ${skipSection}
   `;
   modal.classList.add('visible');
@@ -1330,17 +1361,17 @@ function renderRecentActivity(transactions, limit) {
     const glCls = (t.gainLoss || 0) >= 0 ? 'var(--up)' : 'var(--down)';
     const srcBadge = t.rotation ? 'rotation' : t.manual ? 'manual' : t.stopLoss ? 'stop-loss' : isBuy ? '' : 'recommend';
     return `<tr>
-      <td style="white-space:nowrap;font-family:'DM Mono',monospace;font-size:10px">${fmtDate(t.date)}</td>
-      <td><span class="trade-action-badge ${isBuy ? 'buy' : 'sell'}" style="font-size:9px">${t.action}</span></td>
+      <td style="white-space:nowrap;font-family:'DM Mono',monospace;font-size:15px">${fmtDate(t.date)}</td>
+      <td><span class="trade-action-badge ${isBuy ? 'buy' : 'sell'}" style="font-size:14px">${t.action}</span></td>
       <td style="font-family:'Syne',sans-serif;font-weight:700">${t.ticker}</td>
       <td style="text-align:right">${t.shares}</td>
-      <td style="text-align:right">${fmt$(t.price)}${!isBuy ? ` <button onclick="editTransaction(${t._idx},'${(t.ticker||'').replace(/'/g,"\\'")}',${t.price})" title="Edit sell price" style="font-size:9px;padding:0 4px;margin-left:2px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✏️</button>` : ''}</td>
+      <td style="text-align:right">${fmt$(t.price)}${!isBuy ? ` <button onclick="editTransaction(${t._idx},'${(t.ticker||'').replace(/'/g,"\\'")}',${t.price})" title="Edit sell price" style="font-size:14px;padding:0 4px;margin-left:2px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✏️</button>` : ''}</td>
       <td style="text-align:right">${fmt$(t.amount)}</td>
-      <td style="font-size:10px;color:var(--muted);white-space:nowrap">${boughtCell}</td>
+      <td style="font-size:15px;color:var(--muted);white-space:nowrap">${boughtCell}</td>
       <td style="text-align:right;color:${isBuy ? 'var(--muted)' : glCls}">${isBuy ? '—' : fmt$(t.gainLoss)}</td>
       <td style="text-align:right;color:${isBuy ? 'var(--muted)' : glCls}">${isBuy || glPct == null ? '—' : (glPct >= 0 ? '+' : '') + glPct.toFixed(2) + '%'}</td>
-      <td style="font-size:10px;color:var(--muted)">${srcBadge}</td>
-      <td style="font-size:10px;color:var(--muted);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(t.reason||'').replace(/"/g,'&quot;')}">${t.reason || '—'}</td>
+      <td style="font-size:15px;color:var(--muted)">${srcBadge}</td>
+      <td style="font-size:15px;color:var(--muted);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(t.reason||'').replace(/"/g,'&quot;')}">${t.reason || '—'}</td>
     </tr>`;
   }).join('');
 
@@ -1380,16 +1411,16 @@ function renderTradeAIRecommend(rec, identified, holdings) {
     const parts = [];
     if (bkt) {
       const bc = bktColors[bkt] || '#ffffff';
-      parts.push(`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt.toUpperCase()}</span>`);
+      parts.push(`<span style="font-size:14px;padding:2px 7px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt.toUpperCase()}</span>`);
     }
     if (cand && cand.source) {
-      parts.push(`<span style="font-size:9px;padding:2px 7px;border-radius:4px;background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">${cand.source}</span>`);
+      parts.push(`<span style="font-size:14px;padding:2px 7px;border-radius:4px;background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3)">${cand.source}</span>`);
     }
     return parts.join(' ');
   }
 
   const buyCards = buys.length === 0
-    ? `<div style="color:var(--muted);font-size:11px">No buys executed.</div>`
+    ? `<div style="color:var(--muted);font-size:16px">No buys executed.</div>`
     : buys.map(b => `
       <div class="trade-recommend-card buy">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">
@@ -1397,12 +1428,12 @@ function renderTradeAIRecommend(rec, identified, holdings) {
           <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:16px">${b.ticker}</span>
           ${strategyBadge(b.ticker)}
         </div>
-        <div style="font-size:12px;color:var(--muted)">${b.shares} shares @ ${fmt$(b.price)} · Cost: ${fmt$(b.amount)} · Balance after: ${fmt$(b.balance)}</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:4px;font-style:italic">${b.reason}</div>
+        <div style="font-size:17px;color:var(--muted)">${b.shares} shares @ ${fmt$(b.price)} · Cost: ${fmt$(b.amount)} · Balance after: ${fmt$(b.balance)}</div>
+        <div style="font-size:16px;color:var(--muted);margin-top:4px;font-style:italic">${b.reason}</div>
       </div>`).join('');
 
   const sellCards = sells.length === 0
-    ? `<div style="color:var(--muted);font-size:11px">No sells executed.</div>`
+    ? `<div style="color:var(--muted);font-size:16px">No sells executed.</div>`
     : sells.map(s => `
       <div class="trade-recommend-card sell">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">
@@ -1410,8 +1441,8 @@ function renderTradeAIRecommend(rec, identified, holdings) {
           <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:16px">${s.ticker}</span>
           ${strategyBadge(s.ticker)}
         </div>
-        <div style="font-size:12px;color:var(--muted)">${s.shares} shares @ ${fmt$(s.price)} · Proceeds: ${fmt$(s.amount)} · Balance after: ${fmt$(s.balance)}</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:4px;font-style:italic">${s.reason}</div>
+        <div style="font-size:17px;color:var(--muted)">${s.shares} shares @ ${fmt$(s.price)} · Proceeds: ${fmt$(s.amount)} · Balance after: ${fmt$(s.balance)}</div>
+        <div style="font-size:16px;color:var(--muted);margin-top:4px;font-style:italic">${s.reason}</div>
       </div>`).join('');
 
   const sigColors = {'Strong Buy':'#4ade80','Buy':'#86efac','Hold':'#fbbf24','Avoid':'#f87171','Unknown':'#ffffff'};
@@ -1430,11 +1461,11 @@ function renderTradeAIRecommend(rec, identified, holdings) {
     return `<tr>
       <td>${i+1}</td>
       <td style="font-family:'Syne',sans-serif;font-weight:700">${s.ticker}</td>
-      <td><span style="font-size:9px;padding:2px 6px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt !== '—' ? bkt.toUpperCase() : '—'}</span></td>
-      <td style="font-size:10px;color:var(--muted)">${src}</td>
+      <td><span style="font-size:14px;padding:2px 6px;border-radius:4px;background:${bc}22;color:${bc};border:1px solid ${bc}44;font-weight:700">${bkt !== '—' ? bkt.toUpperCase() : '—'}</span></td>
+      <td style="font-size:15px;color:var(--muted)">${src}</td>
       <td>${s.dreamScore}</td>
       <td>${s.aiScore != null ? s.aiScore : '—'}</td>
-      <td><span style="color:${c};font-size:10px;font-weight:700">${s.buySignal||'—'}</span></td>
+      <td><span style="color:${c};font-size:15px;font-weight:700">${s.buySignal||'—'}</span></td>
       <td>${s.trajectory||'—'}</td>
       <td>${s.stage||'—'}</td>
       <td style="font-weight:700;color:var(--accent)">${s.composite}</td>
@@ -1445,11 +1476,11 @@ function renderTradeAIRecommend(rec, identified, holdings) {
   const recommendHtml = `
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
       <div>
-        <div style="font-size:10px;letter-spacing:1px;color:var(--up);margin-bottom:10px">BUYS EXECUTED</div>
+        <div style="font-size:15px;letter-spacing:1px;color:var(--up);margin-bottom:10px">BUYS EXECUTED</div>
         ${buyCards}
       </div>
       <div>
-        <div style="font-size:10px;letter-spacing:1px;color:var(--down);margin-bottom:10px">SELLS EXECUTED</div>
+        <div style="font-size:15px;letter-spacing:1px;color:var(--down);margin-bottom:10px">SELLS EXECUTED</div>
         ${sellCards}
       </div>
     </div>`;
@@ -1628,7 +1659,7 @@ async function showAITransactions() {
         const cls = isBuy ? 'up' : 'down';
         const realIdx = (data.transactions || []).length - 1 - origIdx; // reverse index
         const editBtn = !isBuy
-          ? `<button onclick="editTransaction(${realIdx},'${t.ticker}',${t.price})" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✏️</button>`
+          ? `<button onclick="editTransaction(${realIdx},'${t.ticker}',${t.price})" style="font-size:14px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✏️</button>`
           : '';
         return `<tr>
           <td>${t.date||'—'}</td>
@@ -1764,16 +1795,16 @@ async function showReportReset() {
   const opts = months.map(m => '<option value="' + m + '">' + m + '</option>').join('');
   const html = '<div style="padding:24px;min-width:340px">'
     + '<div style="font-family:\'Syne\',sans-serif;font-size:16px;font-weight:700;margin-bottom:16px;color:var(--warn)">🗑 REPORT RESET</div>'
-    + '<div style="font-size:12px;color:var(--muted);margin-bottom:16px">Delete transactions by month or clear all history. Holdings and balance are not affected.</div>'
-    + (months.length === 0 ? '<div style="color:var(--muted);font-size:12px;margin-bottom:16px">No transactions found.</div>' :
+    + '<div style="font-size:17px;color:var(--muted);margin-bottom:16px">Delete transactions by month or clear all history. Holdings and balance are not affected.</div>'
+    + (months.length === 0 ? '<div style="color:var(--muted);font-size:17px;margin-bottom:16px">No transactions found.</div>' :
       '<div style="margin-bottom:12px">'
-      + '<label style="font-size:11px;color:var(--muted);display:block;margin-bottom:6px">SELECT MONTH TO DELETE</label>'
-      + '<select id="reportResetMonth" style="width:100%;padding:8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px">'
+      + '<label style="font-size:16px;color:var(--muted);display:block;margin-bottom:6px">SELECT MONTH TO DELETE</label>'
+      + '<select id="reportResetMonth" style="width:100%;padding:8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:18px">'
       + opts
       + '</select></div>'
-      + '<button onclick="doReportReset(false)" style="width:100%;padding:9px;margin-bottom:8px;background:transparent;border:1px solid var(--warn);border-radius:6px;color:var(--warn);font-weight:700;cursor:pointer;font-size:12px">DELETE SELECTED MONTH</button>')
-    + '<button onclick="doReportReset(true)" style="width:100%;padding:9px;margin-bottom:12px;background:transparent;border:1px solid var(--down);border-radius:6px;color:var(--down);font-weight:700;cursor:pointer;font-size:12px">DELETE ALL HISTORY</button>'
-    + '<button onclick="document.getElementById(\'reportResetModal\').remove()" style="width:100%;padding:8px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-size:12px">CANCEL</button>'
+      + '<button onclick="doReportReset(false)" style="width:100%;padding:9px;margin-bottom:8px;background:transparent;border:1px solid var(--warn);border-radius:6px;color:var(--warn);font-weight:700;cursor:pointer;font-size:17px">DELETE SELECTED MONTH</button>')
+    + '<button onclick="doReportReset(true)" style="width:100%;padding:9px;margin-bottom:12px;background:transparent;border:1px solid var(--down);border-radius:6px;color:var(--down);font-weight:700;cursor:pointer;font-size:17px">DELETE ALL HISTORY</button>'
+    + '<button onclick="document.getElementById(\'reportResetModal\').remove()" style="width:100%;padding:8px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-size:17px">CANCEL</button>'
     + '</div>';
 
   let modal = document.getElementById('reportResetModal');
@@ -1964,13 +1995,13 @@ async function doReportReset(all) {
           <td class="guide-fail">> 2%</td>
         </tr>
       </table>
-      <div style="margin-top:14px;font-size:11px;color:var(--muted);line-height:1.7">
+      <div style="margin-top:14px;font-size:16px;color:var(--muted);line-height:1.7">
         <strong style="color:var(--text)">Canadian Big 6 context:</strong> BMO, RBC, TD, BNS, CM, NA typically maintain CET1 > 12%, LCR > 130%, NPL < 0.5% due to OSFI oversight. Use these as peer benchmarks.
       </div>
     </div>
 
     <div class="guide-tab-panel" id="guide-howto">
-      <div style="font-size:12px;line-height:1.8;color:var(--text)">
+      <div style="font-size:17px;line-height:1.8;color:var(--text)">
         <div style="margin-bottom:14px">
           <strong style="color:var(--accent)">Step 1 — Find the Annual Report</strong><br>
           Go to the bank's Investor Relations page → Annual Reports → Most Recent PDF
@@ -2146,7 +2177,7 @@ async function showAIInsights(epoch) {
 }
 
 function _insightStatCell(label, val, color) {
-  return `<div style="text-align:center"><div style="font-size:9px;color:var(--muted);letter-spacing:0.5px">${label}</div>
+  return `<div style="text-align:center"><div style="font-size:14px;color:var(--muted);letter-spacing:0.5px">${label}</div>
     <div style="font-size:14px;font-weight:700;font-family:'DM Mono',monospace;${color?'color:'+color:''}">${val != null ? val : '—'}</div></div>`;
 }
 
@@ -2168,8 +2199,8 @@ function _insightGroupTable(title, groups) {
     </tr>`;
   }).join('');
   return `<div style="margin-bottom:18px">
-    <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">${title}</div>
-    <table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+    <div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">${title}</div>
+    <table style="width:100%;border-collapse:collapse;font-size:16px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
       <thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">
         <th style="padding:6px 10px;text-align:left">GROUP</th><th style="padding:6px 10px;text-align:right">N</th>
         <th style="padding:6px 10px;text-align:right">WIN%</th><th style="padding:6px 10px;text-align:right">AVG WIN</th>
@@ -2188,8 +2219,8 @@ function _renderInsights(d) {
     const opts = ['<option value="all"' + (selected === 'all' ? ' selected' : '') + '>All time</option>']
       .concat(epochs.map(e => `<option value="${e.epoch}"${selected === String(e.epoch) ? ' selected' : ''}>Epoch ${e.epoch} — ${e.label}</option>`));
     html += `<div style="margin-bottom:14px;display:flex;align-items:center;gap:8px">
-      <span style="font-size:10px;color:var(--muted);letter-spacing:0.5px">SHOWING</span>
-      <select onchange="showAIInsights(this.value)" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font-family:'DM Mono',monospace;font-size:11px">
+      <span style="font-size:15px;color:var(--muted);letter-spacing:0.5px">SHOWING</span>
+      <select onchange="showAIInsights(this.value)" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font-family:'DM Mono',monospace;font-size:16px">
         ${opts.join('')}
       </select>
     </div>`;
@@ -2197,8 +2228,8 @@ function _renderInsights(d) {
   // Suggestions first — this is the feedback loop
   if (d.suggestions && d.suggestions.length) {
     html += `<div style="margin-bottom:18px">
-      <div style="font-size:10px;letter-spacing:1px;color:#a78bfa;margin-bottom:6px">💡 TUNING SUGGESTIONS</div>` +
-      d.suggestions.map(s => `<div style="padding:9px 12px;margin-bottom:6px;background:rgba(139,92,246,0.06);border:1px solid rgba(139,92,246,0.25);border-radius:8px;font-size:12px;line-height:1.5">${s}</div>`).join('') +
+      <div style="font-size:15px;letter-spacing:1px;color:#a78bfa;margin-bottom:6px">💡 TUNING SUGGESTIONS</div>` +
+      d.suggestions.map(s => `<div style="padding:9px 12px;margin-bottom:6px;background:rgba(139,92,246,0.06);border:1px solid rgba(139,92,246,0.25);border-radius:8px;font-size:17px;line-height:1.5">${s}</div>`).join('') +
       `</div>`;
   }
   const o = d.overall;
@@ -2238,13 +2269,13 @@ function _renderInsights(d) {
       </tr>`;
     }).join('');
     html += `<div style="margin-bottom:18px">
-      <div style="font-size:10px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">FACTOR DISCRIMINATION — AVG VALUE AT BUY TIME</div>
-      <table style="width:100%;border-collapse:collapse;font-size:11px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+      <div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:6px">FACTOR DISCRIMINATION — AVG VALUE AT BUY TIME</div>
+      <table style="width:100%;border-collapse:collapse;font-size:16px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
         <thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">
           <th style="padding:6px 10px;text-align:left">FACTOR</th><th style="padding:6px 10px;text-align:right">IN WINNERS</th>
           <th style="padding:6px 10px;text-align:right">IN LOSERS</th><th style="padding:6px 10px;text-align:right">VERDICT</th>
         </tr></thead><tbody>${rows}</tbody></table>
-      <div style="font-size:10px;color:var(--muted);margin-top:6px">A factor is only useful if its average is meaningfully higher in winning trades than losing ones.</div></div>`;
+      <div style="font-size:15px;color:var(--muted);margin-top:6px">A factor is only useful if its average is meaningfully higher in winning trades than losing ones.</div></div>`;
   }
   return html;
 }
@@ -2273,7 +2304,7 @@ function _renderInsights(d) {
 
 <style>
 .report-period-btn {
-  font-family:'DM Mono',monospace;font-size:11px;font-weight:700;
+  font-family:'DM Mono',monospace;font-size:16px;font-weight:700;
   padding:8px 20px;border:none;background:transparent;
   color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;
   letter-spacing:0.5px;transition:all 0.2s;
@@ -2286,7 +2317,7 @@ function _renderInsights(d) {
 .report-ticker-header {
   display:grid;grid-template-columns:90px 80px 80px 90px 90px 80px 80px 1fr;
   gap:8px;padding:10px 14px;background:var(--surface);cursor:pointer;
-  font-size:11px;align-items:center;transition:background 0.15s;
+  font-size:16px;align-items:center;transition:background 0.15s;
 }
 .report-ticker-header:hover { background:var(--surface2); }
 .report-ticker-detail {
@@ -2296,7 +2327,7 @@ function _renderInsights(d) {
 .report-ticker-detail.open { display:block; }
 .report-trade-pair {
   display:grid;grid-template-columns:110px 80px 80px 80px 80px 80px 1fr;
-  gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid rgba(42,42,58,0.5);
+  gap:8px;font-size:16px;padding:5px 0;border-bottom:1px solid rgba(42,42,58,0.5);
   align-items:center;
 }
 .report-trade-pair:last-child { border-bottom:none; }
@@ -2304,7 +2335,7 @@ function _renderInsights(d) {
   display:grid;grid-template-columns:90px 80px 80px 90px 90px 80px 80px 1fr;
   gap:8px;padding:10px 14px;background:rgba(200,241,53,0.04);
   border:1px solid rgba(200,241,53,0.15);border-radius:8px;
-  font-size:11px;font-weight:700;margin-bottom:12px;
+  font-size:16px;font-weight:700;margin-bottom:12px;
 }
 </style>
 
@@ -2454,7 +2485,7 @@ function _renderReport() {
     // Period header
     html += `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border)">
       <div style="font-family:'Syne',sans-serif;font-size:16px;font-weight:800;letter-spacing:-0.3px">${pk}</div>
-      <div style="display:flex;gap:20px;font-size:11px">
+      <div style="display:flex;gap:20px;font-size:16px">
         <span style="color:var(--muted)">${periodTrades} closed trade${periodTrades!==1?'s':''} · ${tickerKeys.length} ticker${tickerKeys.length!==1?'s':''}</span>
         <span style="font-weight:700;color:${periodColor}">${periodTotal >= 0 ? '+' : ''}${fmt$(periodTotal)} realized P&L</span>
       </div>
@@ -2463,7 +2494,7 @@ function _renderReport() {
     // Column headers
     html += `<div style="display:grid;grid-template-columns:90px 60px 80px 80px 90px 80px 80px 1fr;gap:8px;padding:4px 14px;margin-bottom:4px">
       ${['TICKER','TRADES','AVG BUY','AVG SELL','REALIZED','RETURN','AVG HOLD',''].map(h =>
-        `<div style="font-size:9px;color:var(--muted);letter-spacing:0.8px;text-transform:uppercase">${h}</div>`
+        `<div style="font-size:14px;color:var(--muted);letter-spacing:0.8px;text-transform:uppercase">${h}</div>`
       ).join('')}
     </div>`;
 
@@ -2483,22 +2514,22 @@ function _renderReport() {
       html += `<div class="report-ticker-row">
         <div class="report-ticker-header" onclick="toggleReportDetail('${rowId}')">
           <div style="font-family:'Syne',sans-serif;font-weight:800;font-size:14px">${ticker}</div>
-          <div style="color:var(--muted)">${trades.length}${openBuys.length ? `<span style="color:var(--warn);font-size:9px"> +${openBuys.length} open</span>` : ''}</div>
+          <div style="color:var(--muted)">${trades.length}${openBuys.length ? `<span style="color:var(--warn);font-size:14px"> +${openBuys.length} open</span>` : ''}</div>
           <div>${avgBuy != null ? fmt$(avgBuy) : '—'}</div>
           <div>${avgSell != null ? fmt$(avgSell) : '—'}</div>
           <div style="color:${pnlColor};font-weight:700">${td.totalPnl >= 0?'+':''}${fmt$(td.totalPnl)}</div>
           <div style="color:${retColor};font-weight:700">${ret != null ? (ret>=0?'+':'')+ret.toFixed(1)+'%' : '—'}</div>
           <div style="color:var(--muted)">${fmtD(avgHold ? Math.round(avgHold) : null)}</div>
-          <div style="text-align:right;font-size:10px;color:var(--muted)">▸ detail</div>
+          <div style="text-align:right;font-size:15px;color:var(--muted)">▸ detail</div>
         </div>
         <div class="report-ticker-detail" id="${rowId}">
-          <div style="font-size:9px;color:var(--muted);letter-spacing:0.8px;margin-bottom:8px">CLOSED TRADE PAIRS</div>
+          <div style="font-size:14px;color:var(--muted);letter-spacing:0.8px;margin-bottom:8px">CLOSED TRADE PAIRS</div>
           <div style="display:grid;grid-template-columns:110px 70px 80px 80px 80px 70px 1fr;gap:8px;padding:4px 0;margin-bottom:4px">
             ${['BUY DATE','SELL DATE','SHARES','BUY $','SELL $','HOLD','P&L'].map(h =>
-              `<div style="font-size:9px;color:var(--muted);letter-spacing:0.8px">${h}</div>`
+              `<div style="font-size:14px;color:var(--muted);letter-spacing:0.8px">${h}</div>`
             ).join('')}
           </div>
-          ${trades.length === 0 ? '<div style="color:var(--muted);font-size:11px;padding:4px 0">No closed pairs this period.</div>' :
+          ${trades.length === 0 ? '<div style="color:var(--muted);font-size:16px;padding:4px 0">No closed pairs this period.</div>' :
             trades.map(p => {
               const pc = p.pnl >= 0 ? 'var(--up)' : 'var(--down)';
               return `<div class="report-trade-pair">
@@ -2513,7 +2544,7 @@ function _renderReport() {
             }).join('')
           }
           ${openBuys.length ? `
-            <div style="font-size:9px;color:var(--warn);letter-spacing:0.8px;margin:10px 0 6px">OPEN BUYS (no matching sell yet)</div>
+            <div style="font-size:14px;color:var(--warn);letter-spacing:0.8px;margin:10px 0 6px">OPEN BUYS (no matching sell yet)</div>
             ${openBuys.map(b => `
               <div class="report-trade-pair">
                 <div style="color:var(--warn)">${(b.date||'—').slice(0,10)}</div>
@@ -2522,7 +2553,7 @@ function _renderReport() {
                 <div>${fmt$(b.price)}</div>
                 <div style="color:var(--muted)">—</div>
                 <div style="color:var(--muted)">—</div>
-                <div style="color:var(--warn);font-size:10px">OPEN</div>
+                <div style="color:var(--warn);font-size:15px">OPEN</div>
               </div>`).join('')}` : ''}
         </div>
       </div>`;
