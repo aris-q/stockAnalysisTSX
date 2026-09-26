@@ -411,6 +411,12 @@ async function loadSchedulerStatus() {
         <span>After-close Dream → shortlist → rule assessment</span>
         <span><input id="schedDreamTime" value="${cfg.dreamTime||''}" style="${inp};width:60px"></span>
         <span>${fmt('dreamScan')}</span>
+        <span>Account tracker (portfolio value vs TSX/TSX 60)</span>
+        <span><input id="schedAcctTrackerTime" value="${cfg.accountTrackerTime||''}" style="${inp};width:60px"></span>
+        <span>${fmt('accountTracker')}</span>
+        <span>Scoring weight backtest (dream/AI split vs shadow history — see TradeAI tab)</span>
+        <span><input id="schedWeightBacktestTime" value="${cfg.weightBacktestTime||''}" style="${inp};width:60px"></span>
+        <span>${fmt('weightBacktest')}</span>
       </div>
       <button class="btn" style="margin-top:8px" onclick="saveSchedule(this)">SAVE TIMES</button>`;
     const btn = document.getElementById('schedulerToggleBtn');
@@ -432,16 +438,20 @@ async function saveSchedule(btn) {
   const mins     = listOf('schedSellMins').map(Number);
   const recTimes = listOf('schedRecTimes');
   const dream    = document.getElementById('schedDreamTime').value.trim();
+  const acctTracker = document.getElementById('schedAcctTrackerTime').value.trim();
+  const weightBacktest = document.getElementById('schedWeightBacktestTime').value.trim();
   const timeRe = /^([01]?\d|2[0-3]):[0-5]\d$/;
   if (!hours.length || hours.some(h => isNaN(h) || h < 0 || h > 23)) { alert('Sell-check hours must be numbers 0-23 (e.g. 9,10,11)'); return; }
   if (!mins.length || mins.some(m => isNaN(m) || m < 0 || m > 59))   { alert('Sell-check minutes must be numbers 0-59 (e.g. 20,40)'); return; }
   if (!recTimes.length || !recTimes.every(t => timeRe.test(t))) { alert('Recommend times must be HH:MM 24h (e.g. 10:00, 11:00)'); return; }
   if (!timeRe.test(dream)) { alert('Dream time must be HH:MM 24h (e.g. 16:01)'); return; }
+  if (!timeRe.test(acctTracker)) { alert('Account tracker time must be HH:MM 24h (e.g. 17:04)'); return; }
+  if (!timeRe.test(weightBacktest)) { alert('Weight backtest time must be HH:MM 24h (e.g. 17:06)'); return; }
   btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
   try {
     const r = await fetch('/admin/scheduler', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream })
+      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream, accountTrackerTime: acctTracker, weightBacktestTime: weightBacktest })
     });
     const d = await r.json();
     if (d.error) alert('Save failed: ' + d.error);

@@ -807,6 +807,90 @@ async function refreshAccountPrices(btn) {
   btn.disabled = false; btn.textContent = orig;
 }
 
+async function runWeightBacktestNow(btn) {
+  if (btn.disabled) return;
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ RUNNING...';
+  try {
+    const r = await fetch('/tradeai/weight_backtest/run', {method: 'POST'});
+    const d = await r.json();
+    if (d.error) {
+      alert('Weight backtest failed: ' + d.error);
+      btn.disabled = false; btn.textContent = orig;
+      return;
+    }
+    await loadTradeAI(true);
+  } catch(e) {
+    alert('Weight backtest failed: ' + e.message);
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
+function renderWeightBacktestSection(wb) {
+  const header = (subtitle, extra) => `<div class="trade-section-header">
+      <div>
+        <div class="trade-section-title">🧪 SCORING WEIGHT BACKTEST</div>
+        <div class="trade-section-sub">${subtitle}</div>
+      </div>
+      ${extra || `<button class="btn" onclick="runWeightBacktestNow(this)">▶ RUN NOW</button>`}
+    </div>`;
+  if (!wb) {
+    return `<div class="trade-section">
+      ${header('Tests alternative dream-score/AI-score weightings against real shadow-tracking history — no live trading impact.')}
+      <div style="color:var(--muted);padding:16px">Not run yet — click RUN NOW once at least 5 days of graded shadow history exist (auto-runs daily too; see Admin → scheduler for the time).</div>
+    </div>`;
+  }
+  if (wb.insufficient) {
+    return `<div class="trade-section">
+      ${header('Tests alternative dream-score/AI-score weightings against real shadow-tracking history — no live trading impact.')}
+      <div style="color:var(--muted);padding:16px">Not enough data yet: ${wb.daysAvailable}/${wb.daysNeeded} days with a complete 5-trading-day hold. Checked ${wb.computedAt}.</div>
+    </div>`;
+  }
+  if (!wb.horizons) {
+    return `<div class="trade-section">
+      ${header('Tests alternative dream-score/AI-score weightings against real shadow-tracking history — no live trading impact.')}
+      <div style="color:var(--muted);padding:16px">Saved result is from an older version of this backtest — click RUN NOW to recompute.</div>
+    </div>`;
+  }
+  const pctColor = v => v > 0 ? 'var(--up)' : (v < 0 ? 'var(--down)' : 'var(--muted)');
+  const fmt = v => v == null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`;
+  const hz = wb.horizons.filter(h => h.days > 0);
+  const td = 'padding:7px 10px;text-align:right';
+  const cell = (h, label) => {
+    const v = (h.variants || []).find(x => x.label === label);
+    if (!v) return `<td style="${td}">—</td><td style="${td}">—</td>`;
+    const c = v.w > v.l ? 'var(--up)' : v.l > v.w ? 'var(--down)' : 'var(--muted)';
+    return `<td style="${td};color:${c};font-weight:700">${v.w}–${v.t}–${v.l}</td>
+            <td style="${td};color:${pctColor(v.avgPct - h.currentAvgPct)}">${fmt(v.avgPct)}</td>`;
+  };
+  const labels = (hz[0].variants || []).map(v => v.label);
+  const rows = labels.map(label => `<tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:7px 10px;font-weight:700">${label}</td>${hz.map(h => cell(h, label)).join('')}
+    </tr>`).join('');
+  const refRow = (name, key, bold) => `<tr style="border-bottom:1px solid var(--border);background:var(--surface2)">
+      <td style="padding:7px 10px;${bold ? 'font-weight:700' : 'color:var(--muted)'}">${name}</td>
+      ${hz.map(h => `<td style="${td};color:var(--muted)">—</td><td style="${td};${bold ? 'font-weight:700' : 'color:var(--muted)'}">${fmt(h[key])}</td>`).join('')}
+    </tr>`;
+  const live = Math.max(...hz.map(h => h.daysLive || 0));
+  return `<div class="trade-section">
+    ${header(`Top-${wb.topN} picks each day re-ranked under each dream/AI split, then held a fixed number of trading days (buy-and-hold — stops and rotations not simulated) and compared with what the LIVE formula would have picked. AI score is rebuilt from price history (no analyst/news parts) before ${wb.since}${live ? `, live-scored after (${live} days)` : ''} · computed ${wb.computedAt}`)}
+    <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:16px;font-family:'DM Mono',monospace;background:var(--surface);border:1px solid var(--border);border-radius:8px">
+      <thead>
+        <tr style="color:var(--muted)">
+          <th style="padding:7px 10px;text-align:left" rowspan="2">DREAM/AI SPLIT</th>
+          ${hz.map(h => `<th colspan="2" style="padding:7px 10px;text-align:center;border-left:1px solid var(--border)">${h.h}-DAY HOLD<div style="font-weight:400;font-size:14px">${h.days} days · ${h.from.slice(5)}→${h.to.slice(5)}</div></th>`).join('')}
+        </tr>
+        <tr style="color:var(--muted);border-bottom:1px solid var(--border)">
+          ${hz.map(() => `<th style="${td};border-left:1px solid var(--border)">W–T–L</th><th style="${td}">AVG</th>`).join('')}
+        </tr>
+      </thead>
+      <tbody>${refRow('Current formula (live)', 'currentAvgPct', true)}${refRow('All candidates', 'poolAvgPct', false)}${rows}</tbody>
+    </table></div>
+    <div style="font-size:15px;color:var(--muted);margin-top:8px">W–T–L = days that split's top-${wb.topN} beat / tied / lost to the current formula's top-${wb.topN} (a tie means both picked the same stocks). AVG = average of each day's top-${wb.topN} median return, green when above the current formula's. Every day is measured over the same hold, so days compare fairly; longer holds cover fewer days because recent picks haven't been held that long yet. Read-only — it never changes live scoring; apply a split yourself in Admin → Scoring Matrix → Bucket Weights.</div>
+  </div>`;
+}
+
 function renderTradeAI(data) {
   const holdings = data.holdings || [];
   const transactions = data.transactions || [];
@@ -1125,6 +1209,8 @@ function renderTradeAI(data) {
       </div>
     </div>
   </div>
+
+  ${renderWeightBacktestSection(data.weightBacktest)}
 
   <!-- RECOMMEND SUMMARY SECTION -->
   <div class="trade-section">

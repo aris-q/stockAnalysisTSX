@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, redirect, jsonify, make_response
-import json, os, logging, threading, time, hashlib
+import json, os, logging, threading, time, hashlib, statistics
 from config import WATCHLIST, OUTPUT_PATH, NEWS_PATH, WATCHLIST_PATH, TRADES_AI_PATH, TRADE_AI_CANDIDATES_PATH
 try:
     from config import FRED_API_KEY, NEWSAPI_KEY, MACRO_PATH
@@ -279,7 +279,7 @@ def load_recommend_versions():
 def current_recommend_version():
     return load_recommend_versions()["versions"][-1]["version"]
 
-def bump_recommend_version(changes, label="", config_snapshot=None, based_on=None):
+def bump_recommend_version(changes, label="", config_snapshot=None, based_on=None, code_change=False):
     db = load_recommend_versions()
     new_v = db["versions"][-1]["version"] + 1
     if config_snapshot is None:
@@ -295,8 +295,9 @@ def bump_recommend_version(changes, label="", config_snapshot=None, based_on=Non
     if based_on:
         entry["basedOn"] = based_on
     # Don't-repeat-mistakes guard: flag if this exact config already existed
+    # (skipped for code_change: same config, but the scoring code itself changed)
     dup = next((v for v in db["versions"] if v.get("configHash") == entry["configHash"]), None)
-    if dup and not based_on:
+    if dup and not based_on and not code_change:
         entry["warning"] = f"Config identical to v{dup['version']} — check its results before expecting different ones"
     # Whole-account equity snapshot at the moment this version starts — lets
     # the Validation tab show a real "before this version vs now" return even
@@ -1244,6 +1245,222 @@ def _missed_gainers_summary(window_days=30, gain_threshold=5.0, limit=25):
     return rows[:limit]
 
 
+WEIGHT_BACKTEST_PATH = "output/weight_backtest.json"
+
+# Full 0/100 -> 100/0 sweep in 10pt steps. Adjacent splits within the
+# dream-dominant range pick nearly identical tickers (~5.9/6 overlap,
+# checked 2026-09-25), so finer steps would only add noise.
+WEIGHT_BACKTEST_CANDIDATES = [(d / 10, (10 - d) / 10) for d in range(11)]
+
+# Date the current AI score formula went live. Older shadow rows carry a
+# different AI score (Gemini until 2026-08-24, then a rule formula that
+# also scored fundamentals), so judging today's weighting on them would
+# be judging a different score. Bump this whenever _rule_based_assessment
+# changes.
+AI_SCORE_FORMULA_SINCE = "2026-09-26"
+
+
+def _rebuild_ai_scores(bars=42):
+    """Backfill `aiScoreRebuilt` on identified+ shadow rows dated before
+    AI_SCORE_FORMULA_SINCE: the CURRENT _rule_based_assessment, fed price
+    indicators rebuilt from daily bars strictly BEFORE each snapshot date
+    (no lookahead; same fetcher.price_indicators math the live fetch uses,
+    over ~the same 60-calendar-day window). Analyst upside and news can't
+    be rebuilt — Yahoo only has today's analyst target and old headlines
+    were never stored — so both count as neutral. Kept separate from
+    `aiScore` so live-recorded scores stay pure, and tagged with the
+    formula date so a future formula change triggers a fresh rebuild."""
+    import yfinance as yf
+    import pandas as pd
+    from fetcher import price_indicators
+
+    db = load_json(SHADOW_PATH, {"snapshots": []})
+    todo = [(snap["date"], r) for snap in db.get("snapshots", [])
+            if snap.get("date", "") < AI_SCORE_FORMULA_SINCE
+            for r in snap.get("rows", [])
+            if r.get("composite") is not None and r.get("aiScoreRebuiltFor") != AI_SCORE_FORMULA_SINCE]
+    if not todo:
+        return {"rebuilt": 0, "noHistory": 0}
+
+    tickers = sorted({r["ticker"] for _, r in todo})
+    start = (datetime.strptime(min(d for d, _ in todo), "%Y-%m-%d") - timedelta(days=120)).strftime("%Y-%m-%d")
+    end = max(d for d, _ in todo)  # yfinance end is exclusive — only bars before the last snapshot are needed
+    hist_by = {}
+    for i in range(0, len(tickers), 40):
+        chunk = tickers[i:i + 40]
+        try:
+            df = yf.download(chunk, start=start, end=end, group_by="ticker",
+                             auto_adjust=True, progress=False, threads=True)
+        except Exception as e:
+            log.warning(f"[AIScoreRebuild] download FAIL for {chunk[0]}..: {e}")
+            continue
+        for t in chunk:
+            try:
+                h = df[t] if isinstance(df.columns, pd.MultiIndex) else df
+                h = h.dropna(subset=["Close"])
+                if h.index.tz is not None:
+                    h.index = h.index.tz_localize(None)
+                if not h.empty:
+                    hist_by[t] = h
+            except KeyError:
+                pass
+
+    rebuilt = no_hist = 0
+    for date, r in todo:
+        h = hist_by.get(r["ticker"])
+        h = h[h.index < pd.Timestamp(date)].tail(bars) if h is not None else None
+        if h is None or len(h) < 30:
+            r["aiScoreRebuilt"] = None
+            no_hist += 1
+        else:
+            ind = price_indicators(h, r["ticker"])
+            detail = {k: ind[k] for k in ("rsi14", "bbPercent", "volumeRatio", "change1d", "change7d", "change30d")}
+            r["aiScoreRebuilt"] = _rule_based_assessment(r["ticker"], detail, [], r.get("bucket") or "Dream")["aiScore"]
+            rebuilt += 1
+        r["aiScoreRebuiltFor"] = AI_SCORE_FORMULA_SINCE
+    save_json(SHADOW_PATH, db)
+    log.info(f"[AIScoreRebuild] rebuilt {rebuilt} rows, {no_hist} without enough price history ({len(tickers)} tickers)")
+    return {"rebuilt": rebuilt, "noHistory": no_hist, "tickers": len(tickers)}
+
+FIXED_HORIZONS = [5, 10, 20]  # holding periods in trading days
+
+
+def _grade_fixed_horizons():
+    """Fill r["fwdH"] = {"5": pct, "10": pct, "20": pct} on identified+
+    shadow rows: return from the snapshot price to the close N trading days
+    later. fwdReturnPct is graded once, whenever the grading job first
+    reaches a snapshot (9 to 50 days later in practice), so days measured
+    different holding periods and couldn't be compared fairly — every row
+    here is measured over the same holds. Today's bar is never used (it
+    may be incomplete), and a horizon is only filled once it has fully
+    elapsed, so values never change after being written."""
+    import yfinance as yf
+    import pandas as pd
+
+    db = load_json(SHADOW_PATH, {"snapshots": []})
+    todo = [(snap["date"], r) for snap in db.get("snapshots", []) for r in snap.get("rows", [])
+            if r.get("composite") is not None and r.get("price") and not r.get("fwdHNoData")
+            and not all(str(h) in (r.get("fwdH") or {}) for h in FIXED_HORIZONS)]
+    if not todo:
+        return {"graded": 0}
+
+    tickers = sorted({r["ticker"] for _, r in todo})
+    start = min(d for d, _ in todo)
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    closes = {}
+    for i in range(0, len(tickers), 40):
+        chunk = tickers[i:i + 40]
+        try:
+            df = yf.download(chunk, start=start, end=today, group_by="ticker",
+                             auto_adjust=True, progress=False, threads=True)
+        except Exception as e:
+            log.warning(f"[FixedHorizon] download FAIL for {chunk[0]}..: {e}")
+            continue
+        for t in chunk:
+            try:
+                c = (df[t] if isinstance(df.columns, pd.MultiIndex) else df)["Close"].dropna()
+                if c.index.tz is not None:
+                    c.index = c.index.tz_localize(None)
+                closes[t] = c
+            except KeyError:
+                closes[t] = None
+
+    graded = 0
+    for date, r in todo:
+        if r["ticker"] not in closes:
+            continue  # download failed this run — retry next time
+        c = closes[r["ticker"]]
+        if c is None or c.empty:
+            r["fwdHNoData"] = True
+            continue
+        after = c[c.index > pd.Timestamp(date)]
+        fwd_h = r.setdefault("fwdH", {})
+        for h in FIXED_HORIZONS:
+            if str(h) not in fwd_h and len(after) >= h:
+                fwd_h[str(h)] = round((float(after.iloc[h - 1]) - r["price"]) / r["price"] * 100, 2)
+                graded += 1
+    save_json(SHADOW_PATH, db)
+    log.info(f"[FixedHorizon] filled {graded} horizon values across {len(todo)} rows")
+    return {"graded": graded}
+
+
+def _backtest_bucket_weights(top_n=6):
+    """Day-by-day A/B test: for each shadow snapshot, re-rank that day's
+    identified-or-further candidate pool by each dream/ai split and compare
+    the top-N picks' return against what the CURRENT formula would have
+    picked that same day, at each fixed holding period (FIXED_HORIZONS,
+    buy-and-hold — stops and rotations are not simulated). "Current" uses
+    each row's own bucket weights; the alternative applies the same split
+    to every bucket.
+
+    Only judges the current AI score formula: days on/after
+    AI_SCORE_FORMULA_SINCE use the live aiScore, earlier days use
+    aiScoreRebuilt (no analyst/news parts). Older recorded aiScores
+    (Gemini, prior rule formula) are never used. Refreshes the rebuilt
+    scores and fixed-horizon returns first (network), then computes."""
+    for step in (_rebuild_ai_scores, _grade_fixed_horizons):
+        try:
+            step()
+        except Exception as e:
+            log.warning(f"[WeightBacktest] {step.__name__} FAIL, using existing data: {e}")
+
+    bw = load_scoring_config().get("bucketWeights", {})
+    db = load_json(SHADOW_PATH, {"snapshots": []})
+
+    def current_score(r):
+        w = bw.get(r["bucket"], {"dream": 0.2, "ai": 0.6})
+        return r["dream"] * w.get("dream", 0.2) + r["ai"] * w.get("ai", 0.6)
+
+    days = []
+    for snap in db.get("snapshots", []):
+        live = snap.get("date", "") >= AI_SCORE_FORMULA_SINCE
+        ai_key = "aiScore" if live else "aiScoreRebuilt"
+        rows = [{"bucket": r["bucket"], "dream": r["dreamScore"], "ai": r[ai_key], "fwdH": r.get("fwdH") or {}}
+                for r in snap.get("rows", [])
+                if r.get("composite") is not None and r.get(ai_key) is not None
+                and r.get("dreamScore") is not None and r.get("bucket") in bw]
+        days.append((snap["date"], rows, live))
+
+    median_top = lambda rows, key, h: statistics.median([r["fwdH"][h] for r in sorted(rows, key=key, reverse=True)[:top_n]])
+    horizons = []
+    for hz in FIXED_HORIZONS:
+        h = str(hz)
+        usable = [(d, [r for r in rows if h in r["fwdH"]], live) for d, rows, live in days]
+        usable = [u for u in usable if len(u[1]) >= top_n]
+        if not usable:
+            horizons.append({"h": hz, "days": 0})
+            continue
+        cur = [median_top(rows, current_score, h) for _, rows, _ in usable]
+        pool = [statistics.median([r["fwdH"][h] for r in rows]) for _, rows, _ in usable]
+        variants = []
+        for ad, aa in WEIGHT_BACKTEST_CANDIDATES:
+            alt = [median_top(rows, lambda r: r["dream"] * ad + r["ai"] * aa, h) for _, rows, _ in usable]
+            # ties counted separately — both weightings often pick the same top-N
+            variants.append({
+                "label": f"{round(ad*100)}/{round(aa*100)}", "dream": ad, "ai": aa,
+                "w": sum(1 for a, c in zip(alt, cur) if a > c),
+                "t": sum(1 for a, c in zip(alt, cur) if a == c),
+                "l": sum(1 for a, c in zip(alt, cur) if a < c),
+                "avgPct": round(sum(alt) / len(alt), 2),
+            })
+        horizons.append({
+            "h": hz, "days": len(usable), "from": usable[0][0], "to": usable[-1][0],
+            "daysLive": sum(1 for u in usable if u[2]),
+            "currentAvgPct": round(sum(cur) / len(cur), 2),
+            "poolAvgPct": round(sum(pool) / len(pool), 2),
+            "variants": variants,
+        })
+
+    if horizons[0]["days"] < 5:
+        out = {"computedAt": ts(), "insufficient": True, "daysAvailable": horizons[0]["days"],
+               "daysNeeded": 5, "since": AI_SCORE_FORMULA_SINCE, "topN": top_n}
+    else:
+        out = {"computedAt": ts(), "since": AI_SCORE_FORMULA_SINCE, "topN": top_n, "horizons": horizons}
+    save_json(WEIGHT_BACKTEST_PATH, out)
+    log.info(f"[WeightBacktest] computed over {[(x['h'], x['days']) for x in horizons]} (horizon, days)")
+    return out
+
+
 def _flatten_cfg(d, prefix=""):
     out = {}
     for k, v in (d or {}).items():
@@ -1920,6 +2137,25 @@ def tradeai_account_tracker_run():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/tradeai/weight_backtest")
+def tradeai_weight_backtest_get():
+    """Read-only — whatever the last computed run (scheduled or manual)
+    left in output/weight_backtest.json. Returns {result: null} if it's
+    never been run yet rather than computing on a page load."""
+    return jsonify({"result": load_json(WEIGHT_BACKTEST_PATH, None)})
+
+
+@app.route("/tradeai/weight_backtest/run", methods=["POST"])
+def tradeai_weight_backtest_run():
+    """Manual trigger — refreshes rebuilt AI scores and fixed-horizon
+    returns (one batch price download), then computes. Synchronous."""
+    try:
+        return jsonify({"status": "ok", "result": _backtest_bucket_weights()})
+    except Exception as e:
+        log.error(f"[WeightBacktest] manual run FAIL: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 # ── MARKET ALERT ──────────────────────────────────────────────────────────────
 MARKET_ALERT_CACHE = {"data": None, "cachedAt": None}
 MARKET_ALERT_TTL   = 300   # seconds (5 min)
@@ -2382,16 +2618,20 @@ def _record_shadow_snapshot(scored, qualified, actual_buys, dream_map, holdings,
             price = live_prices.get(ticker) or s.get("price") or c.get("price")
             composite = s.get("composite")
             bucket = s.get("bucket")
+            # None (not 0) when no assessment ran, so the weight backtest can
+            # exclude it instead of treating "never scored" as a real 0.
+            ai_score = s.get("aiScore") if s.get("hasAI") else None
         else:
             outcome = "scanned_not_identified"
             price = c.get("price")
             composite = None
             bucket = None
+            ai_score = None
         if not price:
             continue
         rows.append({
             "ticker": ticker, "bucket": bucket, "outcome": outcome,
-            "composite": composite, "dreamScore": c.get("score"),
+            "composite": composite, "dreamScore": c.get("score"), "aiScore": ai_score,
             "rsi": bd.get("rsi"), "volumeRatio": bd.get("volumeRatio"),
             "rangeExpansion": bd.get("rangeExpansion"), "aboveMa50": bd.get("aboveMa50"),
             "dataCompleteness": bd.get("dataCompleteness"),
@@ -2709,13 +2949,21 @@ def run_tradeai_identify():
             and (momentum_vol_min is None or bd(c, "volumeRatio") is None
                  or bd(c, "volumeRatio") >= momentum_vol_min)
         ]
-        momentum_pool.sort(key=lambda c: bd(c, "rsi") or 0, reverse=True)
+        # Rank the RSI/aboveMa50-eligible pool by dream score, not raw RSI.
+        # RSI/aboveMa50 still DEFINE "momentum" (the eligibility filter
+        # above is unchanged) — but taking the top 8 by RSI alone let a
+        # fundamentally weak name bump a fundamentally strong one off the
+        # shortlist purely for being a couple RSI points more overbought.
+        # Ported from stock-analysis, where it was backtested on 14 days of
+        # shadow data (11/14 days better); TSX has no graded shadow history
+        # yet to re-test it on.
+        momentum_pool.sort(key=lambda c: c.get("score", 0) or 0, reverse=True)
         for c in momentum_pool[:8]:
             if len(result) >= CANDIDATE_SLOTS: break
             ticker = c["ticker"]
             seen.add(ticker)
             rsi_val = bd(c, "rsi")
-            reason = f"Momentum: RSI {rsi_val} — trending, not overextended"
+            reason = f"Momentum: RSI {rsi_val} (trending, not overextended), dream score {c.get('score', '?')} — ranked by score among RSI-eligible names"
             result.append({"ticker": ticker, "reason": reason, "source": c.get("source", "Dream"), "bucket": "Momentum"})
         log.info(f"[TradeAI Identify] Bucket 1 Momentum: {[r['ticker'] for r in result if r.get('bucket')=='Momentum']}")
 
@@ -2948,7 +3196,9 @@ def _rule_based_assessment(ticker, detail, news_items, bucket):
     """Create the assessment contract used by Recommend without an AI call."""
     detail = detail or {}
     value = lambda key, default=0: detail.get(key) if detail.get(key) is not None else default
-    rsi = float(value("rsi14", 50) or 50)
+    # Missing RSI stays missing — defaulting it to 50 landed inside the
+    # 45-65 reward band and gave a no-data ticker +12.
+    rsi = float(detail["rsi14"]) if detail.get("rsi14") is not None else None
     change1d = float(value("change1d") or 0)
     change7d = float(value("change7d") or 0)
     change30d = float(value("change30d") or 0)
@@ -2982,16 +3232,22 @@ def _rule_based_assessment(ticker, detail, news_items, bucket):
     negative_news = sum(news_text.count(word) for word in negative_words)
     news_sentiment = "Bullish" if positive_news > negative_news else "Bearish" if negative_news > positive_news else "Neutral"
 
-    score = 35
+    # Recent clues only — revenue growth and gross margin are long-term
+    # fundamentals already scored by the Dream score, and scoring them here
+    # too made the two scores ~0.67 rank-correlated. Base raised 35 -> 44 to
+    # offset their removal so the Strong Buy/Buy/Hold/Avoid mix (which
+    # drives forced "Avoid" sells) stays about the same. Same formula as
+    # stock-analysis: the removed points average +10.6 on TSX's identified
+    # pool vs +9.5 on the US one, and +6.4 vs +6.9 across each Dream universe.
+    score = 44
     score += 15 if change30d > 10 else 8 if change30d > 0 else -8 if change30d < -10 else 0
-    score += 12 if 45 <= rsi <= 65 else 5 if 35 <= rsi < 45 else -8 if rsi > 75 else 0
-    score += 8 if gross_margin >= 40 else 3 if gross_margin >= 20 else -5
-    score += 8 if revenue_growth >= 20 else 4 if revenue_growth >= 10 else -4 if revenue_growth < 0 else 0
+    if rsi is not None:
+        score += 12 if 45 <= rsi <= 65 else 5 if 35 <= rsi < 45 else -8 if rsi > 75 else 0
     score += 8 if analyst_upside >= 20 else 4 if analyst_upside >= 10 else 0
     score += 5 if volume_ratio >= 1.5 else 0
     score += 5 if trajectory == "Accelerating" else -5 if trajectory == "Decelerating" else 0
     score += 5 if news_sentiment == "Bullish" else -5 if news_sentiment == "Bearish" else 0
-    if bucket == "Reversal" and rsi < 40:
+    if bucket == "Reversal" and rsi is not None and rsi < 40:
         score += 8
     if bb_percent is not None and bb_percent < 0.1:
         score += 5
@@ -3003,7 +3259,7 @@ def _rule_based_assessment(ticker, detail, news_items, bucket):
         "sentiment": sentiment, "newsSentiment": news_sentiment,
         "trajectory": trajectory, "stage": stage, "confidence": "Rule-based",
         "reasoning": f"Rule assessment: {trajectory.lower()} price trend, {stage.lower()} profile, and {news_sentiment.lower()} recent-news signal.",
-        "forecastReason": f"Rule forecast uses RSI {rsi:.1f}, momentum {change7d:.1f}% over 7 days, and the current technical range.",
+        "forecastReason": f"Rule forecast uses RSI {f'{rsi:.1f}' if rsi is not None else 'n/a'}, momentum {change7d:.1f}% over 7 days, and the current technical range.",
         "promptSent": "Rule-based assessment; no AI provider used.",
     }
 
@@ -3834,6 +4090,7 @@ def get_tradeai():
         "benchmarks":         analysis_data.get("benchmarks", {}),
         "newsWarnings":       load_json(NEWS_WARNINGS_PATH, {"warnings": {}}).get("warnings", {}),
         "macroSignal":        _macro_risk_signal(),
+        "weightBacktest":     load_json(WEIGHT_BACKTEST_PATH, None),
         "resetPending":       load_json(RESET_PENDING_PATH, {"status": "none"}),
     })
 
@@ -4918,6 +5175,8 @@ SCHEDULER_DEFAULTS = {
     "recommendTimes":   ["10:00", "11:00"],
     "macroTime":        "13:00",  # daily — before dream/chain so the macro risk gate has today's data
     "dreamTime":        "13:30",
+    "accountTrackerTime": "17:04",  # daily, after close — portfolio value vs TSX/TSX 60
+    "weightBacktestTime": "17:06",  # daily — dream/AI weighting backtest over shadow history
     "tuningTime":       "16:15",  # Friday only — weekly missed-gainer tuning check
     "marketHolidays": [
         "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
@@ -5041,6 +5300,12 @@ def _scheduler_loop():
             if hhmm == cfg.get("macroTime"):
                 slots.append((f"macro-{hhmm}", "macroRefresh",
                               [("macro-refresh", run_macro_refresh)]))
+            if hhmm == cfg.get("accountTrackerTime"):
+                slots.append((f"accountTracker-{hhmm}", "accountTracker",
+                              [("account-tracker", _update_account_tracker)]))
+            if hhmm == cfg.get("weightBacktestTime"):
+                slots.append((f"weightBacktest-{hhmm}", "weightBacktest",
+                              [("weight-backtest", _backtest_bucket_weights)]))
             if hhmm == cfg.get("dreamTime") and not early_close:
                 slots.append((f"dream-{hhmm}", "dreamPreparation",
                               [("price-refresh", lambda: run_price_refresh("scheduler")),
@@ -5083,6 +5348,10 @@ def admin_scheduler():
                 saved["recommendTimes"] = [norm_time(t) for t in body["recommendTimes"]]
             if "dreamTime" in body:
                 saved["dreamTime"] = norm_time(body["dreamTime"])
+            if "accountTrackerTime" in body:
+                saved["accountTrackerTime"] = norm_time(body["accountTrackerTime"])
+            if "weightBacktestTime" in body:
+                saved["weightBacktestTime"] = norm_time(body["weightBacktestTime"])
             if "sellCheckHours" in body:
                 hours = sorted({int(h) for h in body["sellCheckHours"]})
                 if any(h < 0 or h > 23 for h in hours):

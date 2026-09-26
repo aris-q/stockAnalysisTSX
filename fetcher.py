@@ -1374,6 +1374,106 @@ def fetch_dream_candidates(watchlist_tickers, gainer_tickers, existing_candidate
 
 # ── TRADE DETAIL FETCH ────────────────────────────────────────────────────────
 
+def price_indicators(hist, ticker=""):
+    """Technical indicators from a daily-bar history, as of its LAST bar.
+    Shared by fetch_trade_detail (live) and the AI score history rebuild
+    (app._rebuild_ai_scores, which passes history truncated to a past
+    date) so both compute identical values."""
+    ind = dict.fromkeys(["rsi14", "ma50", "ma20", "bbPercent", "atr14", "atr14Pct", "volumeRatio",
+                         "change1d", "change2d", "change3d", "change4d", "change5d", "change7d", "change30d"])
+
+    # RSI 14
+    try:
+        delta = hist['Close'].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss
+        rsi_series = 100 - (100 / (1 + rs))
+        _v = rsi_series.iloc[-1]
+        ind["rsi14"] = round(float(_v), 1) if not math.isnan(float(_v)) else None
+    except Exception as e:
+        log.warning(f"price_indicators RSI FAIL: {ticker} | {e}")
+
+    # MA50
+    try:
+        if len(hist) >= 35:
+            _m = hist['Close'].rolling(50).mean().iloc[-1]
+            ind["ma50"] = round(float(_m), 2) if not math.isnan(float(_m)) else None
+    except Exception as e:
+        log.warning(f"price_indicators MA50 FAIL: {ticker} | {e}")
+
+    # MA20
+    try:
+        if len(hist) >= 20:
+            ind["ma20"] = round(float(hist['Close'].rolling(20).mean().iloc[-1]), 2)
+    except Exception as e:
+        log.warning(f"price_indicators MA20 FAIL: {ticker} | {e}")
+
+    # Bollinger Band %B
+    try:
+        close = hist['Close']
+        bb_mid = close.rolling(20).mean()
+        bb_std = close.rolling(20).std()
+        bb_upper = bb_mid + 2 * bb_std
+        bb_lower = bb_mid - 2 * bb_std
+        band_width = bb_upper.iloc[-1] - bb_lower.iloc[-1]
+        if band_width and band_width != 0:
+            ind["bbPercent"] = round(float((close.iloc[-1] - bb_lower.iloc[-1]) / band_width), 3)
+    except Exception as e:
+        log.warning(f"price_indicators BB FAIL: {ticker} | {e}")
+
+    # ATR14 (Average True Range) — feeds the volatility-adjusted stop-loss:
+    # a stock's own typical daily range, not a one-size-fits-all flat %.
+    try:
+        if len(hist) >= 15:
+            high, low, close = hist['High'], hist['Low'], hist['Close']
+            prev_close = close.shift(1)
+            true_range = (high - low).combine((high - prev_close).abs(), max) \
+                                      .combine((low - prev_close).abs(), max)
+            _atr = true_range.rolling(14).mean().iloc[-1]
+            if not math.isnan(float(_atr)):
+                ind["atr14"] = round(float(_atr), 4)
+                last_price = float(close.iloc[-1])
+                if last_price > 0:
+                    ind["atr14Pct"] = round(ind["atr14"] / last_price * 100, 2)
+    except Exception as e:
+        log.warning(f"price_indicators ATR14 FAIL: {ticker} | {e}")
+
+    # Volume ratio — today's volume vs 20-day average (surge/breakout signal)
+    try:
+        if 'Volume' in hist.columns and len(hist) >= 2:
+            vol_today = float(hist['Volume'].iloc[-1])
+            avg_window = hist['Volume'].iloc[-21:-1] if len(hist) >= 21 else hist['Volume'].iloc[:-1]
+            vol_avg = float(avg_window.mean()) if len(avg_window) > 0 else None
+            if vol_avg and vol_avg > 0:
+                ind["volumeRatio"] = round(vol_today / vol_avg, 2)
+    except Exception as e:
+        log.warning(f"price_indicators volumeRatio FAIL: {ticker} | {e}")
+
+    # Price changes
+    try:
+        c = hist['Close']
+        pct = lambda a, b: round((c.iloc[a] - c.iloc[b]) / c.iloc[b] * 100, 2)
+        if len(hist) >= 2:
+            ind["change1d"] = pct(-1, -2)
+        if len(hist) >= 3:
+            ind["change2d"] = pct(-2, -3)
+        if len(hist) >= 4:
+            ind["change3d"] = pct(-3, -4)
+        if len(hist) >= 5:
+            ind["change4d"] = pct(-4, -5)
+        if len(hist) >= 6:
+            ind["change5d"] = pct(-5, -6)
+        if len(hist) >= 7:
+            ind["change7d"] = pct(-1, -7)
+        if len(hist) >= 30:
+            ind["change30d"] = pct(-1, -30)
+    except Exception as e:
+        log.warning(f"price_indicators price changes FAIL: {ticker} | {e}")
+
+    return ind
+
+
 def fetch_trade_detail(ticker):
     """Fetch enriched detail for a trade candidate: price, technicals, key financials."""
     try:
@@ -1386,101 +1486,12 @@ def fetch_trade_detail(ticker):
             return None
 
         hist = stock.history(period="60d")
-
-        # RSI 14
-        rsi = None
-        try:
-            delta = hist['Close'].diff()
-            gain = delta.clip(lower=0).rolling(14).mean()
-            loss = (-delta.clip(upper=0)).rolling(14).mean()
-            rs = gain / loss
-            rsi_series = 100 - (100 / (1 + rs))
-            _v = rsi_series.iloc[-1]
-            rsi = round(float(_v), 1) if not math.isnan(float(_v)) else None
-        except Exception as e:
-            log.warning(f"fetch_trade_detail RSI FAIL: {ticker} | {e}")
-
-        # MA50
-        ma50 = None
-        try:
-            if len(hist) >= 35:
-                _m = hist['Close'].rolling(50).mean().iloc[-1]
-                ma50 = round(float(_m), 2) if not math.isnan(float(_m)) else None
-        except Exception as e:
-            log.warning(f"fetch_trade_detail MA50 FAIL: {ticker} | {e}")
-
-        # MA20
-        ma20 = None
-        try:
-            if len(hist) >= 20:
-                ma20 = round(float(hist['Close'].rolling(20).mean().iloc[-1]), 2)
-        except Exception as e:
-            log.warning(f"fetch_trade_detail MA20 FAIL: {ticker} | {e}")
-
-        # Bollinger Band %B
-        bb_percent = None
-        try:
-            close = hist['Close']
-            bb_mid = close.rolling(20).mean()
-            bb_std = close.rolling(20).std()
-            bb_upper = bb_mid + 2 * bb_std
-            bb_lower = bb_mid - 2 * bb_std
-            band_width = bb_upper.iloc[-1] - bb_lower.iloc[-1]
-            if band_width and band_width != 0:
-                bb_percent = round(float((close.iloc[-1] - bb_lower.iloc[-1]) / band_width), 3)
-        except Exception as e:
-            log.warning(f"fetch_trade_detail BB FAIL: {ticker} | {e}")
-
-        # ATR14 (Average True Range) — feeds the volatility-adjusted stop-loss:
-        # a stock's own typical daily range, not a one-size-fits-all flat %.
-        atr14 = None
-        atr14_pct = None
-        try:
-            if len(hist) >= 15:
-                high, low, close = hist['High'], hist['Low'], hist['Close']
-                prev_close = close.shift(1)
-                true_range = (high - low).combine((high - prev_close).abs(), max) \
-                                          .combine((low - prev_close).abs(), max)
-                _atr = true_range.rolling(14).mean().iloc[-1]
-                if not math.isnan(float(_atr)):
-                    atr14 = round(float(_atr), 4)
-                    last_price = float(close.iloc[-1])
-                    if last_price > 0:
-                        atr14_pct = round(atr14 / last_price * 100, 2)
-        except Exception as e:
-            log.warning(f"fetch_trade_detail ATR14 FAIL: {ticker} | {e}")
-
-        # Volume ratio — today's volume vs 20-day average (surge/breakout signal)
-        volume_ratio = None
-        try:
-            if 'Volume' in hist.columns and len(hist) >= 2:
-                vol_today = float(hist['Volume'].iloc[-1])
-                avg_window = hist['Volume'].iloc[-21:-1] if len(hist) >= 21 else hist['Volume'].iloc[:-1]
-                vol_avg = float(avg_window.mean()) if len(avg_window) > 0 else None
-                if vol_avg and vol_avg > 0:
-                    volume_ratio = round(vol_today / vol_avg, 2)
-        except Exception as e:
-            log.warning(f"fetch_trade_detail volumeRatio FAIL: {ticker} | {e}")
-
-        # Price changes
-        change1d = change2d = change3d = change4d = change5d = change7d = change30d = None
-        try:
-            if len(hist) >= 2:
-                change1d = round((hist['Close'].iloc[-1] - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2] * 100, 2)
-            if len(hist) >= 3:
-                change2d = round((hist['Close'].iloc[-2] - hist['Close'].iloc[-3]) / hist['Close'].iloc[-3] * 100, 2)
-            if len(hist) >= 4:
-                change3d = round((hist['Close'].iloc[-3] - hist['Close'].iloc[-4]) / hist['Close'].iloc[-4] * 100, 2)
-            if len(hist) >= 5:
-                change4d = round((hist['Close'].iloc[-4] - hist['Close'].iloc[-5]) / hist['Close'].iloc[-5] * 100, 2)
-            if len(hist) >= 6:
-                change5d = round((hist['Close'].iloc[-5] - hist['Close'].iloc[-6]) / hist['Close'].iloc[-6] * 100, 2)
-            if len(hist) >= 7:
-                change7d = round((hist['Close'].iloc[-1] - hist['Close'].iloc[-7]) / hist['Close'].iloc[-7] * 100, 2)
-            if len(hist) >= 30:
-                change30d = round((hist['Close'].iloc[-1] - hist['Close'].iloc[-30]) / hist['Close'].iloc[-30] * 100, 2)
-        except Exception as e:
-            log.warning(f"fetch_trade_detail price changes FAIL: {ticker} | {e}")
+        ind = price_indicators(hist, ticker)
+        rsi, ma50, ma20, bb_percent = ind["rsi14"], ind["ma50"], ind["ma20"], ind["bbPercent"]
+        atr14, atr14_pct, volume_ratio = ind["atr14"], ind["atr14Pct"], ind["volumeRatio"]
+        change1d, change2d, change3d, change4d, change5d, change7d, change30d = (
+            ind["change1d"], ind["change2d"], ind["change3d"], ind["change4d"],
+            ind["change5d"], ind["change7d"], ind["change30d"])
 
         # Key financials
         revenue_growth = info.get("revenueGrowth")
