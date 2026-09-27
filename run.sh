@@ -17,5 +17,5 @@ source venv/bin/activate
 echo "Checking dependencies..."
 pip install -q -r requirements.txt
 
-echo "Starting app — open http://127.0.0.1:5090"
+echo "Starting app — open http://127.0.0.1:5051"
 python3 app.py
