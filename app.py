@@ -5620,4 +5620,7 @@ if __name__ == "__main__":
     # re-executes this module, doubling every background thread (scheduler,
     # startup refresh) and causing duplicate scheduled runs — e.g. two
     # concurrent Analyze passes blowing the 20-request/day Gemini quota.
-    app.run(debug=True, port=5050, use_reloader=False)
+    # 5051, not 5050: stock-analysis (US) uses 5050 and its stock.bat
+    # refuses to start while anything holds that port, so sharing it meant
+    # only one of the two apps could ever run at a time.
+    app.run(debug=True, port=5051, use_reloader=False)
