@@ -47,10 +47,10 @@ def _epoch_for_date(date_str, epochs):
         else:
             break
     return matched
-from fetcher import fetch_yfinance, fetch_daily_gainers, fetch_news, fetch_price_context, fetch_price_only, fetch_macro_data, fetch_dream_candidates, fetch_trade_detail, fetch_ticker_news, fetch_live_prices, fetch_prev_closes, fetch_index_trend_signal, _next_fomc_date, FOMC_MEETING_DATES
+from fetcher import fetch_yfinance, fetch_daily_gainers, fetch_news, fetch_price_only, fetch_macro_data, fetch_dream_candidates, fetch_trade_detail, fetch_ticker_news, fetch_live_prices, fetch_prev_closes, fetch_index_trend_signal, _next_fomc_date, FOMC_MEETING_DATES
 from compute import process_watchlist
-from ai_summary import generate_summary, generate_recommendations, generate_followup, generate_news_impact
-from refresh_manager import check_what_needs_refresh, needs_news_refresh, now, hours_since
+from ai_summary import generate_summary, generate_recommendations, generate_followup
+from refresh_manager import check_what_needs_refresh, now, hours_since
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -75,10 +75,6 @@ def _sanitize_str(s):
     if not isinstance(s, str):
         return s
     return s.replace('\x00', '').replace('\r', ' ')
-
-def _sanitize_news(items):
-    return [{k: _sanitize_str(v) for k, v in item.items()} for item in items]
-
 
 def load_watchlist():
     try:
@@ -378,6 +374,81 @@ def _cap_filtered_candidates(candidates_sorted, holdings, details, identify_rule
     return kept
 
 
+def _keep_recent_if_empty(new_articles, old_articles, days=7):
+    """An empty fetch must not wipe stored articles that are still recent —
+    on 2026-10-01 a Yahoo news-feed outage replaced every ticker's news
+    with an empty list. A real "no news" result loses nothing by this:
+    old articles are only kept while they're inside the same 7-day window."""
+    if new_articles:
+        return new_articles
+    cutoff = datetime.now(TZ) - timedelta(days=days)
+    kept = []
+    for a in old_articles or []:
+        try:
+            if datetime.fromisoformat(str(a.get("pubDate", "")).replace("Z", "+00:00")) >= cutoff:
+                kept.append(a)
+        except ValueError:
+            pass
+    return kept
+
+
+def _news_tickers():
+    """Everything the app shows or scores: holdings, watchlist, today's
+    Identify candidates."""
+    wl = load_json(WATCHLIST_PATH, [])
+    wl = wl if isinstance(wl, list) else wl.get("watchlist", [])
+    identified = [i["ticker"] for i in load_json(TRADE_AI_CANDIDATES_PATH, {}).get("identified", [])]
+    return sorted(set(load_trades_ai().get("holdings", {})) | set(wl) | set(identified))
+
+
+def run_news_refresh(trigger="manual"):
+    """The one news fetch: scheduled at newsTimes (default 09:20 and 12:30)
+    plus the TradeAI REFRESH NEWS button. Refreshes every ticker from
+    _news_tickers(), then re-runs the severe-news scan on holdings. Other
+    code paths read the stored news instead of fetching their own."""
+    global fetch_status
+    tickers = _news_tickers()
+    total = len(tickers)
+    fetch_status = {"running": True, "message": f"News: refreshing {total} tickers...", "operation": "news_refresh",
+                    "current": 0, "total": total, "current_ticker": ""}
+    log.info(f"=== News Refresh Started [{trigger}]: {total} tickers ===")
+    try:
+        news_db = load_json(NEWS_PATH, {})
+        with_news = 0
+        for i, t in enumerate(tickers, 1):
+            fetch_status.update({"current": i, "current_ticker": t, "message": f"News: {i} of {total} — {t}"})
+            _refresh_ticker_news_if_stale(t, news_db, max_age_hours=-1)  # -1 forces a refresh
+            with_news += bool(news_db.get(t, {}).get("articles"))
+        save_json(NEWS_PATH, news_db)
+        try:
+            _scan_news_warnings(list(load_trades_ai().get("holdings", {})), news_db)
+        except Exception as e:
+            log.warning(f"[NewsWarning] scan FAIL: {e}")
+        msg = f"News refreshed: {total} tickers, {with_news} with recent news"
+        fetch_status = {"running": False, "message": msg, "operation": None, "current": total, "total": total, "current_ticker": ""}
+        log.info(f"=== News Refresh Complete [{trigger}]: {msg} ===")
+    except Exception as e:
+        log.error(f"News refresh FAIL: {e}")
+        fetch_status = {"running": False, "message": f"News refresh FAIL: {e}", "operation": None}
+
+
+@app.route("/news/refresh_all", methods=["POST"])
+def news_refresh_all():
+    if fetch_status.get("running"):
+        return jsonify({"error": "Another operation is running"}), 409
+    threading.Thread(target=run_news_refresh, args=("manual",), daemon=True).start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/news/headlines/<ticker>")
+def news_headlines(ticker):
+    """Stored headlines only — no fetching, no AI analysis."""
+    entry = load_json(NEWS_PATH, {}).get(ticker, {})
+    items = sorted(entry.get("articles", []), key=lambda a: a.get("pubDate", ""), reverse=True)
+    return jsonify({"ticker": ticker, "fetchedAt": entry.get("fetchedAt"),
+                    "items": [{k: a.get(k, "") for k in ("title", "url", "provider", "pubDate")} for a in items]})
+
+
 def _refresh_ticker_news_if_stale(ticker, news_db, max_age_hours=4):
     """Fetch and merge fresh news articles for `ticker` into news_db if the
     cached copy is older than max_age_hours (or missing). Merges into
@@ -392,7 +463,7 @@ def _refresh_ticker_news_if_stale(ticker, news_db, max_age_hours=4):
         return False
     try:
         articles = fetch_ticker_news(ticker)
-        entry["articles"] = articles
+        entry["articles"] = _keep_recent_if_empty(articles, entry.get("articles"))
         entry["fetchedAt"] = ts()
         news_db[ticker] = entry
         return True
@@ -1810,100 +1881,6 @@ def api_holding_tickers():
     log.info(f"[HoldingTickers] {tickers}")
     return jsonify({"holdingTickers": tickers})
 
-@app.route("/news/<ticker>")
-def get_news(ticker):
-    try:
-        today_only = request.args.get("today") == "1"
-        news_db = load_json(NEWS_PATH, {})
-        news_entry = news_db.get(ticker, {})
-
-        if needs_news_refresh(news_entry, today_only=today_only):
-            all_news = fetch_news(ticker)
-            if today_only:
-                from datetime import date as dt_date
-                today_str = str(dt_date.today())
-                news_items = [n for n in all_news if n.get("pubDate", "").startswith(today_str)]
-                news_entry["todayItems"] = news_items
-                news_entry["todayFetchedAt"] = ts()
-            else:
-                news_entry["sevenDayItems"] = all_news
-                news_entry["sevenDayFetchedAt"] = ts()
-            news_db[ticker] = news_entry
-            save_json(NEWS_PATH, news_db)
-            log.info(f"News saved: {ticker} | today:{today_only}")
-        else:
-            news_items = news_entry.get("todayItems" if today_only else "sevenDayItems", [])
-            log.info(f"News from cache: {ticker} | today:{today_only} | {len(news_items)} articles")
-
-        news_items = news_entry.get("todayItems" if today_only else "sevenDayItems", [])
-        news_items = _sanitize_news(news_items)
-
-        existing = load_json(OUTPUT_PATH, {"watchlist": []})
-        stock = next((s for s in existing.get("watchlist", []) if s["ticker"] == ticker), {})
-        price_context = fetch_price_context(ticker)
-
-        if not news_items:
-            return jsonify({"error": "No news found", "items": [], "impact": None, "priceContext": price_context})
-
-        impact = None
-        try:
-            impact = generate_news_impact(ticker, news_items, stock, price_context)
-        except Exception as e:
-            log.error(f"News impact generation FAIL: {ticker} | {e}")
-            impact = {
-                "overallSentiment": "neutral",
-                "sentimentScore": 0,
-                "marketConfirmation": "UNKNOWN",
-                "summary": "AI analysis unavailable",
-                "priceImpact": "Unknown",
-                "keyThemes": [],
-                "tradingImplication": "N/A",
-                "watchFor": "N/A",
-                "newsItems": []
-            }
-
-        impact_key = "todayImpact" if today_only else "sevenDayImpact"
-        impact_ts_key = "todayImpactAt" if today_only else "sevenDayImpactAt"
-        news_entry[impact_key] = impact
-        news_entry[impact_ts_key] = ts()
-        news_db[ticker] = news_entry
-        save_json(NEWS_PATH, news_db)
-        log.info(f"News impact saved: {ticker} | today:{today_only} | sentiment:{impact.get('overallSentiment')}")
-
-        log.info(f"News route OK: {ticker} | items:{len(news_items)} sentiment:{impact.get('overallSentiment')}")
-        return jsonify({
-            "items": news_items,
-            "impact": impact,
-            "priceContext": price_context,
-            "cached": not needs_news_refresh(news_entry, today_only)
-        })
-    except Exception as e:
-        log.error(f"News route FAIL: {ticker} | {e}")
-        return jsonify({"error": str(e), "items": [], "impact": None, "priceContext": {}})
-
-
-@app.route("/news/cached-impact/<ticker>")
-def get_cached_news_impact(ticker):
-    try:
-        news_db = load_json(NEWS_PATH, {})
-        entry = news_db.get(ticker, {})
-        result = {
-            "sevenDay": {
-                "impact": entry.get("sevenDayImpact"),
-                "fetchedAt": entry.get("sevenDayImpactAt"),
-            },
-            "today": {
-                "impact": entry.get("todayImpact"),
-                "fetchedAt": entry.get("todayImpactAt"),
-            }
-        }
-        log.info(f"Cached impact served: {ticker} | 7d:{bool(result['sevenDay']['impact'])} today:{bool(result['today']['impact'])}")
-        return jsonify(result)
-    except Exception as e:
-        log.error(f"Cached impact FAIL: {ticker} | {e}")
-        return jsonify({"sevenDay": {}, "today": {}})
-
-
 @app.route("/")
 def index():
     resp = make_response(render_template("index.html", watchlist=watchlist, status=fetch_status))
@@ -3100,8 +3077,6 @@ def run_tradeai_fetch():
         total = len(fetch_list)
         fetch_status["total"] = total
         details = candidates_data.get("details", {})
-        news_db = load_json(NEWS_PATH, {})
-        news_updated = False
         for idx, item in enumerate(fetch_list, 1):
             if stop_flag:
                 log.info(f"[TradeAI Fetch] Stopped by user at {idx}/{total}")
@@ -3134,16 +3109,9 @@ def run_tradeai_fetch():
                     log.info(f"TradeAI fetch OK: {ticker} | price:{detail.get('price')} rsi:{rsi_val}")
             except Exception as e:
                 log.error(f"TradeAI fetch FAIL: {ticker} | {e}")
-            # Bulk news refresh — keeps _rule_based_assessment's newsSentiment
-            # (and the severe-news warning scan) fed with real, same-day
-            # headlines instead of running dry until someone clicks a ticker.
-            try:
-                if _refresh_ticker_news_if_stale(ticker, news_db, max_age_hours=4):
-                    news_updated = True
-            except Exception as ne:
-                log.warning(f"TradeAI fetch news FAIL: {ticker} | {ne}")
-        if news_updated:
-            save_json(NEWS_PATH, news_db)
+            # News is no longer fetched here — run_news_refresh (09:20 and
+            # 12:30, plus the REFRESH NEWS button) keeps it fresh for every
+            # ticker before the 10:00+ Recommend runs read it.
         candidates_data["details"] = details
         candidates_data["detailsFetchedAt"] = ts()
         save_json(TRADE_AI_CANDIDATES_PATH, candidates_data)
@@ -4052,6 +4020,8 @@ def get_tradeai():
         ticker = item["ticker"]
         entry = news_db.get(ticker, {})
         news_ts_map[ticker] = entry.get("fetchedAt") or entry.get("updatedAt") or None
+    news_count_map = {t: len(news_db.get(t, {}).get("articles", []))
+                      for t in {*trades.get("holdings", {}), *(i["ticker"] for i in identified)}}
 
     # Load today's signal forecasts for per-ticker display
     today_str = datetime.now(TZ).strftime("%Y-%m-%d")
@@ -4084,6 +4054,7 @@ def get_tradeai():
         "signalForecastAt":   candidates.get("signalForecastAt"),
         "aiAnalyzedAt":       candidates.get("aiAnalyzedAt"),
         "newsTsMap":          news_ts_map,
+        "newsCountMap":       news_count_map,
         "signalFcMap":        signal_fc_map,
         "rollbackProposal":   load_json(ROLLBACK_PROPOSAL_PATH, {"status": "none"}),
         "tuningProposal":     load_json(TUNING_PROPOSAL_PATH, {"status": "none"}),
@@ -4122,17 +4093,11 @@ def run_tradeai_sell_check(trigger="manual"):
         SELL_CFG = cfg["sellThresholds"]
         EXEC_CFG = cfg.get("execution", {})
 
-        # Severe-news watch on held positions: fresh news (1h cache — this
-        # cycle runs every ~20 min so it's still cheap) then scan for
-        # red-flag keywords. Flags only — never sells on its own.
+        # Severe-news watch on held positions: scan the stored news (kept
+        # fresh by run_news_refresh at 09:20/12:30 and the REFRESH NEWS
+        # button) for red-flag keywords. Flags only — never sells on its own.
         try:
             news_db = load_json(NEWS_PATH, {})
-            news_updated = False
-            for t in holdings.keys():
-                if _refresh_ticker_news_if_stale(t, news_db, max_age_hours=1):
-                    news_updated = True
-            if news_updated:
-                save_json(NEWS_PATH, news_db)
             _scan_news_warnings(list(holdings.keys()), news_db)
         except Exception as nwe:
             log.warning(f"[NewsWarning] scan FAIL: {nwe}")
@@ -5146,7 +5111,7 @@ def refresh_ticker_news(ticker):
     """On-demand news refresh for any ticker. Saves into shared news.json."""
     try:
         news_db = load_json(NEWS_PATH, {})
-        articles = fetch_ticker_news(ticker)
+        articles = _keep_recent_if_empty(fetch_ticker_news(ticker), (news_db.get(ticker) or {}).get("articles"))
         news_db[ticker] = {
             "articles": articles,
             "fetchedAt": ts(),
@@ -5177,6 +5142,7 @@ SCHEDULER_DEFAULTS = {
     "dreamTime":        "13:30",
     "accountTrackerTime": "17:04",  # daily, after close — portfolio value vs TSX/TSX 60
     "weightBacktestTime": "17:06",  # daily — dream/AI weighting backtest over shadow history
+    "newsTimes":        ["09:20", "12:30"],  # the only scheduled news fetch — before the open, and midday before the afternoon Recommends
     "tuningTime":       "16:15",  # Friday only — weekly missed-gainer tuning check
     "marketHolidays": [
         "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
@@ -5303,6 +5269,9 @@ def _scheduler_loop():
             if hhmm == cfg.get("accountTrackerTime"):
                 slots.append((f"accountTracker-{hhmm}", "accountTracker",
                               [("account-tracker", _update_account_tracker)]))
+            if hhmm in cfg.get("newsTimes", []):
+                slots.append((f"news-{hhmm}", "newsRefresh",
+                              [("news-refresh", lambda: run_news_refresh("scheduler"))]))
             if hhmm == cfg.get("weightBacktestTime"):
                 slots.append((f"weightBacktest-{hhmm}", "weightBacktest",
                               [("weight-backtest", _backtest_bucket_weights)]))
@@ -5350,6 +5319,8 @@ def admin_scheduler():
                 saved["dreamTime"] = norm_time(body["dreamTime"])
             if "accountTrackerTime" in body:
                 saved["accountTrackerTime"] = norm_time(body["accountTrackerTime"])
+            if "newsTimes" in body:
+                saved["newsTimes"] = [norm_time(t) for t in body["newsTimes"]]
             if "weightBacktestTime" in body:
                 saved["weightBacktestTime"] = norm_time(body["weightBacktestTime"])
             if "sellCheckHours" in body:

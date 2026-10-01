@@ -196,6 +196,13 @@ function renderTickerDetail(s) {
       + '</div></div>';
   }
 
+  // Recent news — headlines with links (filled by loadTickerNews after render)
+  html += '<div class="card-section expanded">'
+    + '<div class="section-title" onclick="toggleSection(this)">RECENT NEWS</div>'
+    + '<span class="section-toggle" onclick="toggleSection(this)">−</span>'
+    + '<div class="section-content"><div id="ticker-news-' + s.ticker + '" style="color:var(--muted);font-size:16px">Loading news...</div></div>'
+    + '</div>';
+
   // Key Metrics (expanded)
   html += `
   <div class="card-section expanded">
@@ -414,6 +421,9 @@ async function loadSchedulerStatus() {
         <span>Account tracker (portfolio value vs TSX/TSX 60)</span>
         <span><input id="schedAcctTrackerTime" value="${cfg.accountTrackerTime||''}" style="${inp};width:60px"></span>
         <span>${fmt('accountTracker')}</span>
+        <span>News refresh (holdings, watchlist, candidates)</span>
+        <span><input id="schedNewsTimes" value="${(cfg.newsTimes||[]).join(', ')}" style="${inp};width:130px"></span>
+        <span>${fmt('newsRefresh')}</span>
         <span>Scoring weight backtest (dream/AI split vs shadow history — see TradeAI tab)</span>
         <span><input id="schedWeightBacktestTime" value="${cfg.weightBacktestTime||''}" style="${inp};width:60px"></span>
         <span>${fmt('weightBacktest')}</span>
@@ -440,6 +450,7 @@ async function saveSchedule(btn) {
   const dream    = document.getElementById('schedDreamTime').value.trim();
   const acctTracker = document.getElementById('schedAcctTrackerTime').value.trim();
   const weightBacktest = document.getElementById('schedWeightBacktestTime').value.trim();
+  const newsTimes = listOf('schedNewsTimes');
   const timeRe = /^([01]?\d|2[0-3]):[0-5]\d$/;
   if (!hours.length || hours.some(h => isNaN(h) || h < 0 || h > 23)) { alert('Sell-check hours must be numbers 0-23 (e.g. 9,10,11)'); return; }
   if (!mins.length || mins.some(m => isNaN(m) || m < 0 || m > 59))   { alert('Sell-check minutes must be numbers 0-59 (e.g. 20,40)'); return; }
@@ -447,11 +458,12 @@ async function saveSchedule(btn) {
   if (!timeRe.test(dream)) { alert('Dream time must be HH:MM 24h (e.g. 16:01)'); return; }
   if (!timeRe.test(acctTracker)) { alert('Account tracker time must be HH:MM 24h (e.g. 17:04)'); return; }
   if (!timeRe.test(weightBacktest)) { alert('Weight backtest time must be HH:MM 24h (e.g. 17:06)'); return; }
+  if (!newsTimes.length || !newsTimes.every(t => timeRe.test(t))) { alert('News times must be HH:MM 24h (e.g. 09:20, 12:30)'); return; }
   btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
   try {
     const r = await fetch('/admin/scheduler', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream, accountTrackerTime: acctTracker, weightBacktestTime: weightBacktest })
+      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream, accountTrackerTime: acctTracker, weightBacktestTime: weightBacktest, newsTimes })
     });
     const d = await r.json();
     if (d.error) alert('Save failed: ' + d.error);
@@ -566,7 +578,7 @@ async function loadData() {
     // Build/update ticker tabs
 
     stocks.forEach(s => {
-      loadCachedNewsImpact(s.ticker);
+      loadTickerNews(s.ticker);
       const ai = s.aiSummary || {};
       (ai.eventImpacts || []).forEach(e => {
         if (e.event) checkFollowupCache(s.ticker, e.event);
@@ -853,158 +865,6 @@ async function getFollowupPlan(ticker, eventName, btn, forceRefresh=false) {
   } catch(e) {
     console.error('Followup error:', e);
     body.innerHTML = `<div class="modal-loading" style="color:var(--down)">Failed to load plan. Check logs.</div>`;
-  } finally {
-    btn.textContent = origText;
-    btn.disabled = false;
-  }
-}
-
-async function getNews(ticker, btn, todayOnly=false) {
-  const modal = document.getElementById('newsModal');
-  const body = document.getElementById('newsBody');
-  const title = document.getElementById('newsTitle');
-  const subtitle = document.getElementById('newsSubtitle');
-  title.textContent = ticker + (todayOnly ? ' — TODAY\'S NEWS' : ' — 7 DAY NEWS');
-  subtitle.textContent = todayOnly ? 'Fetching today\'s news...' : 'Fetching last 7 days of news...';
-  body.innerHTML = `<div class="modal-loading">📰 Fetching ${todayOnly ? "today's" : "7-day"} news & running AI analysis...<br><span style="font-size:11px;color:var(--muted)">This may take 30-60 seconds</span></div>`;
-  modal.classList.add('visible');
-  const origText = btn.textContent;
-  btn.textContent = '⏳ Loading...';
-  btn.disabled = true;
-  try {
-    const url = `/news/${ticker}${todayOnly ? '?today=1' : ''}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    console.log('News response:', JSON.stringify(data).slice(0, 500));
-    if (data.error && !data.items.length) {
-      body.innerHTML = `<div class="modal-loading" style="color:var(--muted)">${data.error}</div>`;
-      return;
-    }
-    const impact = data.impact || {};
-    const items = data.items || [];
-    const pc = data.priceContext || {};
-    const score = impact.sentimentScore || 0;
-    const sentiment = (impact.overallSentiment || 'neutral').toLowerCase();
-    const scoreClass = score > 0 ? 'positive' : score < 0 ? 'negative' : 'neutral-score';
-    const confirmation = (impact.marketConfirmation || 'MIXED').toUpperCase();
-    const cacheLabel = data.cached ? ' · from cache' : ' · live';
-    subtitle.textContent = `${items.length} articles${cacheLabel} · RSI ${pc.rsi14 || '—'} · Vol ${pc.volumeRatio || '—'}x avg`;
-
-    // Price context panel
-    const pctColor = v => v == null ? 'var(--muted)' : v >= 0 ? 'var(--up)' : 'var(--down)';
-    const pctFmt = v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
-    const rsi = pc.rsi14;
-    const rsiColor = rsi > 70 ? 'var(--down)' : rsi < 30 ? 'var(--up)' : 'var(--accent)';
-    const rsiWidth = rsi ? Math.min(100, rsi) : 50;
-
-    let html = `
-      <div class="price-context-grid">
-        <div class="price-context-card">
-          <div class="price-context-label">1D CHANGE</div>
-          <div class="price-context-value" style="color:${pctColor(pc.change1d)}">${pctFmt(pc.change1d)}</div>
-        </div>
-        <div class="price-context-card">
-          <div class="price-context-label">7D CHANGE</div>
-          <div class="price-context-value" style="color:${pctColor(pc.change7d)}">${pctFmt(pc.change7d)}</div>
-        </div>
-        <div class="price-context-card">
-          <div class="price-context-label">30D CHANGE</div>
-          <div class="price-context-value" style="color:${pctColor(pc.change30d)}">${pctFmt(pc.change30d)}</div>
-        </div>
-        <div class="price-context-card">
-          <div class="price-context-label">VOL RATIO</div>
-          <div class="price-context-value" style="color:${pc.volumeRatio > 2 ? 'var(--warn)' : 'var(--text)'}">${pc.volumeRatio || '—'}x</div>
-        </div>
-        <div class="price-context-card">
-          <div class="price-context-label">RSI 14</div>
-          <div class="price-context-value" style="color:${rsiColor}">${rsi || '—'}</div>
-        </div>
-        <div class="price-context-card">
-          <div class="price-context-label">vs MA20</div>
-          <div class="price-context-value" style="color:${pctColor(pc.priceVsMa20)}">${pctFmt(pc.priceVsMa20)}</div>
-        </div>
-        <div class="price-context-card">
-          <div class="price-context-label">vs MA50</div>
-          <div class="price-context-value" style="color:${pctColor(pc.priceVsMa50)}">${pctFmt(pc.priceVsMa50)}</div>
-        </div>
-        <div class="price-context-card">
-          <div class="price-context-label">PRICE</div>
-          <div class="price-context-value">$${pc.currentPrice || '—'}</div>
-        </div>
-      </div>
-      ${rsi ? `<div class="rsi-bar-wrap">
-        <div class="rsi-bar-label"><span>OVERSOLD (30)</span><span>RSI ${rsi}</span><span>OVERBOUGHT (70)</span></div>
-        <div class="rsi-bar-track">
-          <div class="rsi-bar-fill" style="width:${rsiWidth}%;background:${rsiColor}"></div>
-        </div>
-      </div>` : ''}
-      <div style="margin-bottom:14px">
-        <span class="confirmation-badge ${confirmation}">
-          ${confirmation === 'CONFIRMS' ? '✓' : confirmation === 'CONTRADICTS' ? '✗' : '~'}
-          MARKET ${confirmation} NEWS SENTIMENT
-        </span>
-      </div>
-      <div class="news-sentiment-bar ${sentiment}">
-        <div class="news-score ${scoreClass}">${score > 0 ? '+' : ''}${score}</div>
-        <div class="news-sentiment-info">
-          <div class="news-sentiment-label">${sentiment.toUpperCase()} SENTIMENT</div>
-          <div class="news-summary-text">${impact.summary || ''}</div>
-        </div>
-      </div>`;
-
-    if (impact.priceImpact || impact.tradingImplication) {
-      html += `<div class="news-meta-row">
-        ${impact.priceImpact ? `<div class="news-meta-card">
-          <div class="news-meta-label">PRICE IMPACT</div>
-          <div class="news-meta-value">${impact.priceImpact}</div>
-        </div>` : ''}
-        ${impact.tradingImplication ? `<div class="news-meta-card">
-          <div class="news-meta-label">TRADING IMPLICATION</div>
-          <div class="news-meta-value">${impact.tradingImplication}</div>
-        </div>` : ''}
-      </div>`;
-    }
-    if (impact.watchFor) {
-      html += `<div class="news-meta-card" style="margin-bottom:16px">
-        <div class="news-meta-label">WATCH FOR</div>
-        <div class="news-meta-value">${impact.watchFor}</div>
-      </div>`;
-    }
-    if (impact.keyThemes && impact.keyThemes.length) {
-      html += '<div class="news-themes">'+impact.keyThemes.map(t=>'<span class="news-theme">'+t+'</span>').join('')+'</div>';
-    }
-    html += `<div class="news-divider">ARTICLES (${items.length})</div>`;
-    const aiItems = {};
-    (impact.newsItems || []).forEach(n => { aiItems[n.title] = n; });
-    items.forEach(item => {
-      const ai = aiItems[item.title] || {};
-      const impactType = (ai.impact || 'neutral').toLowerCase();
-      const sig = (ai.significance || 'low').toLowerCase();
-      const date = item.pubDate ? item.pubDate.slice(0,10) : '';
-      html += `
-      <div class="news-item">
-        <div class="news-item-header">
-          <div class="news-item-title">
-            ${item.url ? `<a href="${item.url}" target="_blank">${item.title}</a>` : item.title}
-          </div>
-          <span class="news-impact-badge ${impactType}">${impactType.toUpperCase()}</span>
-        </div>
-        <div class="news-item-meta">
-          ${item.provider || ''} · ${date}
-          ${sig !== 'low' ? `· <span class="news-sig-${sig}">${sig.toUpperCase()} SIGNIFICANCE</span>` : ''}
-        </div>
-        ${item.summary ? `<div class="news-item-summary">${item.summary.slice(0,200)}${item.summary.length>200?'...':''}</div>` : ''}
-        ${ai.oneLineSummary ? `<div class="news-item-impact">→ ${ai.oneLineSummary}</div>` : ''}
-      </div>`;
-    });
-    body.innerHTML = html;
-    const cacheKey = `${ticker}_${todayOnly ? 'today' : '7d'}`;
-    newsCache[cacheKey] = { impact, items, priceContext: pc, cached: data.cached };
-    console.log(`[NewsCache] Stored: ${cacheKey} | items:${items.length}`);
-    loadCachedNewsImpact(ticker);
-  } catch(e) {
-    console.error('News error:', e);
-    body.innerHTML = `<div class="modal-loading" style="color:var(--down)">Failed to load news: ${e.message}</div>`;
   } finally {
     btn.textContent = origText;
     btn.disabled = false;

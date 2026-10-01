@@ -12,7 +12,7 @@ GEMINI_MODEL   = "gemini-2.5-flash"
 def _call_gemini(system_prompt, user_prompt):
     """Gemini is disabled — no longer required for now. Returns "" instead
     of calling out; every caller (generate_summary/generate_recommendations/
-    generate_followup/generate_news_impact) already treats a parse failure
+    generate_followup) already treats a parse failure
     here as "no AI data" and degrades to its own fallback, so nothing else
     needs to change. To re-enable, restore the google-genai call here."""
     return ""
@@ -241,60 +241,6 @@ Generate a detailed step-by-step follow-up plan. Return JSON with EXACTLY:
     except Exception as e:
         log.error(f"AI followup FAIL: {ticker} | {e}")
         return {"error": "Follow-up generation failed"}
-
-
-def generate_news_impact(ticker, news_items, stock, price_context={}):
-    try:
-        log.info(f"AI news impact: {ticker} | {len(news_items)} articles")
-        price     = stock.get("price")
-        sector    = stock.get("sector")
-        sentiment = stock.get("aiSummary", {}).get("analystSentiment", "neutral")
-
-        news_text = "\n".join([
-            f"- [{n['pubDate'][:10]}] {n['title']} ({n['provider']}): {n['summary'][:200]}"
-            for n in news_items
-        ])
-
-        prompt = f"""Today is {date.today()}. Analyze the following recent news for {ticker} and return JSON with EXACTLY:
-{{
-  "overallSentiment": "bullish OR bearish OR neutral",
-  "sentimentScore": number from -10 (very bearish) to +10 (very bullish),
-  "summary": "2-3 sentence overall news impact summary",
-  "priceImpact": "assessment of likely short-term price impact with estimated % range",
-  "keyThemes": ["theme 1", "theme 2", "theme 3"],
-  "tradingImplication": "what should investor do based on this news: buy/hold/sell/wait with reasoning",
-  "watchFor": "what upcoming catalyst or confirmation to watch for",
-  "newsItems": [
-    {{
-      "title": "article title",
-      "impact": "positive OR negative OR neutral",
-      "significance": "high OR medium OR low",
-      "oneLineSummary": "one sentence impact on stock"
-    }}
-  ]
-}}
-
-Stock context: {ticker} | Price: ${price} | Sector: {sector} | Prior sentiment: {sentiment}
-
-Recent news (last 7 days):
-{news_text}
-"""
-        raw    = _call_gemini(SYSTEM_PROMPT, prompt)
-        result = json.loads(raw)
-        log.info(f"AI news impact OK: {ticker} | sentiment:{result.get('overallSentiment')} score:{result.get('sentimentScore')}")
-        return result
-    except Exception as e:
-        log.error(f"AI news impact FAIL: {ticker} | {e}")
-        return {
-            "overallSentiment": "neutral",
-            "sentimentScore":   0,
-            "summary":          "News analysis unavailable",
-            "priceImpact":      "Unknown",
-            "keyThemes":        [],
-            "tradingImplication": "N/A",
-            "watchFor":         "N/A",
-            "newsItems":        []
-        }
 
 
 def default_summary(ticker):

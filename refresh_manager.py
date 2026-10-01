@@ -78,15 +78,6 @@ def needs_calendar_refresh(stock):
     return False
 
 
-def needs_news_refresh(news_entry, today_only=False):
-    if not news_entry:
-        return True
-    key = "todayFetchedAt" if today_only else "sevenDayFetchedAt"
-    ttl = 1 if today_only else 6
-    h = hours_since(news_entry.get(key))
-    return h > ttl
-
-
 def check_what_needs_refresh(stock, fetcher):
     ticker = stock.get("ticker")
     result = {

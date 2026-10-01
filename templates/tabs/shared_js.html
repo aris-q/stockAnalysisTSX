@@ -171,167 +171,60 @@ function sentimentBadgeClass(s) {
   return 'neutral';
 }
 
-function renderNewsImpactInline(ticker, data) {
-  const el = document.getElementById(`news-impact-${ticker}`);
-  if (!el) return;
-
-  function buildBlock(label, entry, todayOnly) {
-    const imp = entry && entry.impact;
-    const ts = entry && entry.fetchedAt;
-    if (!imp) {
-      const safeT2 = "'" + ticker + "'";
-      return '<div class="ni-block">'
-        +'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">'
-        +'<div class="ni-label" style="margin-bottom:0">'+label+'</div>'
-        +'<span style="font-size:10px;color:var(--muted)">🕐 No analysis yet</span>'
-        +'<button onclick="getNews('+safeT2+', this, '+todayOnly+')" style="font-size:10px;padding:2px 10px;background:var(--warn);color:#0a0a0f;border:none;border-radius:4px;font-weight:700;cursor:pointer">⚡ Refresh</button>'
-        +'</div>'
-        +'<div class="ni-summary" style="color:var(--muted);font-style:italic">No analysis cached yet.</div>'
-        +'</div>';
-    }
-    const safeT  = "'" + ticker + "'";
-    return '<div class="ni-block">'
-      +'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">'
-      +'<div class="ni-label" style="margin-bottom:0">'+label+'</div>'
-      +'<span style="font-size:10px;color:var(--muted)">🕐 '+(ts||'unknown')+'</span>'
-      +'<button onclick="getNews('+safeT+', this, '+todayOnly+')" style="font-size:10px;padding:2px 10px;background:var(--warn);color:#0a0a0f;border:none;border-radius:4px;font-weight:700;cursor:pointer">⚡ Refresh</button>'
-      +'<button onclick="showCachedNews('+safeT+', '+todayOnly+')" style="font-size:10px;padding:2px 10px;background:var(--warn);color:#0a0a0f;border:none;border-radius:4px;font-weight:700;cursor:pointer">📰 View All</button>'
-      +'</div>'
-      +'<div class="ni-meta">'
-      +'<span class="news-impact-badge '+(imp.sentimentScore >= 2 ? 'positive' : imp.sentimentScore <= -2 ? 'negative' : 'neutral')+'">'+(imp.overallSentiment||'neutral').toUpperCase()+'</span>'
-      +(imp.sentimentScore != null ? '<span style="font-size:10px;color:var(--muted)">Score: '+(imp.sentimentScore > 0 ? '+' : '')+imp.sentimentScore+'</span>' : '')
-      +'</div>'
-      +'<div class="ni-summary">'+(imp.summary||'—')+'</div>'
-      +'<div style="font-size:11px;color:var(--text);margin-bottom:4px">→ '+(imp.tradingImplication||'—')+'</div>'
-      +'</div>';
-  }
-
-  el.innerHTML = buildBlock('7-DAY NEWS', data.sevenDay, false) + buildBlock('TODAY\'S NEWS', data.today, true);
+// ── NEWS — headlines with links only (no AI analysis) ─────────────────────
+// Stored headlines come from /news/headlines/<ticker>; they're refreshed at
+// 09:20 and 12:30 and by the TradeAI REFRESH NEWS button.
+function _newsAgo(iso) {
+  const t = Date.parse(iso || '');
+  if (!t) return '';
+  const h = (Date.now() - t) / 3600000;
+  return h < 1 ? 'just now' : h < 24 ? Math.floor(h) + 'h ago' : Math.floor(h / 24) + 'd ago';
 }
 
-const newsCache = {};
+function _escNews(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
 
-function buildNewsModalHtml(ticker, data, todayOnly) {
-  const impact = data.impact || {};
-  const items = data.items || [];
-  const pc = data.priceContext || {};
-  const score = impact.sentimentScore || 0;
-  const sentiment = (impact.overallSentiment || 'neutral').toLowerCase();
-  const scoreClass = score > 0 ? 'positive' : score < 0 ? 'negative' : 'neutral-score';
-  const confirmation = (impact.marketConfirmation || 'MIXED').toUpperCase();
-  const cacheLabel = data.cached ? ' · from cache' : ' · live';
+function _newsListHtml(items, limit) {
+  const esc = _escNews;
+  if (!items || !items.length) return '<div style="color:var(--muted);font-size:16px">No news in the last 7 days.</div>';
+  return items.slice(0, limit || items.length).map(n => `<div style="padding:6px 0;border-bottom:1px solid var(--border)">
+      <a href="${esc(n.url || '#')}" target="_blank" rel="noopener" style="color:var(--text);font-size:16px;text-decoration:none">${esc(n.title)}</a>
+      <div style="font-size:14px;color:var(--muted);margin-top:2px">${esc(n.provider)}${n.provider ? ' · ' : ''}${_newsAgo(n.pubDate)}</div>
+    </div>`).join('');
+}
 
+async function openNewsModal(ticker) {
   const modal = document.getElementById('newsModal');
-  const title = document.getElementById('newsTitle');
-  const subtitle = document.getElementById('newsSubtitle');
-  title.textContent = ticker + (todayOnly ? ' — TODAY\'S NEWS' : ' — 7 DAY NEWS');
-  subtitle.textContent = items.length
-    ? `${items.length} articles${cacheLabel} · RSI ${pc.rsi14 || '—'} · Vol ${pc.volumeRatio || '—'}x avg`
-    : `Cached impact · ${todayOnly ? 'today' : '7-day'}`;
-  modal.classList.add('visible');
-
-  const pctColor = v => v == null ? 'var(--muted)' : v >= 0 ? 'var(--up)' : 'var(--down)';
-  const pctFmt = v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
-  const rsi = pc.rsi14;
-  const rsiColor = rsi > 70 ? 'var(--down)' : rsi < 30 ? 'var(--up)' : 'var(--accent)';
-  const rsiWidth = rsi ? Math.min(100, rsi) : 50;
-
-  let html = '';
-  if (Object.keys(pc).length) {
-    html += `
-      <div class="price-context-grid">
-        <div class="price-context-card"><div class="price-context-label">1D CHANGE</div><div class="price-context-value" style="color:${pctColor(pc.change1d)}">${pctFmt(pc.change1d)}</div></div>
-        <div class="price-context-card"><div class="price-context-label">7D CHANGE</div><div class="price-context-value" style="color:${pctColor(pc.change7d)}">${pctFmt(pc.change7d)}</div></div>
-        <div class="price-context-card"><div class="price-context-label">30D CHANGE</div><div class="price-context-value" style="color:${pctColor(pc.change30d)}">${pctFmt(pc.change30d)}</div></div>
-        <div class="price-context-card"><div class="price-context-label">VOL RATIO</div><div class="price-context-value" style="color:${pc.volumeRatio > 2 ? 'var(--warn)' : 'var(--text)'}">${pc.volumeRatio || '—'}x</div></div>
-        <div class="price-context-card"><div class="price-context-label">RSI 14</div><div class="price-context-value" style="color:${rsiColor}">${rsi || '—'}</div></div>
-        <div class="price-context-card"><div class="price-context-label">vs MA20</div><div class="price-context-value" style="color:${pctColor(pc.priceVsMa20)}">${pctFmt(pc.priceVsMa20)}</div></div>
-        <div class="price-context-card"><div class="price-context-label">vs MA50</div><div class="price-context-value" style="color:${pctColor(pc.priceVsMa50)}">${pctFmt(pc.priceVsMa50)}</div></div>
-        <div class="price-context-card"><div class="price-context-label">PRICE</div><div class="price-context-value">$${pc.currentPrice || '—'}</div></div>
-      </div>
-      ${ rsi ? '<div class="rsi-bar-wrap"><div class="rsi-bar-label"><span>OVERSOLD (30)</span><span>RSI '+rsi+'</span><span>OVERBOUGHT (70)</span></div><div class="rsi-bar-track"><div class="rsi-bar-fill" style="width:'+rsiWidth+'%;background:'+rsiColor+'"></div></div></div>' : ''}` ;
-  }
-
-  html += `
-    <div style="margin-bottom:14px">
-      <span class="confirmation-badge ${confirmation}">
-        ${confirmation === 'CONFIRMS' ? '✓' : confirmation === 'CONTRADICTS' ? '✗' : '~'}
-        MARKET ${confirmation} NEWS SENTIMENT
-      </span>
-    </div>
-    <div class="news-sentiment-bar ${sentiment}">
-      <div class="news-score ${scoreClass}">${score > 0 ? '+' : ''}${score}</div>
-      <div class="news-sentiment-info">
-        <div class="news-sentiment-label">${sentiment.toUpperCase()} SENTIMENT</div>
-        <div class="news-summary-text">${impact.summary || ''}</div>
-      </div>
-    </div>`;
-
-  if (impact.priceImpact) html += `<div style="font-size:12px;color:var(--text);margin:10px 0;padding:8px;background:rgba(42,42,58,0.4);border-radius:6px">📈 ${impact.priceImpact}</div>`;
-  if (impact.tradingImplication) html += `<div style="font-size:12px;color:var(--accent2);margin-bottom:10px">→ ${impact.tradingImplication}</div>`;
-  if (impact.watchFor) html += `<div style="font-size:11px;color:var(--muted);margin-bottom:14px">👁 Watch for: ${impact.watchFor}</div>`;
-
-  if (impact.keyThemes && impact.keyThemes.length) {
-    html += '<div style="margin-bottom:14px"><div style="font-size:10px;color:var(--muted);letter-spacing:0.5px;margin-bottom:6px">KEY THEMES</div><div style="display:flex;flex-wrap:wrap;gap:6px">'+impact.keyThemes.map(t=>'<span style="font-size:11px;padding:2px 8px;border-radius:4px;background:rgba(42,42,58,0.6);color:var(--text);border:1px solid var(--border)">'+t+'</span>').join('')+ '</div></div>';
-  }
-
-  if (items.length) {
-    html += `<div style="font-size:10px;color:var(--muted);letter-spacing:0.5px;margin-bottom:10px">NEWS ARTICLES (${items.length})</div>`;
-    items.forEach(n => {
-      const ni = (impact.newsItems || []).find(x => x.title === n.title) || {};
-      const impClass = ni.impact === 'positive' ? 'positive' : ni.impact === 'negative' ? 'negative' : 'neutral';
-      html += `<div class="news-item">
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
-          <div class="news-item-title"><a href="${n.link||'#'}" target="_blank" style="color:var(--text);text-decoration:none">${n.title||''}</a></div>
-          ${ni.impact ? `<span class="news-impact-badge ${impClass}">${(ni.impact||'').toUpperCase()}</span>` : ''}
-        </div>
-        <div class="news-item-meta">${(n.pubDate||'').slice(0,16)} · ${n.provider||''} ${ni.significance ? `· ${ni.significance.toUpperCase()} significance` : ''}</div>
-        ${n.summary ? `<div class="news-item-summary">${n.summary.slice(0,200)}...</div>` : ''}
-        ${ni.oneLineSummary ? `<div class="news-item-impact">💡 ${ni.oneLineSummary}</div>` : ''}
-      </div>`;
-    });
-  } else if (impact.summary) {
-    html += `<div style="font-size:11px;color:var(--muted);font-style:italic;margin-top:8px">Full article list not cached — click ↺ Refresh to reload with articles.</div>`;
-  }
-
-  return html;
-}
-
-function showCachedNews(ticker, todayOnly) {
-  const key = `${ticker}_${todayOnly ? 'today' : '7d'}`;
-  const cached = newsCache[key];
-  if (!cached) {
-    console.warn(`[NewsCache] No cache for ${key}, falling back to fetch`);
-    getNews(ticker, document.createElement('button'), todayOnly);
-    return;
-  }
   const body = document.getElementById('newsBody');
-  body.innerHTML = buildNewsModalHtml(ticker, cached, todayOnly);
-  console.log(`[NewsCache] showCachedNews: ${key} | items:${(cached.items||[]).length}`);
+  document.getElementById('newsTitle').textContent = ticker + ' — RECENT NEWS';
+  document.getElementById('newsSubtitle').textContent = 'Loading...';
+  body.innerHTML = '';
+  modal.classList.add('visible');
+  try {
+    const d = await fetch('/news/headlines/' + encodeURIComponent(ticker)).then(r => r.json());
+    document.getElementById('newsSubtitle').textContent =
+      `${(d.items || []).length} headline${(d.items || []).length === 1 ? '' : 's'}, last 7 days · updated ${d.fetchedAt || 'never'}`;
+    body.innerHTML = _newsListHtml(d.items);
+  } catch (e) {
+    body.innerHTML = '<div style="color:var(--down)">Failed to load news.</div>';
+    console.error('[News] modal FAIL:', ticker, e);
+  }
 }
 
-async function loadCachedNewsImpact(ticker) {
+async function loadTickerNews(ticker) {
+  const el = document.getElementById('ticker-news-' + ticker);
+  if (!el) return;
   try {
-    const res = await fetch(`/news/cached-impact/${ticker}`);
-    const data = await res.json();
-    if (data.sevenDay && data.sevenDay.impact) {
-      const key7 = `${ticker}_7d`;
-      newsCache[key7] = newsCache[key7] || {};
-      newsCache[key7].impact = data.sevenDay.impact;
-      newsCache[key7].cached = true;
-    }
-    if (data.today && data.today.impact) {
-      const keyT = `${ticker}_today`;
-      newsCache[keyT] = newsCache[keyT] || {};
-      newsCache[keyT].impact = data.today.impact;
-      newsCache[keyT].cached = true;
-    }
-    renderNewsImpactInline(ticker, data);
-    console.log(`[NewsImpact] ${ticker} | 7d:${!!(data.sevenDay && data.sevenDay.impact)} today:${!!(data.today && data.today.impact)}`);
-  } catch(e) {
-    const el = document.getElementById(`news-impact-${ticker}`);
-    if (el) el.innerHTML = `<div style="font-size:11px;color:var(--muted)">Failed to load cached analysis.</div>`;
-    console.error(`[NewsImpact] FAIL ${ticker} | ${e}`);
+    const d = await fetch('/news/headlines/' + encodeURIComponent(ticker)).then(r => r.json());
+    const items = d.items || [];
+    el.innerHTML = _newsListHtml(items, 6)
+      + `<div style="font-size:14px;color:var(--muted);margin-top:6px">updated ${d.fetchedAt || 'never'}`
+      + (items.length > 6 ? ` · <a href="#" onclick="openNewsModal('${ticker}');return false" style="color:var(--accent)">view all ${items.length}</a>` : '')
+      + '</div>';
+  } catch (e) {
+    el.innerHTML = '<div style="color:var(--down);font-size:16px">Failed to load news.</div>';
+    console.error('[News] inline FAIL:', ticker, e);
   }
 }
 

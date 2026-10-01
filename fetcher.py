@@ -148,11 +148,42 @@ def fetch_cdn_gainers():
         log.error(f"CDN gainers FAIL: {e}")
         return []
 
+def _search_news(ticker, cutoff):
+    """Fallback source: Yahoo's search endpoint. Ticker.news uses a separate
+    feed that can go empty while search still works (seen 2026-10-01 from
+    ~16:30: every ticker returned 0 raw items, search returned news fine).
+    Search items carry relatedTickers, so only news tagged with this ticker
+    is kept; they have no summary text."""
+    out = []
+    for i in yf.Search(ticker, news_count=10).news or []:
+        if ticker not in (i.get("relatedTickers") or []) or not i.get("providerPublishTime"):
+            continue
+        pub = datetime.fromtimestamp(i["providerPublishTime"], timezone.utc)
+        if pub < cutoff:
+            continue
+        out.append({
+            "title": i.get("title", ""),
+            "summary": "",
+            "pubDate": pub.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "url": i.get("link", ""),
+            "provider": i.get("publisher", ""),
+        })
+    return out
+
+
 def fetch_news(ticker):
     try:
         stock = yf.Ticker(ticker)
         news = stock.news
         cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        if not news:
+            try:
+                fallback = _search_news(ticker, cutoff)
+                log.info(f"News fetched: {ticker} | {len(fallback)} articles (last 7 days) [search fallback — Ticker.news empty]")
+                return fallback
+            except Exception as e:
+                log.warning(f"News search fallback FAIL: {ticker} | {e}")
+                return []
         filtered = []
         for item in news:
             try:
@@ -356,80 +387,6 @@ def clean_float(v):
         return round(v, 2)
     except Exception:
         return None
-
-def fetch_price_context(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="35d")
-        if hist.empty:
-            log.warning(f"Price context empty: {ticker}")
-            return {}
-
-        current_price = hist['Close'].iloc[-1]
-        price_1d_ago = hist['Close'].iloc[-2] if len(hist) >= 2 else None
-        price_7d_ago = hist['Close'].iloc[-7] if len(hist) >= 7 else None
-        price_30d_ago = hist['Close'].iloc[-30] if len(hist) >= 30 else None
-
-        vol_today = hist['Volume'].iloc[-1]
-        vol_avg_30d = hist['Volume'].iloc[-30:].mean()
-        vol_ratio = round(vol_today / vol_avg_30d, 2) if vol_avg_30d else None
-
-        def pct(current, prev):
-            if prev and prev != 0:
-                return round((current - prev) / prev * 100, 2)
-            return None
-
-        # RSI calculation (14-day)
-        delta = hist['Close'].diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rs = gain / loss
-        rsi_series = 100 - (100 / (1 + rs))
-        _rsi_val = rsi_series.iloc[-1]
-        rsi = round(float(_rsi_val), 1) if not rsi_series.empty and not math.isnan(float(_rsi_val)) else None
-
-        # 20-day and 50-day moving averages
-        ma20 = round(hist['Close'].rolling(20).mean().iloc[-1], 2) if len(hist) >= 20 else None
-        _ma50_val = hist['Close'].rolling(50).mean().iloc[-1]
-        ma50 = round(float(_ma50_val), 2) if not math.isnan(float(_ma50_val)) else None
-        
-        # Bollinger Bands %B (20-day, 2 std)
-        bb_percent = None
-        try:
-            close = hist['Close']
-            bb_mid = close.rolling(20).mean()
-            bb_std = close.rolling(20).std()
-            bb_upper = bb_mid + 2 * bb_std
-            bb_lower = bb_mid - 2 * bb_std
-            last_close = close.iloc[-1]
-            last_upper = bb_upper.iloc[-1]
-            last_lower = bb_lower.iloc[-1]
-            band_width = last_upper - last_lower
-            if band_width and band_width != 0:
-                bb_percent = round((last_close - last_lower) / band_width, 3)
-        except Exception as e:
-            log.warning(f"BB%B calc FAIL: {ticker} | {e}")
-
-        context = {
-            "currentPrice": clean_float(current_price),
-            "change1d": clean_float(pct(current_price, price_1d_ago)),
-            "change7d": clean_float(pct(current_price, price_7d_ago)),
-            "change30d": clean_float(pct(current_price, price_30d_ago)),
-            "volumeToday": int(vol_today),
-            "volumeAvg30d": int(vol_avg_30d),
-            "volumeRatio": clean_float(vol_ratio),
-            "rsi14": clean_float(rsi),
-            "bbPercent": clean_float(bb_percent),
-            "ma20": clean_float(ma20),
-            "ma50": clean_float(ma50),
-            "priceVsMa20": clean_float(pct(current_price, ma20) if ma20 else None),
-            "priceVsMa50": clean_float(pct(current_price, ma50) if ma50 else None),
-        }
-        log.info(f"Price context OK: {ticker} | rsi:{rsi} bbPct:{bb_percent} vol_ratio:{vol_ratio} 7d:{context['change7d']}%")
-        return context
-    except Exception as e:
-        log.error(f"Price context FAIL: {ticker} | {e}")
-        return {}
 
 def fetch_price_only(ticker):
     """Price + technicals fetch: price, previousClose, volume, marketCap, rsi14, bbPercent."""
