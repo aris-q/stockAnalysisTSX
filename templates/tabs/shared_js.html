@@ -284,6 +284,34 @@ async function loadTickerOptions(ticker, elId) {
   }
 }
 
+// ── Ticker extras — OPTIONS on top, RECENT NEWS at the bottom, wrapped around
+// any ticker detail. Rendered as empty placeholders (the Dream table builds
+// ~630 hidden details up front); fillTickerExtras(root) loads the ones inside
+// root once it's actually visible.
+let _tickerExtrasSeq = 0;
+function tickerExtrasWrap(ticker, innerHtml) {
+  const t = String(ticker).replace(/"/g, '');
+  return `<div class="tx-options" data-ticker="${t}" style="padding:0 16px"></div>`
+    + innerHtml
+    + `<div style="margin-top:14px;border-top:1px solid var(--border);padding:10px 16px 0">`
+    + `<div style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;letter-spacing:1px;color:var(--muted);margin-bottom:6px">RECENT NEWS</div>`
+    + `<div class="tx-news" data-ticker="${t}" style="color:var(--muted);font-size:16px">Loading news...</div></div>`;
+}
+
+function fillTickerExtras(root) {
+  if (!root) return;
+  root.querySelectorAll('.tx-options:not([data-loaded]), .tx-news:not([data-loaded])').forEach(el => {
+    el.dataset.loaded = '1';
+    if (!el.id) el.id = 'tx-extra-' + (++_tickerExtrasSeq);
+    if (el.classList.contains('tx-options')) {
+      el.innerHTML = '<div style="color:var(--muted);font-size:16px">Loading options...</div>';
+      loadTickerOptions(el.dataset.ticker, el.id);
+    } else {
+      loadTickerNews(el.dataset.ticker, el.id);
+    }
+  });
+}
+
 async function loadTickerNews(ticker, elId) {
   const el = document.getElementById(elId || ('ticker-news-' + ticker));
   if (!el) return;

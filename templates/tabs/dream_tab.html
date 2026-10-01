@@ -120,6 +120,7 @@ function toggleDreamDetail(id) {
   });
   if (!isOpen) {
     detailEl.style.display = 'table-row';
+    fillTickerExtras(detailEl);
     const row = document.querySelector('.dream-row[data-id="' + id + '"]');
     if (row) row.classList.add('dream-row-active');
   }
@@ -229,7 +230,13 @@ function renderDream(data) {
 // Extracted so the same candidate-detail markup can be reused outside the
 // Dream tab's own table (e.g. TradeAI tab's "view in Dream Scan" modal),
 // not just this table's expandable rows.
+// Every place that shows a Dream detail (Dream rows, TradeAI and Gainers
+// popups) gets OPTIONS on top and RECENT NEWS below from here.
 function _dreamDetailHtml(c, addBtn, flagsGoodHtml, flagsWarnHtml, instNames) {
+  return tickerExtrasWrap(c.ticker, _dreamDetailCore(c, addBtn, flagsGoodHtml, flagsWarnHtml, instNames));
+}
+
+function _dreamDetailCore(c, addBtn, flagsGoodHtml, flagsWarnHtml, instNames) {
   if (flagsGoodHtml === undefined) flagsGoodHtml = (c.flagsGood || []).map(function(f) { return '<div class="dream-flag-good">✅ ' + f + '</div>'; }).join('');
   if (flagsWarnHtml === undefined) flagsWarnHtml = (c.flagsWarn || []).map(function(f) { return '<div class="dream-flag-warn">⚠️ ' + f + '</div>'; }).join('');
   if (instNames === undefined) instNames = (c.institutions || []).map(function(inst) { return inst.name + (inst.pct ? ' ' + inst.pct : ''); }).join(', ');
