@@ -97,6 +97,9 @@ function renderTickerDetail(s) {
       </div>
     </div>`;
 
+  // Options put/call — top of the detail (filled by loadTickerOptions after render)
+  html += `<div id="ticker-options-${s.ticker}" style="padding:0 16px"><div style="color:var(--muted);font-size:16px">Loading options...</div></div>`;
+
   // Ranks row
   const rankBadges = [];
   if (s.marginRank) rankBadges.push(`<span class="rank-badge rank-${s.marginRank}">MARGIN #${s.marginRank}</span>`);
@@ -593,6 +596,7 @@ async function loadData() {
 
     stocks.forEach(s => {
       loadTickerNews(s.ticker);
+      loadTickerOptions(s.ticker, 'ticker-options-' + s.ticker);
       const ai = s.aiSummary || {};
       (ai.eventImpacts || []).forEach(e => {
         if (e.event) checkFollowupCache(s.ticker, e.event);
