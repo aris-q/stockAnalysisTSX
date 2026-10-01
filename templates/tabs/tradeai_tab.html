@@ -259,14 +259,21 @@ async function openDreamDetailModal(ticker) {
   if (title) title.textContent = '🌟 ' + ticker + ' — Dream Scan Detail';
   body.innerHTML = '<div class="loading">Loading...</div>';
   modal.classList.add('visible');
+  // Headlines go under the Dream detail (or the not-in-universe note) —
+  // the stored news covers holdings/candidates even outside the scan.
+  const newsSec = `<div style="margin-top:14px;border-top:1px solid var(--border);padding:10px 16px 0">`
+    + `<div style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;letter-spacing:1px;color:var(--muted);margin-bottom:6px">RECENT NEWS</div>`
+    + `<div id="dream-modal-news" style="color:var(--muted);font-size:16px">Loading news...</div></div>`;
   try {
     const data = await fetch('/dream').then(r => r.json());
     const c = (data.candidates || []).find(x => x.ticker === ticker);
     if (!c) {
-      body.innerHTML = `<div style="color:var(--muted);padding:16px">${ticker} isn't in the current Dream Scan universe (outside the scan, or dropped since it was last identified).</div>`;
+      body.innerHTML = `<div style="color:var(--muted);padding:16px">${ticker} isn't in the current Dream Scan universe (outside the scan, or dropped since it was last identified).</div>` + newsSec;
+      loadTickerNews(ticker, 'dream-modal-news');
       return;
     }
-    body.innerHTML = (typeof _dreamDetailHtml === 'function') ? _dreamDetailHtml(c) : '<div style="color:var(--muted);padding:16px">Dream detail renderer not available.</div>';
+    body.innerHTML = ((typeof _dreamDetailHtml === 'function') ? _dreamDetailHtml(c) : '<div style="color:var(--muted);padding:16px">Dream detail renderer not available.</div>') + newsSec;
+    loadTickerNews(ticker, 'dream-modal-news');
   } catch(e) {
     body.innerHTML = '<span style="color:var(--down)">Failed to load Dream Scan data.</span>';
     console.error('[DreamDetail] load FAIL:', e);

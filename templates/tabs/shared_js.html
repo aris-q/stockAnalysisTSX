@@ -212,8 +212,8 @@ async function openNewsModal(ticker) {
   }
 }
 
-async function loadTickerNews(ticker) {
-  const el = document.getElementById('ticker-news-' + ticker);
+async function loadTickerNews(ticker, elId) {
+  const el = document.getElementById(elId || ('ticker-news-' + ticker));
   if (!el) return;
   try {
     const d = await fetch('/news/headlines/' + encodeURIComponent(ticker)).then(r => r.json());
