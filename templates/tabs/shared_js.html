@@ -212,6 +212,78 @@ async function openNewsModal(ticker) {
   }
 }
 
+// ── OPTIONS — daily put/call snapshot (recorded at 17:15 by run_options_snapshot)
+function _pcColor(r) {
+  if (r == null) return 'var(--muted)';
+  return r >= 1.0 ? 'var(--down)' : r <= 0.7 ? 'var(--up)' : '#fbbf24';
+}
+
+function _pcLabel(r) {
+  if (r == null) return '';
+  return r >= 1.0 ? 'put-heavy · bearish lean' : r <= 0.7 ? 'call-heavy · bullish lean' : 'balanced';
+}
+
+function _optionsHtml(ticker, hist) {
+  const box = (inner) => `<div style="border:2px solid var(--accent);border-radius:8px;padding:12px 14px;margin:4px 0 14px;background:rgba(255,255,255,0.02)">${inner}</div>`;
+  const head = (sub) => `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      <span style="font-family:'Syne',sans-serif;font-weight:800;font-size:17px;letter-spacing:1px;color:var(--accent)">📊 OPTIONS — PUT / CALL</span>
+      <span style="font-size:14px;color:var(--muted)">${sub}</span></div>`;
+  const recs = (hist || []).filter(h => h.callVolume != null);
+  if (!recs.length) {
+    const last = (hist || [])[0];
+    const why = !last ? 'No options recorded yet — the snapshot runs daily at 17:15 (Admin → Options snapshot → RUN NOW).'
+      : last.noOptions ? (ticker.endsWith('.TO') ? 'No US-listed twin with options — TSX options themselves aren\'t available from Yahoo.' : 'Yahoo lists no options for this ticker.')
+      : 'Last snapshot failed: ' + _escNews(last.error || 'unknown');
+    return box(head('') + `<div style="color:var(--muted);font-size:16px">${why}</div>`);
+  }
+  const d = recs[0];
+  const via = d.usSymbol && d.usSymbol !== ticker ? ` · via ${_escNews(d.usSymbol)} (US listing)` : '';
+  const n = (v) => v == null ? '—' : Number(v).toLocaleString();
+  const tile = (label, val, color, sub) => `<div style="flex:1 1 110px;min-width:110px">
+      <div style="font-size:13px;color:var(--muted);letter-spacing:1px">${label}</div>
+      <div style="font-family:'DM Mono',monospace;font-size:22px;font-weight:800;color:${color || 'var(--text)'}">${val}</div>
+      ${sub ? `<div style="font-size:13px;color:${color || 'var(--muted)'}">${sub}</div>` : ''}</div>`;
+  const pc = d.putCallVolumeRatio;
+  let html = head(`as of ${d.date}${via}`)
+    + `<div style="display:flex;gap:12px;flex-wrap:wrap">`
+    + tile('P/C VOLUME', pc != null ? pc.toFixed(2) : '—', _pcColor(pc), _pcLabel(pc))
+    + tile('P/C OPEN INT.', d.putCallOIRatio != null ? d.putCallOIRatio.toFixed(2) : '—', _pcColor(d.putCallOIRatio))
+    + tile('CALLS TRADED', n(d.callVolume), 'var(--up)')
+    + tile('PUTS TRADED', n(d.putVolume), 'var(--down)')
+    + tile('IMPLIED VOL', d.atmIV != null ? (d.atmIV * 100).toFixed(1) + '%' : '—', null, 'at-the-money, nearest expiry')
+    + tile('UNUSUAL', n(d.unusualCount || 0), (d.unusualCount || 0) > 0 ? '#fbbf24' : null, 'vol ≥100 and &gt;2× open int.')
+    + `</div>`;
+  if (recs.length > 1) {
+    const days = recs.slice(0, 10).reverse();
+    html += `<div style="margin-top:10px;font-size:14px;color:var(--muted)">P/C volume, last ${days.length} days: `
+      + days.map(h => `<span title="${h.date}" style="font-family:'DM Mono',monospace;color:${_pcColor(h.putCallVolumeRatio)};margin-right:6px">${h.putCallVolumeRatio != null ? h.putCallVolumeRatio.toFixed(2) : '—'}</span>`).join('')
+      + `</div>`;
+  }
+  const un = (d.unusual || []).slice(0, 5);
+  if (un.length) {
+    html += `<div style="margin-top:10px;font-size:14px;color:var(--muted);letter-spacing:1px">TOP UNUSUAL CONTRACTS</div>`
+      + `<table style="width:100%;font-size:14px;font-family:'DM Mono',monospace;border-collapse:collapse;margin-top:4px">`
+      + `<tr style="color:var(--muted)"><td>side</td><td>strike</td><td>expiry</td><td style="text-align:right">volume</td><td style="text-align:right">open int.</td><td style="text-align:right">IV</td></tr>`
+      + un.map(u => `<tr><td style="color:${u.side === 'call' ? 'var(--up)' : 'var(--down)'};font-weight:700">${u.side.toUpperCase()}</td><td>${u.strike}</td><td>${u.expiration}</td>`
+        + `<td style="text-align:right">${n(u.volume)}</td><td style="text-align:right">${n(u.openInterest)}</td><td style="text-align:right">${u.iv != null ? (u.iv * 100).toFixed(0) + '%' : '—'}</td></tr>`).join('')
+      + `</table>`;
+  }
+  html += `<div style="margin-top:8px;font-size:13px;color:var(--muted)">Sentiment reference only — history began 2026-10-01; not yet tested as a predictor.</div>`;
+  return box(html);
+}
+
+async function loadTickerOptions(ticker, elId) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  try {
+    const d = await fetch('/options/' + encodeURIComponent(ticker) + '?days=30').then(r => r.json());
+    el.innerHTML = _optionsHtml(ticker, d.history);
+  } catch (e) {
+    el.innerHTML = '<div style="color:var(--down);font-size:16px">Failed to load options.</div>';
+    console.error('[Options] load FAIL:', ticker, e);
+  }
+}
+
 async function loadTickerNews(ticker, elId) {
   const el = document.getElementById(elId || ('ticker-news-' + ticker));
   if (!el) return;
