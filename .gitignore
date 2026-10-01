@@ -218,3 +218,6 @@ __marimo__/
 venv/
 .DS_Store
 output/options/
+watchlist.json
+watchlist.json.auto
+watchlist.json.tmp

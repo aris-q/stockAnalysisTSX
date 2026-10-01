@@ -85,8 +85,13 @@ def load_watchlist():
         return list(WATCHLIST)
 
 def save_watchlist():
-    with open(WATCHLIST_PATH, "w") as f:
+    # temp file + rename: a crash mid-write can't leave an empty/corrupt
+    # watchlist.json (load_watchlist would then fall back to the 4-ticker
+    # config default and the next save would make that permanent)
+    tmp = WATCHLIST_PATH + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(watchlist, f)
+    os.replace(tmp, WATCHLIST_PATH)
     log.info(f"Watchlist saved: {watchlist}")
 
 watchlist = load_watchlist()
@@ -94,15 +99,19 @@ watchlist = load_watchlist()
 def _sync_watchlist_from_holdings(holding_tickers):
     """
     Keep watchlist aligned with TradeAI holdings:
-    - Add any holding ticker not already in watchlist
-    - Remove any ticker that was a previous holding but is no longer held
-      (identified by tradeai_holdings set stored in watchlist.json metadata)
-    - Manual tickers (never held) are left untouched
+    - Add any holding ticker not already in watchlist, and remember that
+      this sync added it (watchlist.json.auto)
+    - When a holding is sold, remove it only if this sync added it
+    - Tickers you added yourself are never removed, even after the bot
+      buys and sells them (before 2026-10-01 they were: every sold holding
+      was dropped, manual or not)
     """
     global watchlist
     try:
-        prev_holdings = set(load_json(WATCHLIST_PATH + ".holdings", []))
         current_holdings = set(holding_tickers)
+        # No .auto file yet (first run of this logic): nothing is marked
+        # auto-added, so nothing already on the list gets removed.
+        auto = set(load_json(WATCHLIST_PATH + ".auto", []))
 
         added, removed = [], []
 
@@ -110,15 +119,17 @@ def _sync_watchlist_from_holdings(holding_tickers):
             if t not in watchlist:
                 watchlist.append(t)
                 added.append(t)
+                auto.add(t)
 
-        for t in list(watchlist):
-            if t in prev_holdings and t not in current_holdings:
-                watchlist.remove(t)
-                removed.append(t)
+        for t in list(auto):
+            if t not in current_holdings:
+                if t in watchlist:
+                    watchlist.remove(t)
+                    removed.append(t)
+                auto.discard(t)
 
         save_watchlist()
-        # Persist current holding set for next diff
-        save_json(WATCHLIST_PATH + ".holdings", list(current_holdings))
+        save_json(WATCHLIST_PATH + ".auto", sorted(auto))
 
         if added or removed:
             log.info(f"[WatchlistSync] added:{added} removed:{removed} | watchlist now:{watchlist}")

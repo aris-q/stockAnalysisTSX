@@ -1,6 +1,7 @@
 import requests
 import yfinance as yf
 import logging
+import json
 import math
 import re
 import time
@@ -233,26 +234,101 @@ def resolve_us_twin(ticker):
     return None
 
 
+NEWS_NAMES_PATH = "output/news_names.json"
+_NAME_FILLER = {"inc", "corp", "corporation", "ltd", "limited", "co", "company", "plc", "the", "and", "of"}
+
+
+def _tsx_company_name(ticker):
+    """longName for a TSX ticker, cached in NEWS_NAMES_PATH (one .info call
+    per ticker, ever — names don't change)."""
+    try:
+        with open(NEWS_NAMES_PATH, encoding="utf-8") as f:
+            names = json.load(f)
+    except Exception:
+        names = {}
+    if ticker not in names:
+        info = yf.Ticker(ticker).info
+        names[ticker] = info.get("longName") or info.get("shortName") or ""
+        with open(NEWS_NAMES_PATH, "w", encoding="utf-8") as f:
+            json.dump(names, f, indent=1)
+    return names[ticker]
+
+
+OPTIONS_SYMBOL_MAP_PATH = "output/options_symbol_map.json"  # shared with app.py's options snapshot
+
+
+def _tsx_us_twin_cached(ticker):
+    """resolve_us_twin through the options snapshot's cache file, so news and
+    options share one lookup per ticker. Unmatched entries are retried after
+    30 days, matching app.OPTIONS_TWIN_RECHECK_DAYS."""
+    try:
+        with open(OPTIONS_SYMBOL_MAP_PATH, encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {}
+    e = cache.get(ticker)
+    today = datetime.now().date()
+    if e and (e.get("us") or (today - datetime.strptime(e["checkedAt"], "%Y-%m-%d").date()).days < 30):
+        return e.get("us")
+    us = resolve_us_twin(ticker)
+    cache[ticker] = {"us": us, "checkedAt": today.isoformat()}
+    with open(OPTIONS_SYMBOL_MAP_PATH, "w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=1)
+    return us
+
+
+def _tsx_news_match(ticker, name):
+    """(symbols, phrase) that mark a search item as about this TSX company.
+    Yahoo tags Canadian news with the US symbol (RY, not RY.TO) or a US
+    listing under another symbol (EDR.TO news is tagged EXK), so tags alone
+    miss most of it — the company name in the headline catches the rest.
+    The bare root (ABX) is only trusted once verified as the same company:
+    NYSE ABX is Abacus, not Barrick."""
+    symbols = {ticker}
+    twin = _tsx_us_twin_cached(ticker)
+    if twin:
+        symbols.add(twin)
+    words = [w for w in re.sub(r"[^a-z0-9 ]", " ", name.lower()).split() if w not in _NAME_FILLER]
+    phrase = " ".join(words[:2]) if len(words) >= 2 or (words and len(words[0]) >= 5) else ""
+    return symbols, phrase, twin
+
+
 def _search_news(ticker, cutoff):
     """Fallback source: Yahoo's search endpoint. Ticker.news uses a separate
     feed that can go empty while search still works (seen 2026-10-01 from
     ~16:30: every ticker returned 0 raw items, search returned news fine).
     Search items carry relatedTickers, so only news tagged with this ticker
-    is kept; they have no summary text."""
-    out = []
-    for i in yf.Search(ticker, news_count=10).news or []:
-        if ticker not in (i.get("relatedTickers") or []) or not i.get("providerPublishTime"):
-            continue
-        pub = datetime.fromtimestamp(i["providerPublishTime"], timezone.utc)
-        if pub < cutoff:
-            continue
-        out.append({
-            "title": i.get("title", ""),
-            "summary": "",
-            "pubDate": pub.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "url": i.get("link", ""),
-            "provider": i.get("publisher", ""),
-        })
+    is kept; they have no summary text.
+
+    TSX tickers: Yahoo never tags news with the .TO symbol for interlisted
+    names, and searching "RY.TO" returns nothing — so search by company
+    name and keep items tagged with any of the company's symbols or naming
+    it in the headline (see _tsx_news_match)."""
+    if ticker.endswith(".TO"):
+        name = _tsx_company_name(ticker)
+        symbols, phrase, twin = _tsx_news_match(ticker, name)
+        queries = [q for q in (name, twin) if q]
+        keep = lambda i: bool(symbols & set(i.get("relatedTickers") or [])) or (phrase and phrase in (i.get("title") or "").lower())
+    else:
+        queries = [ticker]
+        keep = lambda i: ticker in (i.get("relatedTickers") or [])
+    out, seen = [], set()
+    for q in queries:
+        for i in yf.Search(q, news_count=10).news or []:
+            link = i.get("link", "")
+            if link in seen or not keep(i) or not i.get("providerPublishTime"):
+                continue
+            seen.add(link)
+            pub = datetime.fromtimestamp(i["providerPublishTime"], timezone.utc)
+            if pub < cutoff:
+                continue
+            out.append({
+                "title": i.get("title", ""),
+                "summary": "",
+                "pubDate": pub.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "url": link,
+                "provider": i.get("publisher", ""),
+            })
     return out
 
 
