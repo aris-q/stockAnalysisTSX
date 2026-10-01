@@ -2,6 +2,7 @@ import requests
 import yfinance as yf
 import logging
 import math
+import re
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -147,6 +148,90 @@ def fetch_cdn_gainers():
     except Exception as e:
         log.error(f"CDN gainers FAIL: {e}")
         return []
+
+def fetch_options_summary(ticker, max_days=60, max_expirations=8):
+    """End-of-day options activity for one ticker from Yahoo (US listings
+    only — TSX tickers go through resolve_us_twin; ~15 min delayed). Covers expirations within
+    max_days — near-term contracts carry most of the activity — and keeps a
+    summary plus the most unusual contracts, not full chains (NVDA alone
+    has thousands of contracts across 21 expirations).
+
+    Returns {"noOptions": True} when Yahoo lists no options."""
+    import pandas as pd
+    tk = yf.Ticker(ticker)
+    exps = list(tk.options or [])
+    if not exps:
+        return {"noOptions": True}
+    today = datetime.now().date()
+    near = [e for e in exps if (datetime.strptime(e, "%Y-%m-%d").date() - today).days <= max_days][:max_expirations] or exps[:1]
+    try:
+        spot = float(tk.fast_info.last_price)
+    except Exception:
+        spot = None
+
+    totals = {"callVolume": 0, "putVolume": 0, "callOpenInterest": 0, "putOpenInterest": 0}
+    unusual, atm_iv = [], None
+    for i, e in enumerate(near):
+        chain = tk.option_chain(e)
+        for side, df in (("call", chain.calls), ("put", chain.puts)):
+            df = df.fillna({"volume": 0, "openInterest": 0})
+            totals[f"{side}Volume"] += int(df["volume"].sum())
+            totals[f"{side}OpenInterest"] += int(df["openInterest"].sum())
+            # unusual = lots traded relative to what was already open: new positioning
+            hot = df[(df["volume"] >= 100) & (df["volume"] > 2 * df["openInterest"])]
+            unusual += [{"side": side, "expiration": e, "strike": float(r.strike), "volume": int(r.volume),
+                         "openInterest": int(r.openInterest),
+                         "iv": round(float(r.impliedVolatility), 4) if pd.notna(r.impliedVolatility) else None}
+                        for r in hot.itertuples()]
+            if i == 0 and spot and not df.empty and side == "call":
+                atm = df.iloc[(df["strike"] - spot).abs().argsort()[:1]]
+                v = atm["impliedVolatility"].iloc[0]
+                atm_iv = round(float(v), 4) if pd.notna(v) else None
+    cv, pv = totals["callVolume"], totals["putVolume"]
+    return {
+        **totals,
+        "putCallVolumeRatio": round(pv / cv, 3) if cv else None,
+        "putCallOIRatio": round(totals["putOpenInterest"] / totals["callOpenInterest"], 3) if totals["callOpenInterest"] else None,
+        "atmIV": atm_iv,                      # nearest expiration, call strike closest to spot
+        "spot": spot,
+        "expirationsCovered": near,
+        "unusual": sorted(unusual, key=lambda u: u["volume"], reverse=True)[:10],
+        "unusualCount": len(unusual),
+    }
+
+
+def _name_key(name):
+    """Company name reduced for comparison: lowercase letters/digits only,
+    first 10 chars ("Royal Bank of Canada" -> "royalbanko")."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())[:10]
+
+
+def resolve_us_twin(ticker):
+    """US-listed symbol of the same company as a TSX ticker, or None.
+
+    TSX options trade on the Montreal Exchange, which Yahoo doesn't carry —
+    but ~1/3 of our TSX names are interlisted in the US, where Yahoo has
+    full chains. Tries the TSX root (RY.TO -> RY) and, for class shares,
+    the root without the class (TECK-B.TO -> TECK); accepts it only when
+    both company names match, which rejects same-symbol strangers
+    (ABX.TO Barrick vs ABX on NYSE). Misses twins with a different symbol
+    (CNR.TO -> CNI)."""
+    if not ticker.endswith(".TO"):
+        return None
+    root = ticker[:-3]
+    tsx_info = yf.Ticker(ticker).info
+    tsx_key = _name_key(tsx_info.get("longName") or tsx_info.get("shortName"))
+    if not tsx_key:
+        return None
+    for cand in dict.fromkeys([root, root.split("-")[0]]):
+        try:
+            info = yf.Ticker(cand).info
+        except Exception:
+            continue
+        if _name_key(info.get("longName") or info.get("shortName")) == tsx_key:
+            return cand
+    return None
+
 
 def _search_news(ticker, cutoff):
     """Fallback source: Yahoo's search endpoint. Ticker.news uses a separate

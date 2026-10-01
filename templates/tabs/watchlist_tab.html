@@ -424,6 +424,9 @@ async function loadSchedulerStatus() {
         <span>News refresh (holdings, watchlist, candidates)</span>
         <span><input id="schedNewsTimes" value="${(cfg.newsTimes||[]).join(', ')}" style="${inp};width:130px"></span>
         <span>${fmt('newsRefresh')}</span>
+        <span>Options snapshot (ever bought or simulated, via US listing) <button class="btn" style="font-size:14px;padding:1px 8px" onclick="runOptionsSnapshot(this)">RUN NOW</button></span>
+        <span><input id="schedOptionsTime" value="${cfg.optionsTime||''}" style="${inp};width:60px"></span>
+        <span>${fmt('optionsSnapshot')}</span>
         <span>Scoring weight backtest (dream/AI split vs shadow history — see TradeAI tab)</span>
         <span><input id="schedWeightBacktestTime" value="${cfg.weightBacktestTime||''}" style="${inp};width:60px"></span>
         <span>${fmt('weightBacktest')}</span>
@@ -442,6 +445,15 @@ async function loadSchedulerStatus() {
   }
 }
 
+async function runOptionsSnapshot(btn) {
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
+  try {
+    const d = await fetch('/options/snapshot/run', {method: 'POST'}).then(r => r.json());
+    if (d.error) alert('Could not start: ' + d.error);
+  } catch (e) { console.error('[Options] run FAIL:', e); }
+  btn.disabled = false; btn.textContent = orig;  // progress shows in the header status bar
+}
+
 async function saveSchedule(btn) {
   const listOf = (id) => (document.getElementById(id).value || '').split(',').map(s => s.trim()).filter(Boolean);
   const hours    = listOf('schedSellHours').map(Number);
@@ -451,6 +463,7 @@ async function saveSchedule(btn) {
   const acctTracker = document.getElementById('schedAcctTrackerTime').value.trim();
   const weightBacktest = document.getElementById('schedWeightBacktestTime').value.trim();
   const newsTimes = listOf('schedNewsTimes');
+  const optionsTime = document.getElementById('schedOptionsTime').value.trim();
   const timeRe = /^([01]?\d|2[0-3]):[0-5]\d$/;
   if (!hours.length || hours.some(h => isNaN(h) || h < 0 || h > 23)) { alert('Sell-check hours must be numbers 0-23 (e.g. 9,10,11)'); return; }
   if (!mins.length || mins.some(m => isNaN(m) || m < 0 || m > 59))   { alert('Sell-check minutes must be numbers 0-59 (e.g. 20,40)'); return; }
@@ -458,12 +471,13 @@ async function saveSchedule(btn) {
   if (!timeRe.test(dream)) { alert('Dream time must be HH:MM 24h (e.g. 16:01)'); return; }
   if (!timeRe.test(acctTracker)) { alert('Account tracker time must be HH:MM 24h (e.g. 17:04)'); return; }
   if (!timeRe.test(weightBacktest)) { alert('Weight backtest time must be HH:MM 24h (e.g. 17:06)'); return; }
+  if (!timeRe.test(optionsTime)) { alert('Options snapshot time must be HH:MM 24h (e.g. 17:15)'); return; }
   if (!newsTimes.length || !newsTimes.every(t => timeRe.test(t))) { alert('News times must be HH:MM 24h (e.g. 09:20, 12:30)'); return; }
   btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
   try {
     const r = await fetch('/admin/scheduler', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream, accountTrackerTime: acctTracker, weightBacktestTime: weightBacktest, newsTimes })
+      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream, accountTrackerTime: acctTracker, weightBacktestTime: weightBacktest, newsTimes, optionsTime })
     });
     const d = await r.json();
     if (d.error) alert('Save failed: ' + d.error);

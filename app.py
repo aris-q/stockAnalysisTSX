@@ -432,6 +432,124 @@ def run_news_refresh(trigger="manual"):
         fetch_status = {"running": False, "message": f"News refresh FAIL: {e}", "operation": None}
 
 
+# ═══════════════════════════ OPTIONS HISTORY ═══════════════════════════
+# Yahoo keeps no options history, so it has to be recorded daily to ever
+# test whether unusual options activity predicts moves. One file per
+# trading day: output/options/YYYY-MM-DD.json (gitignored).
+# TSX options aren't on Yahoo, so each ticker is recorded through its
+# US-listed twin when it has one (RY.TO -> RY); see resolve_us_twin.
+OPTIONS_DIR = "output/options"
+OPTIONS_SYMBOL_MAP_PATH = "output/options_symbol_map.json"
+OPTIONS_TWIN_RECHECK_DAYS = 30  # retry tickers with no twin monthly (new US listings)
+
+
+def _options_tickers():
+    """Every ticker ever bought (transactions, holdings and closed-trade
+    outcomes — outcomes survive account resets) plus every ticker the
+    shadow simulation has scored."""
+    t = load_json(TRADES_AI_PATH, {})
+    tickers = {x["ticker"] for x in t.get("transactions", []) if x.get("ticker")} | set(t.get("holdings", {}))
+    tickers |= {o["ticker"] for o in load_json(TRADE_OUTCOMES_PATH, {"outcomes": []}).get("outcomes", []) if o.get("ticker")}
+    for snap in load_json(SHADOW_PATH, {"snapshots": []}).get("snapshots", []):
+        tickers |= {r["ticker"] for r in snap.get("rows", []) if r.get("composite") is not None}
+    return sorted(tickers)
+
+
+def _options_twin_map(tickers):
+    """{tsx_ticker: us_symbol or None}, cached in OPTIONS_SYMBOL_MAP_PATH.
+    Only new tickers and stale no-twin entries are looked up."""
+    from fetcher import resolve_us_twin
+    cache = load_json(OPTIONS_SYMBOL_MAP_PATH, {})
+    today = datetime.now(TZ).date()
+    changed = False
+    for t in tickers:
+        e = cache.get(t)
+        if e and (e.get("us") or (today - datetime.strptime(e["checkedAt"], "%Y-%m-%d").date()).days < OPTIONS_TWIN_RECHECK_DAYS):
+            continue
+        fetch_status["message"] = f"Options: matching US listing — {t}"
+        try:
+            cache[t] = {"us": resolve_us_twin(t), "checkedAt": today.isoformat()}
+            changed = True
+        except Exception as ex:
+            log.warning(f"[Options] twin lookup FAIL: {t} | {ex}")  # retried next run
+    if changed:
+        save_json(OPTIONS_SYMBOL_MAP_PATH, cache)
+    return {t: (cache.get(t) or {}).get("us") for t in tickers}
+
+
+def run_options_snapshot(trigger="manual"):
+    """Record today's end-of-day options summary for _options_tickers().
+    Re-running the same day only fills tickers not yet recorded (or that
+    failed), so a manual re-run after a partial failure is cheap."""
+    global fetch_status
+    from fetcher import fetch_options_summary
+    os.makedirs(OPTIONS_DIR, exist_ok=True)
+    day = datetime.now(TZ).strftime("%Y-%m-%d")
+    path = os.path.join(OPTIONS_DIR, f"{day}.json")
+    db = load_json(path, {"date": day, "tickers": {}})
+    todo = [t for t in _options_tickers() if t not in db["tickers"] or "error" in db["tickers"][t]]
+    total = len(todo)
+    fetch_status = {"running": True, "message": f"Options: {total} tickers...", "operation": "options_snapshot",
+                    "current": 0, "total": total, "current_ticker": ""}
+    twins = _options_twin_map(todo)
+    log.info(f"=== Options Snapshot Started [{trigger}]: {total} tickers ===")
+    ok = no_opts = failed = 0
+    try:
+        for i, t in enumerate(todo, 1):
+            if stop_flag:
+                break
+            fetch_status.update({"current": i, "current_ticker": t, "message": f"Options: {i} of {total} — {t}"})
+            for attempt in (1, 2):
+                try:
+                    us = twins.get(t)
+                    s = {**fetch_options_summary(us), "usSymbol": us} if us else {"noOptions": True, "usSymbol": None}
+                    db["tickers"][t] = s
+                    if s.get("noOptions"):
+                        no_opts += 1
+                    else:
+                        ok += 1
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        db["tickers"][t] = {"error": str(e)[:200]}
+                        failed += 1
+                        log.warning(f"[Options] FAIL: {t} | {e}")
+                    else:
+                        time.sleep(2)
+            if i % 25 == 0:
+                save_json(path, db)  # partial progress survives a crash
+        db["capturedAt"] = ts()
+        save_json(path, db)
+        msg = f"Options saved {day}: {ok} with options, {no_opts} without (no US listing), {failed} failed"
+        fetch_status = {"running": False, "message": msg, "operation": None, "current": total, "total": total, "current_ticker": ""}
+        log.info(f"=== Options Snapshot Complete [{trigger}]: {msg} ===")
+    except Exception as e:
+        save_json(path, db)
+        log.error(f"Options snapshot FAIL: {e}")
+        fetch_status = {"running": False, "message": f"Options snapshot FAIL: {e}", "operation": None}
+
+
+@app.route("/options/snapshot/run", methods=["POST"])
+def options_snapshot_run():
+    if fetch_status.get("running"):
+        return jsonify({"error": "Another operation is running"}), 409
+    threading.Thread(target=run_options_snapshot, args=("manual",), daemon=True).start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/options/<ticker>")
+def options_history(ticker):
+    """Recorded daily options summaries for one ticker, newest first."""
+    days = int(request.args.get("days", 30))
+    out = []
+    if os.path.isdir(OPTIONS_DIR):
+        for f in sorted(os.listdir(OPTIONS_DIR), reverse=True)[:days]:
+            rec = load_json(os.path.join(OPTIONS_DIR, f), {}).get("tickers", {}).get(ticker)
+            if rec is not None:
+                out.append({"date": f[:-5], **rec})
+    return jsonify({"ticker": ticker, "history": out})
+
+
 @app.route("/news/refresh_all", methods=["POST"])
 def news_refresh_all():
     if fetch_status.get("running"):
@@ -5142,6 +5260,7 @@ SCHEDULER_DEFAULTS = {
     "dreamTime":        "13:30",
     "accountTrackerTime": "17:04",  # daily, after close — portfolio value vs TSX/TSX 60
     "weightBacktestTime": "17:06",  # daily — dream/AI weighting backtest over shadow history
+    "optionsTime":      "17:15",  # daily, after the close — end-of-day options volume/OI (via US-listed twin) for every ticker ever bought or simulated
     "newsTimes":        ["09:20", "12:30"],  # the only scheduled news fetch — before the open, and midday before the afternoon Recommends
     "tuningTime":       "16:15",  # Friday only — weekly missed-gainer tuning check
     "marketHolidays": [
@@ -5269,6 +5388,9 @@ def _scheduler_loop():
             if hhmm == cfg.get("accountTrackerTime"):
                 slots.append((f"accountTracker-{hhmm}", "accountTracker",
                               [("account-tracker", _update_account_tracker)]))
+            if hhmm == cfg.get("optionsTime") and not early_close:
+                slots.append((f"options-{hhmm}", "optionsSnapshot",
+                              [("options-snapshot", lambda: run_options_snapshot("scheduler"))]))
             if hhmm in cfg.get("newsTimes", []):
                 slots.append((f"news-{hhmm}", "newsRefresh",
                               [("news-refresh", lambda: run_news_refresh("scheduler"))]))
@@ -5319,6 +5441,8 @@ def admin_scheduler():
                 saved["dreamTime"] = norm_time(body["dreamTime"])
             if "accountTrackerTime" in body:
                 saved["accountTrackerTime"] = norm_time(body["accountTrackerTime"])
+            if "optionsTime" in body:
+                saved["optionsTime"] = norm_time(body["optionsTime"])
             if "newsTimes" in body:
                 saved["newsTimes"] = [norm_time(t) for t in body["newsTimes"]]
             if "weightBacktestTime" in body:
