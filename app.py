@@ -835,7 +835,8 @@ def run_options_snapshot(trigger="manual"):
                 save_json(path, db)  # partial progress survives a crash
         db["capturedAt"] = ts()
         save_json(path, db)
-        msg = f"Options saved {day}: {ok} with options, {no_opts} without (no US listing), {failed} failed"
+        # only name failures when there are some: any "FAIL" in the message pops the global error popup
+        msg = f"Options saved {day}: {ok} with options, {no_opts} without (no US listing)" + (f", {failed} FAILED" if failed else "")
         fetch_status = {"running": False, "message": msg, "operation": None, "current": total, "total": total, "current_ticker": ""}
         log.info(f"=== Options Snapshot Complete [{trigger}]: {msg} ===")
     except Exception as e:
