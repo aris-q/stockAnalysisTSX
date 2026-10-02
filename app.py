@@ -518,6 +518,92 @@ def _market_risk_today():
     return m if m.get("date") == datetime.now(TZ).strftime("%Y-%m-%d") else None
 
 
+# ── Buy review: after the last Recommend, Gemini second-opinions today's buys ──
+BUY_REVIEWS_PATH = "output/buy_reviews.json"
+
+
+def run_buy_review(trigger="manual"):
+    """One Gemini call reviewing every BUY made today that has no verdict yet.
+    Flags only — agree / caution / avoid; nothing is sold on it."""
+    from news_check import review_buys
+    from config import GEMINI_API_KEY
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    db = load_json(BUY_REVIEWS_PATH, {"reviews": []})
+    done = {r["key"] for r in db.get("reviews", []) if r.get("verdict")}
+    trades = load_trades_ai()
+    holdings = trades.get("holdings", {})
+    buys = []
+    for tx in trades.get("transactions", []):
+        if str(tx.get("action", "")).upper() != "BUY" or (tx.get("date") or "")[:10] != today:
+            continue
+        key = f"{tx.get('ticker')}|{tx.get('date')}"
+        if key in done:
+            continue
+        pos = holdings.get(tx.get("ticker")) or {}
+        buys.append({**tx, "key": key, "factors": pos.get("factors") if pos.get("purchasedAt") == tx.get("date") else None})
+    if not buys:
+        db["lastRun"] = {"at": ts(), "trigger": trigger, "status": "ok", "reviewed": 0, "note": "no unreviewed buys today"}
+        save_json(BUY_REVIEWS_PATH, db)
+        log.info(f"[BuyReview] [{trigger}] nothing to review")
+        return db["lastRun"]
+    nc = load_json(NEWS_CHECK_PATH, {})
+    fresh = nc.get("date") == today
+    out = review_buys(buys, load_json(TRADE_AI_CANDIDATES_PATH, {}).get("details", {}),
+                      {r["ticker"]: r for r in nc.get("tickers", [])} if fresh else {},
+                      nc.get("market") if fresh else None, GEMINI_API_KEY, TZ)
+    keep = [r for r in db.get("reviews", []) if r["key"] not in out]
+    db["reviews"] = (keep + list(out.values()))[-500:]
+    ok = sum(1 for r in out.values() if r.get("verdict"))
+    db["lastRun"] = {"at": ts(), "trigger": trigger, "status": "ok" if ok == len(out) else "partial",
+                     "reviewed": ok, "failed": len(out) - ok}
+    save_json(BUY_REVIEWS_PATH, db)
+    log.info(f"[BuyReview] [{trigger}] reviewed {ok}/{len(out)} buys | "
+             + ", ".join(f"{r['ticker']}:{r.get('verdict')}" for r in out.values()))
+    send = globals().get("_send_alert")  # alerts exist in the US app only
+    if send:
+        for r in out.values():
+            if r.get("verdict") == "avoid":
+                send("news", f"✋ Gemini disagrees with today's {r['ticker']} buy",
+                     f"{r['thesis']} — risks: {'; '.join(r.get('risks') or [])}", priority=4, tags=["warning"])
+    return db["lastRun"]
+
+
+def _buy_reviews_payload():
+    """Reviews (newest first), per-verdict results on closed trades so the
+    verdicts can be judged against outcomes, and the verdict of each
+    current holding's purchase for the badge."""
+    db = load_json(BUY_REVIEWS_PATH, {"reviews": []})
+    rows = sorted(db.get("reviews", []), key=lambda r: r.get("date") or "", reverse=True)
+    closed = {(o.get("ticker"), o.get("buyDate")): o for o in load_json(TRADE_OUTCOMES_PATH, {"outcomes": []}).get("outcomes", [])}
+    stats = {v: {"reviewed": 0, "closed": 0, "wins": 0, "sumPct": 0.0} for v in ("agree", "caution", "avoid")}
+    for r in rows:
+        v = r.get("verdict")
+        if v not in stats:
+            continue
+        stats[v]["reviewed"] += 1
+        o = closed.get((r["ticker"], r.get("date")))
+        if o and o.get("gainLossPct") is not None:
+            r["closedPct"] = o["gainLossPct"]
+            stats[v]["closed"] += 1
+            stats[v]["wins"] += o["gainLossPct"] > 0
+            stats[v]["sumPct"] = round(stats[v]["sumPct"] + o["gainLossPct"], 2)
+    held = {}
+    for t, pos in load_trades_ai().get("holdings", {}).items():
+        r = next((r for r in rows if r["ticker"] == t and r.get("date") == pos.get("purchasedAt") and r.get("verdict")), None)
+        if r:
+            held[t] = {"verdict": r["verdict"], "thesis": r.get("thesis", ""), "risks": r.get("risks", [])}
+    return {"reviews": rows[:60], "stats": stats, "held": held, "lastRun": db.get("lastRun")}
+
+
+@app.route("/tradeai/buy_review/run", methods=["POST"])
+def buy_review_run():
+    try:
+        return jsonify(run_buy_review("manual"))
+    except Exception as e:
+        log.error(f"[BuyReview] FAIL: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 # ── Loss review: after the close, Gemini tags why each losing trade lost ──
 LOSS_REVIEWS_PATH = "output/loss_reviews.json"
 LOSS_REVIEW_LOOKBACK_DAYS = 7  # headlines are only stored for ~7 days
@@ -4333,6 +4419,7 @@ def get_tradeai():
         "newsCheckMap":       _news_check_map(),
         "marketRisk":         _market_risk_today(),
         "lossReviews":        _loss_reviews_payload(),
+        "buyReviews":         _buy_reviews_payload(),
         "signalFcMap":        signal_fc_map,
         "rollbackProposal":   load_json(ROLLBACK_PROPOSAL_PATH, {"status": "none"}),
         "tuningProposal":     load_json(TUNING_PROPOSAL_PATH, {"status": "none"}),
@@ -5420,6 +5507,7 @@ SCHEDULER_DEFAULTS = {
     "dreamTime":        "13:30",
     "accountTrackerTime": "17:04",  # daily, after close — portfolio value vs TSX/TSX 60
     "weightBacktestTime": "17:06",  # daily — dream/AI weighting backtest over shadow history
+    "buyReviewTime":    "15:10",  # daily, after the last (15:00) Recommend — Gemini second opinion on today's buys
     "lossReviewTime":   "16:20",  # daily, after the close — Gemini tags why each losing trade lost
     "optionsTime":      "17:15",  # daily, after the close — end-of-day options volume/OI (via US-listed twin) for every ticker ever bought or simulated
     "newsTimes":        ["09:20", "11:47", "14:47"],  # the only scheduled news fetch — before the open (catches the ~53% published after close/overnight), then just before the 12:00 and 15:00 Recommends; :47 avoids the 5-min sell checks
@@ -5549,6 +5637,9 @@ def _scheduler_loop():
             if hhmm == cfg.get("accountTrackerTime"):
                 slots.append((f"accountTracker-{hhmm}", "accountTracker",
                               [("account-tracker", _update_account_tracker)]))
+            if hhmm == cfg.get("buyReviewTime"):
+                slots.append((f"buyReview-{hhmm}", "buyReview",
+                              [("buy-review", lambda: run_buy_review("scheduler"))]))
             if hhmm == cfg.get("lossReviewTime"):
                 slots.append((f"lossReview-{hhmm}", "lossReview",
                               [("loss-review", lambda: run_loss_review("scheduler"))]))
@@ -5605,6 +5696,8 @@ def admin_scheduler():
                 saved["dreamTime"] = norm_time(body["dreamTime"])
             if "accountTrackerTime" in body:
                 saved["accountTrackerTime"] = norm_time(body["accountTrackerTime"])
+            if "buyReviewTime" in body:
+                saved["buyReviewTime"] = norm_time(body["buyReviewTime"])
             if "lossReviewTime" in body:
                 saved["lossReviewTime"] = norm_time(body["lossReviewTime"])
             if "optionsTime" in body:

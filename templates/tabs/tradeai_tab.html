@@ -829,6 +829,65 @@ async function runWeightBacktestNow(btn) {
   }
 }
 
+function renderBuyReviewSection(br) {
+  br = br || {};
+  const rows = br.reviews || [];
+  const st = br.stats || {};
+  const vc = {agree: 'var(--up)', caution: '#fbbf24', avoid: 'var(--down)'};
+  const icon = {agree: '👍', caution: '⚠', avoid: '✋'};
+  const tiles = ['agree', 'caution', 'avoid'].map(v => {
+    const s = st[v] || {reviewed: 0, closed: 0, wins: 0, sumPct: 0};
+    return `<div style="flex:1 1 150px;border:1px solid var(--border);border-radius:8px;padding:8px 10px">
+        <div style="font-size:13px;color:${vc[v]};font-weight:700;letter-spacing:1px">${icon[v]} ${v.toUpperCase()}</div>
+        <div style="font-family:'DM Mono',monospace;font-size:20px;font-weight:800">${s.reviewed}</div>
+        <div style="font-size:13px;color:var(--muted)">${s.closed ? `${s.closed} closed · ${Math.round(100 * s.wins / s.closed)}% won · avg ${(s.sumPct / s.closed).toFixed(2)}%` : 'no closed trades yet'}</div></div>`;
+  }).join('');
+  const latest = rows.length ? (rows[0].date || '').slice(0, 10) : null;
+  const card = r => {
+    const col = vc[r.verdict] || 'var(--muted)';
+    return `<div style="border:1px solid ${col};border-left:5px solid ${col};border-radius:6px;padding:8px 10px;margin-bottom:8px">
+        <div><b style="font-family:'Syne',sans-serif;font-size:17px">${_escNews(r.ticker)}</b>
+          <span style="color:var(--muted);font-size:13px"> ${_escNews((r.date || '').slice(11))} · ${_escNews(r.bucket || '')} · composite ${r.composite ?? '—'} · $${r.amount != null ? Number(r.amount).toLocaleString() : '—'}</span>
+          <span style="margin-left:8px;font-weight:800;color:${col}">${icon[r.verdict] || ''} ${_escNews((r.verdict || 'not reviewed').toUpperCase())}</span>
+          ${r.earningsSoon ? '<span style="margin-left:6px;font-size:12px;padding:1px 6px;border-radius:4px;background:#fbbf24;color:#111;font-weight:800">EARNINGS ≤7d</span>' : ''}
+          ${r.closedPct != null ? `<span style="margin-left:6px;font-size:13px;color:${r.closedPct > 0 ? 'var(--up)' : 'var(--down)'}">closed ${r.closedPct.toFixed(2)}%</span>` : ''}
+          <span style="color:var(--muted);font-size:13px">${r.confidence ? ' · ' + _escNews(r.confidence) + ' confidence' : ''}</span></div>
+        <div style="font-size:15px;margin-top:3px"><span style="color:var(--muted)">Thesis:</span> ${_escNews(r.thesis)}</div>
+        ${(r.risks || []).length ? `<div style="font-size:15px"><span style="color:var(--muted)">Risks:</span> ${r.risks.map(_escNews).join(' · ')}</div>` : ''}
+        ${r.watch ? `<div style="font-size:15px"><span style="color:var(--muted)">Watch:</span> ${_escNews(r.watch)}</div>` : ''}
+        <div style="font-size:13px;color:var(--muted);margin-top:2px">System reason: ${_escNews(r.buyReason || '')}</div></div>`;
+  };
+  const today = rows.filter(r => (r.date || '').slice(0, 10) === latest);
+  const older = rows.filter(r => (r.date || '').slice(0, 10) !== latest);
+  const last = br.lastRun ? `last run ${_escNews(br.lastRun.at)} · ${br.lastRun.reviewed ?? 0} reviewed${br.lastRun.failed ? ' · ' + br.lastRun.failed + ' failed' : ''}${br.lastRun.note ? ' · ' + _escNews(br.lastRun.note) : ''}` : 'not run yet';
+  return `<div class="trade-section" id="buyReviewSection">
+    <div class="trade-section-header">
+      <div>
+        <div class="trade-section-title">🛒 BUY REVIEW (Gemini second opinion)</div>
+        <div class="trade-section-sub">Each day's purchases: agree / caution / avoid — flags only, nothing is sold on it · ${last}</div>
+      </div>
+      <button class="btn" onclick="runBuyReview(this)" title="Review today's purchases that have no verdict yet (also runs daily after the last Recommend)">▶ RUN NOW</button>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px">${tiles}</div>
+    ${latest ? `<div style="font-size:14px;font-weight:700;letter-spacing:1px;color:var(--muted);margin-bottom:6px">BUYS ON ${latest} (${today.length})</div>${today.map(card).join('')}`
+      : '<div style="color:var(--muted);font-size:15px">No purchases reviewed yet.</div>'}
+    ${older.length ? `<div style="margin-top:8px"><span style="cursor:pointer;color:var(--accent);font-size:15px" onclick="const b=this.nextElementSibling;const o=b.style.display!=='none';b.style.display=o?'none':'block';this.textContent=(o?'▸':'▾')+' EARLIER BUYS (${older.length})'">▸ EARLIER BUYS (${older.length})</span><div style="display:none;margin-top:6px">${older.map(card).join('')}</div></div>` : ''}
+  </div>`;
+}
+
+async function runBuyReview(btn) {
+  const orig = btn.textContent; btn.disabled = true; btn.textContent = '⏳ REVIEWING...';
+  try {
+    const d = await fetch('/tradeai/buy_review/run', {method: 'POST'}).then(r => r.json());
+    if (d.error) alert('Buy review failed: ' + d.error);
+    else if (d.note) alert('Buy review: ' + d.note);
+    await loadTradeAI(true);
+  } catch (e) {
+    alert('Buy review failed: ' + e.message);
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
 function renderLossReviewSection(lr) {
   lr = lr || {};
   const rows = lr.reviews || [];
@@ -1062,7 +1121,7 @@ function renderTradeAI(data) {
         const newsBadge = ` <span onclick="event.stopPropagation();openNewsModal('${tickerSafe}')" title="Recent headlines (last 7 days)" style="font-size:15px;cursor:pointer;color:var(--muted);white-space:nowrap">📰${newsN != null ? ' ' + newsN : ''}</span>`;
         const holdIndustry = (details[h.ticker] || {}).industry || '';
         return `<tr${isWarned ? ' style="background:rgba(248,113,113,0.08);box-shadow:inset 3px 0 0 var(--down)"' : ''}>
-          <td><span onclick="openDreamDetailModal('${tickerSafe}')" title="${holdIndustry ? holdIndustry + ' — click' : 'Click'} for Dream Scan detail" style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px">${h.ticker}</span>${sentBadge}${newsBadge}${newsCheckBadge(h.ticker, data.newsCheckMap)}${isWarned ? ` <span onclick="event.stopPropagation();openNewsWarningDetail('${tickerSafe}')" title="Severe news: ${(warn.keyword||'').replace(/"/g,'')} — click for details" style="cursor:pointer;font-size:17px">🚨</span>` : ''}</td>
+          <td><span onclick="openDreamDetailModal('${tickerSafe}')" title="${holdIndustry ? holdIndustry + ' — click' : 'Click'} for Dream Scan detail" style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px">${h.ticker}</span>${sentBadge}${newsBadge}${newsCheckBadge(h.ticker, data.newsCheckMap)}${buyVerdictBadge(h.ticker, (data.buyReviews || {}).held)}${isWarned ? ` <span onclick="event.stopPropagation();openNewsWarningDetail('${tickerSafe}')" title="Severe news: ${(warn.keyword||'').replace(/"/g,'')} — click for details" style="cursor:pointer;font-size:17px">🚨</span>` : ''}</td>
           <td>${h.shares}</td>
           <td>${fmt$(h.purchasePrice)}</td>
           <td>${fmt$(h.previousClose)}</td>
@@ -1270,6 +1329,8 @@ function renderTradeAI(data) {
       </div>
     </div>
   </div>
+
+  ${renderBuyReviewSection(data.buyReviews)}
 
   ${renderLossReviewSection(data.lossReviews)}
 

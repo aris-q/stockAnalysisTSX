@@ -185,6 +185,16 @@ function newsCheckBadge(ticker, map) {
     + ` style="cursor:pointer;font-size:13px;font-weight:800;padding:2px 6px;border-radius:4px;background:var(--down);color:#fff;white-space:nowrap">⚠ ALERT ${r.severity}</span>`;
 }
 
+function buyVerdictBadge(ticker, held) {
+  const r = (held || {})[ticker];
+  if (!r) return '';
+  const cfg = {agree: ['👍', 'var(--up)'], caution: ['⚠', '#fbbf24'], avoid: ['✋', 'var(--down)']}[r.verdict];
+  if (!cfg) return '';
+  const tip = `Gemini on this buy: ${r.verdict.toUpperCase()} — ${r.thesis}${(r.risks || []).length ? ' · Risks: ' + r.risks.join('; ') : ''}`;
+  return ` <span onclick="event.stopPropagation();const s=document.getElementById('buyReviewSection');if(s)s.scrollIntoView({behavior:'smooth'})" title="${_escNews(tip)}"`
+    + ` style="cursor:pointer;font-size:13px;font-weight:800;padding:2px 6px;border-radius:4px;border:1px solid ${cfg[1]};color:${cfg[1]};white-space:nowrap">${cfg[0]} ${r.verdict.toUpperCase()}</span>`;
+}
+
 function _ncMarketHtml(m) {
   if (!m) return '';
   const col = m.riskLevel === 'high' ? 'var(--down)' : m.riskLevel === 'elevated' ? '#fbbf24' : 'var(--up)';

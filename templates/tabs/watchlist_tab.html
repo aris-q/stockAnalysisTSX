@@ -427,6 +427,9 @@ async function loadSchedulerStatus() {
         <span>News refresh (holdings, watchlist, candidates)</span>
         <span><input id="schedNewsTimes" value="${(cfg.newsTimes||[]).join(', ')}" style="${inp};width:130px"></span>
         <span>${fmt('newsRefresh')}</span>
+        <span>Buy review — Gemini second opinion on today's purchases <button class="btn" style="font-size:14px;padding:1px 8px" onclick="runBuyReviewAdmin(this)">RUN NOW</button></span>
+        <span><input id="schedBuyReviewTime" value="${cfg.buyReviewTime||''}" style="${inp};width:60px"></span>
+        <span>${fmt('buyReview')}</span>
         <span>Loss review — Gemini tags why each losing trade lost <button class="btn" style="font-size:14px;padding:1px 8px" onclick="runLossReviewAdmin(this)">RUN NOW</button></span>
         <span><input id="schedLossReviewTime" value="${cfg.lossReviewTime||''}" style="${inp};width:60px"></span>
         <span>${fmt('lossReview')}</span>
@@ -449,6 +452,15 @@ async function loadSchedulerStatus() {
     el.textContent = 'Scheduler status unavailable';
     console.error('[Scheduler] status FAIL:', e);
   }
+}
+
+async function runBuyReviewAdmin(btn) {
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
+  try {
+    const d = await fetch('/tradeai/buy_review/run', {method: 'POST'}).then(r => r.json());
+    alert(d.error ? 'Buy review failed: ' + d.error : `Buy review: ${d.reviewed ?? 0} reviewed${d.failed ? ', ' + d.failed + ' failed' : ''}${d.note ? ' — ' + d.note : ''}`);
+  } catch (e) { console.error('[BuyReview] run FAIL:', e); }
+  btn.disabled = false; btn.textContent = orig;
 }
 
 async function runLossReviewAdmin(btn) {
@@ -480,6 +492,7 @@ async function saveSchedule(btn) {
   const newsTimes = listOf('schedNewsTimes');
   const optionsTime = document.getElementById('schedOptionsTime').value.trim();
   const lossReviewTime = document.getElementById('schedLossReviewTime').value.trim();
+  const buyReviewTime = document.getElementById('schedBuyReviewTime').value.trim();
   const timeRe = /^([01]?\d|2[0-3]):[0-5]\d$/;
   if (!hours.length || hours.some(h => isNaN(h) || h < 0 || h > 23)) { alert('Sell-check hours must be numbers 0-23 (e.g. 9,10,11)'); return; }
   if (!mins.length || mins.some(m => isNaN(m) || m < 0 || m > 59))   { alert('Sell-check minutes must be numbers 0-59 (e.g. 20,40)'); return; }
@@ -487,6 +500,7 @@ async function saveSchedule(btn) {
   if (!timeRe.test(dream)) { alert('Dream time must be HH:MM 24h (e.g. 16:01)'); return; }
   if (!timeRe.test(acctTracker)) { alert('Account tracker time must be HH:MM 24h (e.g. 17:04)'); return; }
   if (!timeRe.test(weightBacktest)) { alert('Weight backtest time must be HH:MM 24h (e.g. 17:06)'); return; }
+  if (!timeRe.test(buyReviewTime)) { alert('Buy review time must be HH:MM 24h (e.g. 15:10)'); return; }
   if (!timeRe.test(lossReviewTime)) { alert('Loss review time must be HH:MM 24h (e.g. 16:20)'); return; }
   if (!timeRe.test(optionsTime)) { alert('Options snapshot time must be HH:MM 24h (e.g. 17:15)'); return; }
   if (!newsTimes.length || !newsTimes.every(t => timeRe.test(t))) { alert('News times must be HH:MM 24h (e.g. 09:20, 11:47, 14:47)'); return; }
@@ -494,7 +508,7 @@ async function saveSchedule(btn) {
   try {
     const r = await fetch('/admin/scheduler', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream, accountTrackerTime: acctTracker, weightBacktestTime: weightBacktest, newsTimes, optionsTime, lossReviewTime })
+      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream, accountTrackerTime: acctTracker, weightBacktestTime: weightBacktest, newsTimes, optionsTime, lossReviewTime, buyReviewTime })
     });
     const d = await r.json();
     if (d.error) alert('Save failed: ' + d.error);

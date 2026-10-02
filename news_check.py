@@ -9,7 +9,9 @@ the rest of the app's Gemini use stays disabled in ai_summary._call_gemini).
    overnight news (about half of all headlines) gets checked too.
 2. market_risk — once a day (first run of the day, normally 09:20): reads
    market-wide headlines and names today's event risk (Fed, CPI, tariffs).
-3. review_losses — after the close: tags each losing trade's cause
+3. review_buys — after the last Recommend (15:10): a second opinion on each
+   of today's purchases (agree / caution / avoid). Flags only.
+4. review_losses — after the close: tags each losing trade's cause
    (company news / sector / market / no news = technical) from the
    headlines seen while it was held plus its return vs the index.
 
@@ -68,6 +70,77 @@ For EVERY trade decide:
 4. headlines: numbers of the headlines that explain it ([] if none).
 
 Reply with JSON only: {"results":[{"key":"...","cause":"...","reason":"...","confidence":"...","headlines":[1]}]} with one entry per trade, echoing its key."""
+
+
+BUY_PROMPT = """You give a second opinion on stock purchases a rule-based trading system made today. Per purchase you get: the strategy bucket and composite score that triggered it, the system's stated reason, price and size, key metrics (trend, momentum, valuation, analyst view, short interest, upcoming earnings date), today's headlines for the stock with a prior negative-news verdict, and today's market-risk read.
+
+The system's style: short-to-medium holds (days to a few weeks), ATR-based stop-loss, buys strength (momentum/smart-money/reversal buckets).
+
+For EVERY purchase decide:
+1. verdict: "agree" (the setup is sound for this style), "caution" (a real but manageable risk: e.g. earnings within ~7 days, extended far above averages, negative news, crowded short, market risk elevated), or "avoid" (a serious red flag the rules missed: e.g. pending buyout capping upside, severe company news, earnings tomorrow on a volatile name, thesis contradicted by the data).
+2. thesis: <= 20 words — what the buy is betting on.
+3. risks: up to 3 short items, most important first.
+4. watch: <= 15 words — what would show the trade is failing.
+5. earningsSoon: true if earnings are within 7 days of today.
+6. confidence: low / medium / high.
+
+Judge only from the data given; do not invent facts or predict exact prices.
+
+Reply with JSON only: {"results":[{"key":"...","verdict":"agree|caution|avoid","thesis":"...","risks":["..."],"watch":"...","earningsSoon":false,"confidence":"..."}]} with one entry per purchase, echoing its key."""
+
+BUY_METRICS = ["sector", "industry", "marketCap", "price", "rsi14", "ma20", "ma50", "priceVs52wHigh", "change1d", "change5d",
+               "change30d", "volumeRatio", "atr14Pct", "bbPercent", "peRatio", "forwardPE", "revenueGrowth", "grossMargin",
+               "analystTarget", "analystUpside", "recommendation", "shortFloat", "institutionalPct", "insiderNet", "earningsDate"]
+
+
+def review_buys(buys, details, news_rows, market, api_key, tz):
+    """buys: BUY transactions (each with a unique "key", plus optional
+    "factors" from the holding). details: candidate detail dicts by ticker.
+    news_rows: {ticker: latest news-check row}. Returns {key: review}."""
+    now = datetime.now(tz)
+    reviews, payload = {}, []
+    mkt = f"{(market or {}).get('riskLevel') or 'unknown'} — {(market or {}).get('summary') or 'no read today'}"
+    for b in buys:
+        t = b["ticker"]
+        d = details.get(t) or {}
+        nr = news_rows.get(t) or {}
+        heads = (nr.get("headlines") or [])[:8]
+        metrics = {k: d.get(k) for k in BUY_METRICS if d.get(k) is not None}
+        reviews[b["key"]] = {"key": b["key"], "ticker": t, "date": b.get("date"), "price": b.get("price"),
+                             "amount": b.get("amount"), "bucket": b.get("bucket"), "composite": b.get("composite"),
+                             "buyReason": b.get("reason"), "earningsDate": d.get("earningsDate"),
+                             "verdict": None, "thesis": "", "risks": [], "watch": "", "earningsSoon": False,
+                             "confidence": "", "reviewedAt": now.strftime("%Y-%m-%d %H:%M %Z")}
+        payload.append(f"\nkey={b['key']} | {t} | bought {b.get('date')} @ {b.get('price')} (${b.get('amount')}) | bucket {b.get('bucket')} "
+                       f"| composite {b.get('composite')} | factors {json.dumps(b.get('factors') or {})}"
+                       f"\n  system reason: {b.get('reason')}"
+                       f"\n  metrics: {json.dumps(metrics, default=str)}"
+                       f"\n  news verdict today: {nr.get('state', 'not checked')}"
+                       + (f" (severity {nr.get('severity')}, {nr.get('category')}: {nr.get('reason')})" if nr.get("state") == "negative" else "")
+                       + (f" | DEAL: {nr.get('dealNote')}" if nr.get("deal") else "")
+                       + "".join(f"\n  - [{h.get('time')}, {h.get('provider')}] {h.get('title')}" for h in heads))
+    if not payload:
+        return {}
+    if not api_key:
+        for r in reviews.values():
+            r["thesis"] = "Not reviewed — GEMINI_API_KEY is not set"
+        return reviews
+    try:
+        out = call_gemini_json(api_key, BUY_PROMPT,
+                               f"Today: {now.strftime('%Y-%m-%d %H:%M %Z')}. Market risk today: {mkt}.\nPurchases:" + "".join(payload))
+        for x in out.get("results", []):
+            r = reviews.get(str(x.get("key")))
+            if not r:
+                continue
+            v = str(x.get("verdict") or "").lower()
+            r.update(verdict=v if v in ("agree", "caution", "avoid") else None, thesis=x.get("thesis") or "",
+                     risks=[str(s) for s in (x.get("risks") or [])][:3], watch=x.get("watch") or "",
+                     earningsSoon=bool(x.get("earningsSoon")), confidence=x.get("confidence") or "")
+    except Exception as e:
+        log.error(f"[BuyReview] Gemini FAIL: {e}")
+        for r in reviews.values():
+            r["thesis"] = "Not reviewed — " + str(e)[:200]
+    return reviews
 
 
 def call_gemini_json(api_key, system_prompt, user_prompt):
