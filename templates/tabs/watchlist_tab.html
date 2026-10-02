@@ -475,7 +475,7 @@ async function saveSchedule(btn) {
   if (!timeRe.test(acctTracker)) { alert('Account tracker time must be HH:MM 24h (e.g. 17:04)'); return; }
   if (!timeRe.test(weightBacktest)) { alert('Weight backtest time must be HH:MM 24h (e.g. 17:06)'); return; }
   if (!timeRe.test(optionsTime)) { alert('Options snapshot time must be HH:MM 24h (e.g. 17:15)'); return; }
-  if (!newsTimes.length || !newsTimes.every(t => timeRe.test(t))) { alert('News times must be HH:MM 24h (e.g. 09:20, 12:30)'); return; }
+  if (!newsTimes.length || !newsTimes.every(t => timeRe.test(t))) { alert('News times must be HH:MM 24h (e.g. 09:20, 11:47, 14:47)'); return; }
   btn.disabled = true; const orig = btn.textContent; btn.textContent = '⏳';
   try {
     const r = await fetch('/admin/scheduler', {

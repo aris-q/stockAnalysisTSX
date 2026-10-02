@@ -173,7 +173,7 @@ function sentimentBadgeClass(s) {
 
 // ── NEWS — headlines with links only (no AI analysis) ─────────────────────
 // Stored headlines come from /news/headlines/<ticker>; they're refreshed at
-// 09:20 and 12:30 and by the TradeAI REFRESH NEWS button.
+// 09:20, 11:47 and 14:47 and by the TradeAI REFRESH NEWS button.
 function _newsAgo(iso) {
   const t = Date.parse(iso || '');
   if (!t) return '';

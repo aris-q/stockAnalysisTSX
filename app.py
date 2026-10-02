@@ -413,7 +413,7 @@ def _news_tickers():
 
 
 def run_news_refresh(trigger="manual"):
-    """The one news fetch: scheduled at newsTimes (default 09:20 and 12:30)
+    """The one news fetch: scheduled at newsTimes (default 09:20, 11:47, 14:47)
     plus the TradeAI REFRESH NEWS button. Refreshes every ticker from
     _news_tickers(), then re-runs the severe-news scan on holdings. Other
     code paths read the stored news instead of fetching their own."""
@@ -3238,8 +3238,8 @@ def run_tradeai_fetch():
                     log.info(f"TradeAI fetch OK: {ticker} | price:{detail.get('price')} rsi:{rsi_val}")
             except Exception as e:
                 log.error(f"TradeAI fetch FAIL: {ticker} | {e}")
-            # News is no longer fetched here — run_news_refresh (09:20 and
-            # 12:30, plus the REFRESH NEWS button) keeps it fresh for every
+            # News is no longer fetched here — run_news_refresh (09:20,
+            # 11:47 and 14:47, plus the REFRESH NEWS button) keeps it fresh for every
             # ticker before the 10:00+ Recommend runs read it.
         candidates_data["details"] = details
         candidates_data["detailsFetchedAt"] = ts()
@@ -4223,7 +4223,7 @@ def run_tradeai_sell_check(trigger="manual"):
         EXEC_CFG = cfg.get("execution", {})
 
         # Severe-news watch on held positions: scan the stored news (kept
-        # fresh by run_news_refresh at 09:20/12:30 and the REFRESH NEWS
+        # fresh by run_news_refresh at 09:20/11:47/14:47 and the REFRESH NEWS
         # button) for red-flag keywords. Flags only — never sells on its own.
         try:
             news_db = load_json(NEWS_PATH, {})
@@ -5272,7 +5272,7 @@ SCHEDULER_DEFAULTS = {
     "accountTrackerTime": "17:04",  # daily, after close — portfolio value vs TSX/TSX 60
     "weightBacktestTime": "17:06",  # daily — dream/AI weighting backtest over shadow history
     "optionsTime":      "17:15",  # daily, after the close — end-of-day options volume/OI (via US-listed twin) for every ticker ever bought or simulated
-    "newsTimes":        ["09:20", "12:30"],  # the only scheduled news fetch — before the open, and midday before the afternoon Recommends
+    "newsTimes":        ["09:20", "11:47", "14:47"],  # the only scheduled news fetch — before the open (catches the ~53% published after close/overnight), then just before the 12:00 and 15:00 Recommends; :47 avoids the 5-min sell checks
     "tuningTime":       "16:15",  # Friday only — weekly missed-gainer tuning check
     "marketHolidays": [
         "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
