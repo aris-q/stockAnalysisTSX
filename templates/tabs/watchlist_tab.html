@@ -427,6 +427,12 @@ async function loadSchedulerStatus() {
         <span>News refresh (holdings, watchlist, candidates)</span>
         <span><input id="schedNewsTimes" value="${(cfg.newsTimes||[]).join(', ')}" style="${inp};width:130px"></span>
         <span>${fmt('newsRefresh')}</span>
+        <span>Gemini daily call cap (this app) — free tier is 20/day per Google project, shared by every app on that key</span>
+        <span><input id="schedGeminiCap" type="number" min="0" max="20" value="${cfg.geminiDailyCap ?? 4}" style="${inp};width:60px"></span>
+        <span>${(d.geminiUsage || {}).used ?? 0}/${cfg.geminiDailyCap ?? 4} used today${(d.geminiUsage || {}).reserved ? ' · ' + d.geminiUsage.reserved + ' kept for scheduled' : ''}</span>
+        <span>Gemini news check at (must also be news times; first one reads market risk)</span>
+        <span><input id="schedGeminiNewsTimes" value="${(cfg.geminiNewsTimes||[]).join(', ')}" style="${inp};width:130px"></span>
+        <span></span>
         <span>Buy review — Gemini second opinion on today's purchases <button class="btn" style="font-size:14px;padding:1px 8px" onclick="runBuyReviewAdmin(this)">RUN NOW</button></span>
         <span><input id="schedBuyReviewTime" value="${cfg.buyReviewTime||''}" style="${inp};width:60px"></span>
         <span>${fmt('buyReview')}</span>
@@ -493,6 +499,8 @@ async function saveSchedule(btn) {
   const optionsTime = document.getElementById('schedOptionsTime').value.trim();
   const lossReviewTime = document.getElementById('schedLossReviewTime').value.trim();
   const buyReviewTime = document.getElementById('schedBuyReviewTime').value.trim();
+  const geminiDailyCap = Number(document.getElementById('schedGeminiCap').value);
+  const geminiNewsTimes = listOf('schedGeminiNewsTimes');
   const timeRe = /^([01]?\d|2[0-3]):[0-5]\d$/;
   if (!hours.length || hours.some(h => isNaN(h) || h < 0 || h > 23)) { alert('Sell-check hours must be numbers 0-23 (e.g. 9,10,11)'); return; }
   if (!mins.length || mins.some(m => isNaN(m) || m < 0 || m > 59))   { alert('Sell-check minutes must be numbers 0-59 (e.g. 20,40)'); return; }
@@ -500,6 +508,8 @@ async function saveSchedule(btn) {
   if (!timeRe.test(dream)) { alert('Dream time must be HH:MM 24h (e.g. 16:01)'); return; }
   if (!timeRe.test(acctTracker)) { alert('Account tracker time must be HH:MM 24h (e.g. 17:04)'); return; }
   if (!timeRe.test(weightBacktest)) { alert('Weight backtest time must be HH:MM 24h (e.g. 17:06)'); return; }
+  if (!Number.isInteger(geminiDailyCap) || geminiDailyCap < 0 || geminiDailyCap > 20) { alert('Gemini daily cap must be a whole number 0-20'); return; }
+  if (!geminiNewsTimes.every(t => timeRe.test(t) && newsTimes.includes(t))) { alert('Gemini news-check times must be HH:MM and also listed in News times'); return; }
   if (!timeRe.test(buyReviewTime)) { alert('Buy review time must be HH:MM 24h (e.g. 15:10)'); return; }
   if (!timeRe.test(lossReviewTime)) { alert('Loss review time must be HH:MM 24h (e.g. 16:20)'); return; }
   if (!timeRe.test(optionsTime)) { alert('Options snapshot time must be HH:MM 24h (e.g. 17:15)'); return; }
@@ -508,7 +518,7 @@ async function saveSchedule(btn) {
   try {
     const r = await fetch('/admin/scheduler', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream, accountTrackerTime: acctTracker, weightBacktestTime: weightBacktest, newsTimes, optionsTime, lossReviewTime, buyReviewTime })
+      body: JSON.stringify({ sellCheckHours: hours, sellCheckMinutes: mins, recommendTimes: recTimes, dreamTime: dream, accountTrackerTime: acctTracker, weightBacktestTime: weightBacktest, newsTimes, optionsTime, lossReviewTime, buyReviewTime, geminiDailyCap, geminiNewsTimes })
     });
     const d = await r.json();
     if (d.error) alert('Save failed: ' + d.error);

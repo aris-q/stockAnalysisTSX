@@ -262,7 +262,7 @@ function _renderNewsCheck(rec, scrollTo) {
   const m = _ncModal();
   const c = rec.counts || {};
   document.getElementById('newsCheckSub').textContent =
-    `${rec.runAt || ''} · ${rec.trigger === 'scheduler' ? 'scheduled' : 'manual'} run · headlines ${rec.window || 'today'} · ${rec.geminiCalled ? rec.model : 'Gemini not called (no news today)'}`;
+    `${rec.runAt || ''} · ${rec.trigger === 'scheduler' ? 'scheduled' : 'manual'} run · headlines ${rec.window || 'today'} · ${rec.geminiCalled ? rec.model : 'Gemini not called (no news today)'}${rec.usage ? ` · Gemini today ${rec.usage.used}/${rec.usage.cap}` : ''}`;
   const rows = rec.tickers || [];
   const group = (state, title, color, block) => {
     const g = rows.filter(r => r.state === state);

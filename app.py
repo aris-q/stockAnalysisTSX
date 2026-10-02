@@ -412,7 +412,7 @@ def _news_tickers():
     return sorted(set(load_trades_ai().get("holdings", {})) | set(wl) | set(identified))
 
 
-def run_news_refresh(trigger="manual"):
+def run_news_refresh(trigger="manual", gemini=True):
     """The one news fetch: scheduled at newsTimes (default 09:20, 11:47, 14:47)
     plus the TradeAI REFRESH NEWS button. Refreshes every ticker from
     _news_tickers(), then re-runs the severe-news scan on holdings. Other
@@ -436,18 +436,78 @@ def run_news_refresh(trigger="manual"):
         except Exception as e:
             log.warning(f"[NewsWarning] scan FAIL: {e}")
         msg = f"News refreshed: {total} tickers, {with_news} with recent news"
-        fetch_status.update({"message": "News: Gemini checking today's headlines..."})
-        try:
-            nc = run_news_check(trigger)
-            msg += f" · Gemini: {nc['counts']['negative']} negative today" if nc["status"] == "ok" else " · Gemini check FAILED"
-        except Exception as e:
-            log.error(f"[NewsCheck] FAIL: {e}")
-            msg += " · Gemini check FAILED"
+        ok, why = _gemini_allow("news-check", trigger == "scheduler") if gemini else (False, "")
+        if ok:
+            fetch_status.update({"message": "News: Gemini checking today's headlines..."})
+            try:
+                nc = run_news_check(trigger)
+                msg += f" · Gemini: {nc['counts']['negative']} negative today" if nc["status"] == "ok" else " · Gemini check FAILED"
+            except Exception as e:
+                log.error(f"[NewsCheck] FAIL: {e}")
+                msg += " · Gemini check FAILED"
+        elif why:
+            msg += " · " + why
         fetch_status = {"running": False, "message": msg, "operation": None, "current": total, "total": total, "current_ticker": ""}
         log.info(f"=== News Refresh Complete [{trigger}]: {msg} ===")
     except Exception as e:
         log.error(f"News refresh FAIL: {e}")
         fetch_status = {"running": False, "message": f"News refresh FAIL: {e}", "operation": None}
+
+
+# ── Gemini budget: free tier = 20 requests/day per Google project (429s in
+# logs/app.log, 2026-06/07). This app keeps to geminiDailyCap (default 4) so
+# other apps sharing the project keep theirs. Manual presses may only use
+# calls not needed by today's remaining scheduled Gemini jobs.
+GEMINI_USAGE_PATH = "output/gemini_usage.json"
+_gemini_job = ["?"]
+
+
+def _gemini_usage():
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    db = load_json(GEMINI_USAGE_PATH, {})
+    return db if db.get("date") == today else {"date": today, "calls": []}
+
+
+def _gemini_record():
+    db = _gemini_usage()
+    db["calls"].append({"at": ts(), "job": _gemini_job[0]})
+    save_json(GEMINI_USAGE_PATH, db)
+
+
+import news_check as _news_check_mod
+_news_check_mod.USAGE_HOOK = _gemini_record
+
+
+def _gemini_reserved(now=None):
+    """Scheduled Gemini jobs still to come today (market days only)."""
+    now = now or datetime.now(TZ)
+    cfg = load_scheduler_config()
+    if now.weekday() >= 5 or now.strftime("%Y-%m-%d") in cfg.get("marketHolidays", []):
+        return 0
+    hhmm = now.strftime("%H:%M")
+    news = [t for t in cfg.get("geminiNewsTimes", []) if t in cfg.get("newsTimes", []) and t > hhmm]
+    return len(news) + sum(1 for k in ("buyReviewTime", "lossReviewTime") if (cfg.get(k) or "") > hhmm)
+
+
+def _gemini_status():
+    cfg = load_scheduler_config()
+    used = len(_gemini_usage()["calls"])
+    return {"used": used, "cap": int(cfg.get("geminiDailyCap", 4)), "reserved": _gemini_reserved()}
+
+
+def _gemini_allow(job, scheduled):
+    """(ok, reason). Scheduled jobs may use any call left under the cap;
+    manual ones only calls not reserved for later scheduled jobs."""
+    st = _gemini_status()
+    left = st["cap"] - st["used"]
+    spare = left if scheduled else left - st["reserved"]
+    if spare >= 1:
+        _gemini_job[0] = job
+        return True, ""
+    why = (f"Gemini budget used: {st['used']}/{st['cap']} today" if left < 1 else
+           f"Gemini skipped: {left} call(s) left today, kept for {st['reserved']} scheduled job(s)")
+    log.info(f"[GeminiBudget] {job} {'(scheduled)' if scheduled else '(manual)'} blocked — {why}")
+    return False, why
 
 
 # ═══════════════════════════ GEMINI NEWS CHECK ═══════════════════════════
@@ -468,22 +528,24 @@ def _news_check_roles():
 
 
 def run_news_check(trigger="manual"):
-    from news_check import run_check, market_risk
+    from news_check import run_check, fetch_market_headlines
     from config import GEMINI_API_KEY
     prev = load_json(NEWS_CHECK_PATH, {})
-    rec = run_check(_news_check_roles(), load_json(NEWS_PATH, {}), GEMINI_API_KEY, TZ, trigger)
-    # Market read: once a day — the first run (normally 09:20); later runs carry it forward.
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    # Market read: once a day, inside the first news-check call (normally 09:20); later runs carry it forward.
     pm = prev.get("market") or {}
-    if pm.get("date") == rec["date"] and pm.get("status") == "ok":
+    have_market = pm.get("date") == today and pm.get("status") == "ok"
+    mkt_heads = None if have_market else fetch_market_headlines(MARKET_NEWS_QUERIES, TZ)
+    rec = run_check(_news_check_roles(), load_json(NEWS_PATH, {}), GEMINI_API_KEY, TZ, trigger, market_headlines=mkt_heads)
+    if have_market:
         rec["market"] = pm
     else:
-        fetch_status.update({"message": "News: Gemini reading today's market risk..."})
-        rec["market"] = market_risk(GEMINI_API_KEY, MARKET_NEWS_QUERIES, TZ)
-        m = rec["market"]
-        log.info(f"[MarketRisk] {m['status']} | {m.get('riskLevel')} | {m.get('summary') or m.get('error')}")
+        m = rec.get("market") or {}
+        log.info(f"[MarketRisk] {m.get('status')} | {m.get('riskLevel')} | {m.get('summary') or m.get('error')}")
         send = globals().get("_send_alert")
         if send and m.get("riskLevel") == "high":
             send("news", "🌐 Market risk HIGH today", m.get("summary") or "", priority=4, tags=["warning"])
+    rec["usage"] = _gemini_status()
     rec["acked"] = False
     save_json(NEWS_CHECK_PATH, rec)
     hist = load_json(NEWS_CHECK_HISTORY_PATH, {"runs": []})
@@ -545,6 +607,11 @@ def run_buy_review(trigger="manual"):
         db["lastRun"] = {"at": ts(), "trigger": trigger, "status": "ok", "reviewed": 0, "note": "no unreviewed buys today"}
         save_json(BUY_REVIEWS_PATH, db)
         log.info(f"[BuyReview] [{trigger}] nothing to review")
+        return db["lastRun"]
+    ok, why = _gemini_allow("buy-review", trigger == "scheduler")
+    if not ok:
+        db["lastRun"] = {"at": ts(), "trigger": trigger, "status": "skipped", "reviewed": 0, "note": why}
+        save_json(BUY_REVIEWS_PATH, db)
         return db["lastRun"]
     nc = load_json(NEWS_CHECK_PATH, {})
     fresh = nc.get("date") == today
@@ -627,6 +694,11 @@ def run_loss_review(trigger="manual"):
         db["lastRun"] = {"at": ts(), "trigger": trigger, "status": "ok", "reviewed": 0, "note": "no unreviewed losing trades"}
         save_json(LOSS_REVIEWS_PATH, db)
         log.info(f"[LossReview] [{trigger}] nothing to review")
+        return db["lastRun"]
+    ok, why = _gemini_allow("loss-review", trigger == "scheduler")
+    if not ok:
+        db["lastRun"] = {"at": ts(), "trigger": trigger, "status": "skipped", "reviewed": 0, "note": why}
+        save_json(LOSS_REVIEWS_PATH, db)
         return db["lastRun"]
     out = review_losses(todo, load_json(NEWS_PATH, {}), load_json(NEWS_CHECK_HISTORY_PATH, {"runs": []}).get("runs", []),
                         GEMINI_API_KEY, TZ)
@@ -5507,6 +5579,8 @@ SCHEDULER_DEFAULTS = {
     "dreamTime":        "13:30",
     "accountTrackerTime": "17:04",  # daily, after close — portfolio value vs TSX/TSX 60
     "weightBacktestTime": "17:06",  # daily — dream/AI weighting backtest over shadow history
+    "geminiDailyCap":   4,        # Gemini calls/day this app may use (free tier: 20/day per Google project, shared)
+    "geminiNewsTimes":  ["09:20", "14:47"],  # which news refreshes also run the Gemini check (09:20 also reads market risk)
     "buyReviewTime":    "15:10",  # daily, after the last (15:00) Recommend — Gemini second opinion on today's buys
     "lossReviewTime":   "16:20",  # daily, after the close — Gemini tags why each losing trade lost
     "optionsTime":      "17:15",  # daily, after the close — end-of-day options volume/OI (via US-listed twin) for every ticker ever bought or simulated
@@ -5647,8 +5721,9 @@ def _scheduler_loop():
                 slots.append((f"options-{hhmm}", "optionsSnapshot",
                               [("options-snapshot", lambda: run_options_snapshot("scheduler"))]))
             if hhmm in cfg.get("newsTimes", []):
+                g = hhmm in cfg.get("geminiNewsTimes", [])
                 slots.append((f"news-{hhmm}", "newsRefresh",
-                              [("news-refresh", lambda: run_news_refresh("scheduler"))]))
+                              [("news-refresh", lambda g=g: run_news_refresh("scheduler", gemini=g))]))
             if hhmm == cfg.get("weightBacktestTime"):
                 slots.append((f"weightBacktest-{hhmm}", "weightBacktest",
                               [("weight-backtest", _backtest_bucket_weights)]))
@@ -5696,6 +5771,13 @@ def admin_scheduler():
                 saved["dreamTime"] = norm_time(body["dreamTime"])
             if "accountTrackerTime" in body:
                 saved["accountTrackerTime"] = norm_time(body["accountTrackerTime"])
+            if "geminiDailyCap" in body:
+                cap = int(body["geminiDailyCap"])
+                if not 0 <= cap <= 20:
+                    raise ValueError("Gemini daily cap must be 0-20")
+                saved["geminiDailyCap"] = cap
+            if "geminiNewsTimes" in body:
+                saved["geminiNewsTimes"] = [norm_time(t) for t in body["geminiNewsTimes"]]
             if "buyReviewTime" in body:
                 saved["buyReviewTime"] = norm_time(body["buyReviewTime"])
             if "lossReviewTime" in body:
@@ -5724,6 +5806,7 @@ def admin_scheduler():
     return jsonify({
         "config": load_scheduler_config(),
         "state": load_json(SCHEDULER_STATE_PATH, {"lastRuns": {}}),
+        "geminiUsage": {**_gemini_status(), "calls": _gemini_usage()["calls"]},
     })
 
 

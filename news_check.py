@@ -7,8 +7,9 @@ the rest of the app's Gemini use stays disabled in ai_summary._call_gemini).
    upside). Window: today's headlines, except before the 09:30 open, when
    it reaches back to the previous trading day's 16:00 so after-close and
    overnight news (about half of all headlines) gets checked too.
-2. market_risk — once a day (first run of the day, normally 09:20): reads
-   market-wide headlines and names today's event risk (Fed, CPI, tariffs).
+2. Market risk — once a day, folded into the first news check's call
+   (normally 09:20): reads market-wide headlines and names today's event
+   risk (Fed, CPI, tariffs). No call of its own.
 3. review_buys — after the last Recommend (15:10): a second opinion on each
    of today's purchases (agree / caution / avoid). Flags only.
 4. review_losses — after the close: tags each losing trade's cause
@@ -16,6 +17,11 @@ the rest of the app's Gemini use stays disabled in ai_summary._call_gemini).
    headlines seen while it was held plus its return vs the index.
 
 Every ticker gets a result so the UI can always list everything.
+
+The free tier allows 20 gemini-2.5-flash requests/day per Google project
+(proven by 429s in logs/app.log), so the app caps itself: USAGE_HOOK is
+called once per request actually sent, and the app's budget check decides
+whether a job may call at all.
 """
 import json
 import logging
@@ -31,6 +37,7 @@ GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_M
 MAX_HEADLINES_PER_TICKER = 15
 MARKET_HEADLINE_MAX_AGE_H = 18
 MAX_MARKET_HEADLINES = 40
+USAGE_HOOK = None  # set by the app: called with no args before every request sent
 
 NEWS_PROMPT = """You screen stock news for a trading account. You get, per ticker, the headlines from the stated window (newest first, numbered), with publisher and time, and whether the account HOLDS it or it is a buy CANDIDATE. You only see headlines, not article bodies: judge only what a headline clearly says.
 
@@ -47,15 +54,14 @@ Rules: a price move by itself ("stock falls", "slips", "down 12% this quarter", 
 
 Reply with JSON only: {"results":[{"ticker":"...","negative":true|false,"severity":0,"category":"...","headlines":[1],"reason":"...","confidence":"...","deal":false,"dealNote":""}]} with one entry per ticker given."""
 
-MARKET_PROMPT = """You brief a trader before the market opens. You get market-wide headlines from the last hours (numbered). Judge only what they say.
+MARKET_ADDON = """
 
-Decide:
-1. riskLevel for today's session: "low" (nothing scheduled or unusual), "elevated" (a scheduled event or developing story that can move the whole market today, e.g. Fed decision or Fed chair speech, CPI/jobs/GDP release, tariff deadline, major geopolitical escalation, big-index earnings), or "high" (a shock already under way: crash, war escalation, emergency policy action, systemic bank stress).
-2. events: up to 5 items {"event": "...", "when": "time/date if stated, else ''", "impact": "<= 15 words on why it matters to stocks"} — scheduled or developing market-wide events only, not single-company news.
-3. summary: <= 30 words.
-4. headlines: numbers of the headlines your verdict relies on.
-
-Reply with JSON only: {"riskLevel":"low|elevated|high","summary":"...","events":[...],"headlines":[1]}"""
+ALSO, separately: you get MARKET-WIDE headlines (numbered M1, M2, ...). Brief a trader on today's session:
+- riskLevel: "low" (nothing scheduled or unusual), "elevated" (a scheduled event or developing story that can move the whole market today, e.g. Fed decision or Fed chair speech, CPI/jobs/GDP release, tariff deadline, major geopolitical escalation, big-index earnings), or "high" (a shock already under way: crash, war escalation, emergency policy action, systemic bank stress).
+- events: up to 5 {"event": "...", "when": "time/date if stated, else ''", "impact": "<= 15 words on why it matters to stocks"}, market-wide only.
+- summary: <= 30 words.
+- headlines: the M-numbers (as integers, without the M) your verdict relies on.
+Add it to the same JSON object as "market": {"riskLevel":"...","summary":"...","events":[...],"headlines":[1]}"""
 
 LOSS_PROMPT = """You review losing trades from a stock trading account to find the CAUSE of each loss. Per trade you get: ticker, bucket (the strategy that picked it), days held, the trade's return %, the index return over the same period, the excess return, the exit trigger, and the headlines published while it was held (numbered; may be empty or incomplete — only the last ~7 days of news are stored).
 
@@ -151,7 +157,11 @@ def call_gemini_json(api_key, system_prompt, user_prompt):
     }
     last = None
     for attempt in range(3):
+        if USAGE_HOOK:
+            USAGE_HOOK()
         r = requests.post(GEMINI_URL, headers={"x-goog-api-key": api_key}, json=body, timeout=180)
+        if r.status_code == 429 and "PerDay" in r.text:
+            raise RuntimeError("Gemini daily free-tier limit reached (20/day per project); try again tomorrow")
         if r.status_code in (429, 500, 503) and attempt < 2:
             last = f"HTTP {r.status_code}"
             time.sleep(20 * (attempt + 1))  # free tier: per-minute limit / overload
@@ -207,8 +217,10 @@ def headlines_since(articles, start, tz, end=None):
     return out[:MAX_HEADLINES_PER_TICKER]
 
 
-def run_check(roles, news_db, api_key, tz, trigger):
-    """roles: {ticker: "held"|"candidate"}. Returns the full result record."""
+def run_check(roles, news_db, api_key, tz, trigger, market_headlines=None):
+    """roles: {ticker: "held"|"candidate"}. market_headlines (optional, from
+    fetch_market_headlines) adds the day's market-risk read to the SAME call.
+    Returns the full result record (rec["market"] set when asked)."""
     now = datetime.now(tz)
     start, window_label = news_window_start(now)
     rec = {"runId": str(int(time.time() * 1000)), "runAt": now.strftime("%Y-%m-%d %H:%M %Z"),
@@ -220,18 +232,41 @@ def run_check(roles, news_db, api_key, tz, trigger):
                 "reason": "", "confidence": "", "flagged": [], "deal": False, "dealNote": ""}
             for t in roles}
     with_news = [t for t in roles if news[t]]
-    if with_news:
+    market = None
+    if market_headlines is not None:
+        market = {"date": rec["date"], "asOf": rec["runAt"], "status": "ok", "error": None, "riskLevel": None,
+                  "summary": "", "events": [], "headlines": market_headlines, "flagged": []}
+        if not market_headlines:
+            market.update(status="error", error="no market headlines found")
+        rec["market"] = market
+    want_market = bool(market and market_headlines)
+    if with_news or want_market:
         if not api_key:
             rec.update(status="error", error="GEMINI_API_KEY is not set — add it to the .env file next to app.py and restart")
+            if market:
+                market.update(status="error", error=rec["error"])
         else:
             lines = []
             for t in with_news:
                 lines.append(f"\n{t} ({'HELD' if roles[t] == 'held' else 'CANDIDATE'}):")
                 lines += [f"  {i}. [{h['time']} ET, {h['provider']}] {h['title']}" for i, h in enumerate(news[t], 1)]
+            if not with_news:
+                lines.append('\n(no ticker has headlines in this window: return "results": [])')
+            if want_market:
+                lines.append("\n\nMARKET-WIDE headlines:")
+                lines += [f"  M{i}. [{h['time']} ET, {h['provider']}] {h['title']}" for i, h in enumerate(market_headlines, 1)]
             try:
                 rec["geminiCalled"] = True
-                out = call_gemini_json(api_key, NEWS_PROMPT,
+                out = call_gemini_json(api_key, NEWS_PROMPT + (MARKET_ADDON if want_market else ""),
                                        f"Now: {rec['runAt']}. Window: headlines {window_label}. Tickers and headlines:" + "\n".join(lines))
+                if want_market:
+                    m = out.get("market") or {}
+                    lvl = str(m.get("riskLevel") or "").lower()
+                    market.update(riskLevel=lvl if lvl in ("low", "elevated", "high") else None, summary=m.get("summary") or "",
+                                  events=[e for e in (m.get("events") or []) if isinstance(e, dict)][:5],
+                                  flagged=[i for i in (m.get("headlines") or []) if isinstance(i, int) and 1 <= i <= len(market_headlines)])
+                    if not market["riskLevel"]:
+                        market.update(status="error", error="Gemini returned no market read")
                 for r in out.get("results", []):
                     row = rows.get(str(r.get("ticker", "")).upper()) or rows.get(r.get("ticker"))
                     if not row or not row["newsCount"]:
@@ -250,6 +285,8 @@ def run_check(roles, news_db, api_key, tz, trigger):
             except Exception as e:
                 log.error(f"[NewsCheck] Gemini FAIL: {e}")
                 rec.update(status="error", error=str(e)[:300])
+                if market:
+                    market.update(status="error", error=rec["error"])
         if rec["status"] == "error":
             for t in with_news:
                 if rows[t]["state"] == "error" and not rows[t]["reason"]:
@@ -261,12 +298,9 @@ def run_check(roles, news_db, api_key, tz, trigger):
     return rec
 
 
-def market_risk(api_key, queries, tz):
-    """One call: today's market-wide event risk from Yahoo search headlines."""
+def fetch_market_headlines(queries, tz):
+    """Market-wide headlines from the last MARKET_HEADLINE_MAX_AGE_H hours (Yahoo search)."""
     import yfinance as yf
-    now = datetime.now(tz)
-    res = {"date": now.strftime("%Y-%m-%d"), "asOf": now.strftime("%Y-%m-%d %H:%M %Z"), "status": "ok",
-           "error": None, "riskLevel": None, "summary": "", "events": [], "headlines": [], "flagged": []}
     seen, items = set(), []
     for q in queries:
         try:
@@ -280,24 +314,7 @@ def market_risk(api_key, queries, tz):
         except Exception as e:
             log.warning(f"[MarketRisk] search FAIL: {q} | {e}")
     items.sort(key=lambda x: x[0], reverse=True)
-    res["headlines"] = [h for _, h in items[:MAX_MARKET_HEADLINES]]
-    if not res["headlines"]:
-        res.update(status="error", error="no market headlines found")
-        return res
-    if not api_key:
-        res.update(status="error", error="GEMINI_API_KEY is not set")
-        return res
-    try:
-        lines = [f"{i}. [{h['time']} ET, {h['provider']}] {h['title']}" for i, h in enumerate(res["headlines"], 1)]
-        out = call_gemini_json(api_key, MARKET_PROMPT, f"Now: {res['asOf']}. Headlines:\n" + "\n".join(lines))
-        lvl = str(out.get("riskLevel") or "").lower()
-        res.update(riskLevel=lvl if lvl in ("low", "elevated", "high") else None, summary=out.get("summary") or "",
-                   events=[e for e in (out.get("events") or []) if isinstance(e, dict)][:5],
-                   flagged=[i for i in (out.get("headlines") or []) if isinstance(i, int) and 1 <= i <= len(res["headlines"])])
-    except Exception as e:
-        log.error(f"[MarketRisk] Gemini FAIL: {e}")
-        res.update(status="error", error=str(e)[:300])
-    return res
+    return [h for _, h in items[:MAX_MARKET_HEADLINES]]
 
 
 def review_losses(trades, news_db, check_runs, api_key, tz):
