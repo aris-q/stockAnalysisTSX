@@ -2965,7 +2965,8 @@ SCORING_DEFAULTS = {
         "earningsBlackoutDays": 3,
         "rotationEnabled": True,
         "rotationMinScoreGap": 15,
-        "rotationCooldownTradingDays": 5
+        "rotationCooldownTradingDays": 5,     # re-entry window after any sale (see _reentry_block)
+        "reentryAfterLossMinAbovePct": 10.0   # inside the window, a loss exit is re-bought only this % above the price paid
     },
     "identifyRules": {
         # A half-scored ticker (missing data, or SCORE_INCOMPLETE) shouldn't
@@ -3231,6 +3232,49 @@ def _effective_stop_loss_pct(ticker, details, sell_cfg):
     if atr_pct is None:
         return hard_cap
     return min(multiplier * atr_pct, hard_cap)
+
+
+def _reentry_block(ticker, price, transactions, pm):
+    """Re-entry rule for a ticker sold within the last
+    rotationCooldownTradingDays (default 5 ≈ a week). Returns None when the
+    buy may go ahead, else the skip reason.
+    - last sale was a gain → no restriction (the exit was right; buying back
+      in is a fresh decision)
+    - last sale was a loss → only when the price is now at least
+      reentryAfterLossMinAbovePct (default 10%) above the price paid for the
+      position that was sold — the rebound has to prove the exit wrong.
+    Before 2026-10-02 every sale blocked re-entry for the whole window,
+    gain or loss, and loss exits could be re-bought right after it
+    (ONDS was bought and stopped out 6 times, NBIS 3)."""
+    window = int(pm.get("rotationCooldownTradingDays", 5))
+    if window <= 0:
+        return None
+    sells = [t for t in transactions if t.get("ticker") == ticker and t.get("action") == "SELL" and t.get("date")]
+    if not sells:
+        return None
+    last = max(sells, key=lambda t: t["date"])
+    try:
+        sold_on = datetime.strptime(last["date"][:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    since = sum((sold_on + timedelta(days=d)).weekday() < 5 for d in range(1, (datetime.now(TZ).date() - sold_on).days + 1))
+    if since >= window:
+        return None
+    paid = last.get("purchasePrice")
+    gain = last.get("gainLoss")
+    if gain is None and paid:
+        gain = (last.get("price") or 0) - paid
+    if gain is not None and gain > 0:
+        return None
+    min_above = float(pm.get("reentryAfterLossMinAbovePct", 10))
+    if not paid:
+        return f"Sold at a loss {since} trading day(s) ago — purchase price unknown, not re-buying inside the {window}-day window"
+    need = paid * (1 + min_above / 100)
+    if price and price >= need:
+        return None
+    now_txt = f"${price:.2f}" if price else "no price"
+    return (f"Sold at a loss {since} trading day(s) ago (bought ${paid:.2f}) — re-entry inside {window} days "
+            f"needs ≥ ${need:.2f} (+{min_above:g}%), now {now_txt}")
 
 
 def load_scoring_config():
@@ -4069,7 +4113,6 @@ def run_tradeai_recommend():
         min_composite    = float(pm.get("minBuyComposite", 60))
         rotation_enabled = bool(pm.get("rotationEnabled", True))
         rotation_gap     = float(pm.get("rotationMinScoreGap", 15))
-        rotation_cooldown = int(pm.get("rotationCooldownTradingDays", 5))
         deployable       = round(balance * max_deploy, 2)
         budget_per_slot  = round(deployable / max(1, max_slots), 2)
         log.info(f"TradeAI BUY config | balance:{balance} deployable:{deployable} slots:{max_slots} per_slot:{budget_per_slot} min_composite:{min_composite}")
@@ -4086,23 +4129,11 @@ def run_tradeai_recommend():
                 log.info(f"TradeAI QUALIFY skip (already held): {ticker}")
                 skip_reasons.append({"ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"), "reason": "Already held in portfolio"})
                 continue
-            if rotation_cooldown > 0:
-                recent_sells = [t for t in transactions if t.get("ticker") == ticker and t.get("action") == "SELL" and t.get("date")]
-                if recent_sells:
-                    try:
-                        last_sell_date = datetime.strptime(max(t["date"][:10] for t in recent_sells), "%Y-%m-%d").date()
-                        trading_days_since = sum(
-                            (last_sell_date + timedelta(days=offset)).weekday() < 5
-                            for offset in range(1, (datetime.now(TZ).date() - last_sell_date).days + 1)
-                        )
-                        if trading_days_since < rotation_cooldown:
-                            skip_reasons.append({
-                                "ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"),
-                                "reason": f"Re-entry cooldown: {rotation_cooldown - trading_days_since} trading day(s) remaining"
-                            })
-                            continue
-                    except Exception:
-                        pass
+            reentry_block = _reentry_block(ticker, live_prices.get(ticker) or s.get("price"), transactions, pm)
+            if reentry_block:
+                log.info(f"TradeAI QUALIFY skip (re-entry): {ticker} | {reentry_block}")
+                skip_reasons.append({"ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"), "reason": reentry_block})
+                continue
             if s.get("buySignal") == "Avoid":
                 log.info(f"TradeAI QUALIFY skip (AI says Avoid): {ticker}")
                 skip_reasons.append({"ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"), "reason": "AI buy signal is Avoid"})
@@ -5810,6 +5841,31 @@ def admin_scheduler():
         "geminiUsage": {**_gemini_status(), "calls": _gemini_usage()["calls"]},
     })
 
+
+def _migrate_reentry_rule_version():
+    """One-time (2026-10-02): the re-entry rule changed buy behaviour in code
+    (_reentry_block), so it gets its own Recommend version and the tracker
+    judges it from the day it went live. Keyed on the latest version's
+    config snapshot not yet having reentryAfterLossMinAbovePct — runs once
+    per install (this PC and the Mac each create their own)."""
+    try:
+        last = load_recommend_versions()["versions"][-1]
+        if "reentryAfterLossMinAbovePct" in ((last.get("configSnapshot") or {}).get("purchaseMatrix") or {}):
+            return
+        cfg = load_scoring_config()  # fills the new defaults in
+        save_json(SCORING_CONFIG_PATH, cfg)
+        pm = cfg["purchaseMatrix"]
+        bump_recommend_version(
+            [f"Re-entry rule: within {pm['rotationCooldownTradingDays']} trading days of a sale — gain exit: re-buy allowed; "
+             f"loss exit: re-buy only at >= {pm['reentryAfterLossMinAbovePct']:g}% above the price paid "
+             f"(was: any sale blocked re-entry for the whole window)"],
+            label="Re-entry rule: loss exits need +10% over price paid to re-buy within a week",
+            config_snapshot=cfg, code_change=True)
+    except Exception as e:
+        log.error(f"[RecVersion] re-entry rule version migration FAIL: {e}")
+
+
+_migrate_reentry_rule_version()
 
 _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
 _scheduler_thread.start()
