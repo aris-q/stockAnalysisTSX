@@ -171,6 +171,120 @@ function sentimentBadgeClass(s) {
   return 'neutral';
 }
 
+// ── GEMINI NEWS CHECK — popup that stays on top until closed with ✕ ──
+// Shows after every news refresh (scheduled or button), whatever the result.
+let _ncShownRunId = null;
+
+function newsCheckBadge(ticker, map) {
+  const r = (map || {})[ticker];
+  if (!r) return '';
+  return ` <span onclick="event.stopPropagation();openNewsCheck('${String(ticker).replace(/'/g, "\\'")}')" title="Gemini: negative news today — ${_escNews(r.category)} (severity ${r.severity}/5). Click for details."`
+    + ` style="cursor:pointer;font-size:13px;font-weight:800;padding:2px 6px;border-radius:4px;background:var(--down);color:#fff;white-space:nowrap">⚠ ALERT ${r.severity}</span>`;
+}
+
+function _ncModal() {
+  let m = document.getElementById('newsCheckModal');
+  if (m) return m;
+  m = document.createElement('div');
+  m.id = 'newsCheckModal';
+  // No click-outside close: it stays until the ✕ is pressed.
+  m.style.cssText = 'display:none;position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.6);align-items:flex-start;justify-content:center;padding:24px 12px;overflow-y:auto';
+  m.innerHTML = `<div style="background:var(--surface, #111827);border:2px solid var(--accent);border-radius:10px;max-width:860px;width:100%;padding:16px 18px;box-shadow:0 10px 40px rgba(0,0,0,0.6)">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+        <div><div style="font-family:'Syne',sans-serif;font-weight:800;font-size:20px;letter-spacing:1px;color:var(--accent)">🤖 GEMINI NEWS CHECK</div>
+        <div id="newsCheckSub" style="font-size:14px;color:var(--muted);margin-top:2px"></div></div>
+        <button onclick="closeNewsCheck()" title="Close" style="font-size:20px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;padding:2px 10px">✕</button>
+      </div>
+      <div id="newsCheckBody" style="margin-top:12px"></div></div>`;
+  document.body.appendChild(m);
+  return m;
+}
+
+function _ncRowHtml(r) {
+  const role = `<span style="font-size:12px;padding:1px 6px;border-radius:4px;border:1px solid var(--border);color:var(--muted);margin-left:6px">${r.role === 'held' ? 'HELD' : 'CANDIDATE'}</span>`;
+  if (r.state === 'negative') {
+    const sevColor = r.severity >= 4 ? 'var(--down)' : r.severity >= 3 ? '#f97316' : '#fbbf24';
+    const flagged = new Set(r.flagged || []);
+    const heads = (r.headlines || []).map((h, i) => {
+      const hit = flagged.has(i + 1);
+      return `<div style="font-size:15px;margin:3px 0 0 4px;${hit ? '' : 'opacity:0.65'}">${hit ? '⚠️ ' : '· '}`
+        + (h.url ? `<a href="${_escNews(h.url)}" target="_blank" rel="noopener" style="color:${hit ? 'var(--text)' : 'var(--muted)'}">${_escNews(h.title)}</a>` : _escNews(h.title))
+        + ` <span style="color:var(--muted);font-size:13px">${_escNews(h.provider)} · ${h.time}</span></div>`;
+    }).join('');
+    return `<div id="nc-${_escNews(r.ticker)}" style="border:1px solid ${sevColor};border-left:5px solid ${sevColor};border-radius:6px;padding:8px 10px;margin-bottom:8px;background:rgba(248,113,113,0.06)">
+        <div><span style="font-size:18px">⚠️</span> <b style="font-family:'Syne',sans-serif;font-size:17px">${_escNews(r.ticker)}</b>${role}
+        <span style="margin-left:8px;font-weight:800;color:${sevColor}">NEGATIVE · severity ${r.severity}/5</span>
+        <span style="color:var(--muted);font-size:14px"> · ${_escNews(r.category)} · ${_escNews(r.confidence)} confidence</span></div>
+        <div style="font-size:16px;margin:4px 0 2px">${_escNews(r.reason)}</div>${heads}</div>`;
+  }
+  const chip = (txt, color) => `<span id="nc-${_escNews(r.ticker)}" style="display:inline-block;margin:0 6px 6px 0;padding:3px 8px;border:1px solid var(--border);border-radius:5px;font-size:15px"><b>${_escNews(r.ticker)}</b>${role} <span style="color:${color};font-size:13px">${txt}</span></span>`;
+  if (r.state === 'clear') return chip(`✓ ${r.newsCount} headline${r.newsCount === 1 ? '' : 's'}${r.reason ? ' — ' + _escNews(r.reason) : ''}`, 'var(--up)');
+  if (r.state === 'error') return chip('not analysed' + (r.reason ? ' — ' + _escNews(r.reason) : ''), 'var(--down)');
+  return chip('no news', 'var(--muted)');
+}
+
+function _renderNewsCheck(rec, scrollTo) {
+  const m = _ncModal();
+  const c = rec.counts || {};
+  document.getElementById('newsCheckSub').textContent =
+    `${rec.runAt || ''} · ${rec.trigger === 'scheduler' ? 'scheduled' : 'manual'} run · today's headlines only · ${rec.geminiCalled ? rec.model : 'Gemini not called (no news today)'}`;
+  const rows = rec.tickers || [];
+  const group = (state, title, color, block) => {
+    const g = rows.filter(r => r.state === state);
+    return `<div style="margin-bottom:12px"><div style="font-size:14px;font-weight:700;letter-spacing:1px;color:${color};margin-bottom:6px">${title} (${g.length})</div>`
+      + (g.length ? (block ? g.map(_ncRowHtml).join('') : `<div>${g.map(_ncRowHtml).join('')}</div>`) : '<div style="color:var(--muted);font-size:15px">none</div>') + '</div>';
+  };
+  let html = '';
+  if (rec.status === 'error') html += `<div style="border:1px solid var(--down);color:var(--down);border-radius:6px;padding:8px 10px;margin-bottom:12px;font-size:15px">Gemini analysis failed: ${_escNews(rec.error)}</div>`;
+  html += `<div style="font-size:16px;margin-bottom:12px">${c.negative ? `<b style="color:var(--down)">⚠️ ${c.negative} ticker${c.negative === 1 ? '' : 's'} with negative news today</b>` : '<b style="color:var(--up)">✓ No negative news today</b>'}
+      <span style="color:var(--muted)"> · ${c.clear || 0} with news, nothing negative · ${c.no_news || 0} with no news today${c.error ? ' · ' + c.error + ' not analysed' : ''}</span></div>`;
+  html += group('negative', '⚠️ NEGATIVE NEWS TODAY', 'var(--down)', true);
+  if (c.error) html += group('error', 'NOT ANALYSED', 'var(--down)', false);
+  html += group('clear', '✓ NO NEGATIVE NEWS TODAY', 'var(--up)', false);
+  html += group('no_news', 'NO NEWS TODAY', 'var(--muted)', false);
+  html += '<div style="font-size:13px;color:var(--muted)">Headline-only judgement — flags only, nothing is bought or sold on it.</div>';
+  document.getElementById('newsCheckBody').innerHTML = html;
+  m.dataset.runId = rec.runId || '';
+  m.style.display = 'flex';
+  if (scrollTo) { const el = document.getElementById('nc-' + scrollTo); if (el && el.scrollIntoView) el.scrollIntoView({block: 'center'}); }
+}
+
+async function checkNewsCheck() {
+  try {
+    const rec = await fetch('/news/check?t=' + Date.now(), {cache: 'no-store'}).then(r => r.json());
+    if (!rec || !rec.runId || rec.acked) return;
+    const m = document.getElementById('newsCheckModal');
+    if (m && m.style.display === 'flex' && m.dataset.runId === rec.runId) return;  // already up
+    _renderNewsCheck(rec);
+  } catch (e) {
+    console.error('[NewsCheck] poll FAIL:', e);
+  }
+}
+
+async function openNewsCheck(scrollTo) {
+  try {
+    const rec = await fetch('/news/check?t=' + Date.now(), {cache: 'no-store'}).then(r => r.json());
+    if (!rec || !rec.runId) { alert('No Gemini news check has run yet — press 📰 REFRESH NEWS.'); return; }
+    _renderNewsCheck(rec, scrollTo);
+  } catch (e) {
+    console.error('[NewsCheck] open FAIL:', e);
+  }
+}
+
+async function closeNewsCheck() {
+  const m = document.getElementById('newsCheckModal');
+  if (!m) return;
+  m.style.display = 'none';
+  try {
+    await fetch('/news/check/ack', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({runId: m.dataset.runId})});
+  } catch (e) {
+    console.error('[NewsCheck] ack FAIL:', e);
+  }
+}
+
+setTimeout(checkNewsCheck, 1500);
+setInterval(checkNewsCheck, 60000);
+
 // ── NEWS — headlines with links only (no AI analysis) ─────────────────────
 // Stored headlines come from /news/headlines/<ticker>; they're refreshed at
 // 09:20, 11:47 and 14:47 and by the TradeAI REFRESH NEWS button.

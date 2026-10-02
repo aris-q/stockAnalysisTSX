@@ -1008,7 +1008,7 @@ function renderTradeAI(data) {
         const newsBadge = ` <span onclick="event.stopPropagation();openNewsModal('${tickerSafe}')" title="Recent headlines (last 7 days)" style="font-size:15px;cursor:pointer;color:var(--muted);white-space:nowrap">📰${newsN != null ? ' ' + newsN : ''}</span>`;
         const holdIndustry = (details[h.ticker] || {}).industry || '';
         return `<tr${isWarned ? ' style="background:rgba(248,113,113,0.08);box-shadow:inset 3px 0 0 var(--down)"' : ''}>
-          <td><span onclick="openDreamDetailModal('${tickerSafe}')" title="${holdIndustry ? holdIndustry + ' — click' : 'Click'} for Dream Scan detail" style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px">${h.ticker}</span>${sentBadge}${newsBadge}${isWarned ? ` <span onclick="event.stopPropagation();openNewsWarningDetail('${tickerSafe}')" title="Severe news: ${(warn.keyword||'').replace(/"/g,'')} — click for details" style="cursor:pointer;font-size:17px">🚨</span>` : ''}</td>
+          <td><span onclick="openDreamDetailModal('${tickerSafe}')" title="${holdIndustry ? holdIndustry + ' — click' : 'Click'} for Dream Scan detail" style="font-family:'Syne',sans-serif;font-weight:700;font-size:15px;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px">${h.ticker}</span>${sentBadge}${newsBadge}${newsCheckBadge(h.ticker, data.newsCheckMap)}${isWarned ? ` <span onclick="event.stopPropagation();openNewsWarningDetail('${tickerSafe}')" title="Severe news: ${(warn.keyword||'').replace(/"/g,'')} — click for details" style="cursor:pointer;font-size:17px">🚨</span>` : ''}</td>
           <td>${h.shares}</td>
           <td>${fmt$(h.purchasePrice)}</td>
           <td>${fmt$(h.previousClose)}</td>
@@ -1074,7 +1074,7 @@ function renderTradeAI(data) {
         return `
         <div class="trade-candidate-row" onclick="toggleTradeDetail('tai-${i}')">
           <div style="min-width:175px">
-            <div class="trade-candidate-ticker" style="margin-bottom:4px;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px;display:inline-block" onclick="event.stopPropagation();openDreamDetailModal('${item.ticker.replace(/'/g, "\\'")}')" title="${(details[item.ticker]||{}).industry ? (details[item.ticker]||{}).industry + ' — click' : 'Click'} for Dream Scan detail">${item.ticker}</div>
+            <div class="trade-candidate-ticker" style="margin-bottom:4px;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px;display:inline-block" onclick="event.stopPropagation();openDreamDetailModal('${item.ticker.replace(/'/g, "\\'")}')" title="${(details[item.ticker]||{}).industry ? (details[item.ticker]||{}).industry + ' — click' : 'Click'} for Dream Scan detail">${item.ticker}</div>${newsCheckBadge(item.ticker, data.newsCheckMap)}
             ` + pipeRow('①','IDENTIFY', data.identifiedAt, '') + `
             ` + pipeRow('②','FETCH INFO', data.detailsFetchedAt, '') + `
             ` + pipeRow('③','MACRO', data.macroFetchedAt, '') + `
@@ -1172,6 +1172,7 @@ function renderTradeAI(data) {
         </select>
         <button class="btn" onclick="refreshAccountPrices(this)">↻ REFRESH PRICES</button>
         <button class="btn" onclick="refreshAllNews(this)" title="Refresh headlines for holdings, watchlist and candidates (also runs automatically at 09:20, 11:47 and 14:47)">📰 REFRESH NEWS</button>
+        <button class="btn" onclick="openNewsCheck()" title="Show the latest Gemini check of today\'s headlines (runs after every news refresh)">🤖 NEWS CHECK</button>
         <button class="btn" onclick="showAITransactions()">TRANSACTIONS</button>
         <button class="btn" onclick="showAIReport()">📊 REPORT</button>
         <button class="btn" onclick="showAIInsights()">🧠 INSIGHTS</button>
@@ -1724,6 +1725,7 @@ async function refreshAllNews(btn) {
       if (s.running) { if (s.message) btn.textContent = '⏳ ' + s.message; return; }
       clearInterval(poll);
       await loadTradeAI(true);  // re-render replaces this button
+      checkNewsCheck();  // pop the Gemini result
       console.log('[News] refresh all done:', s.message);
     }, 2000);
   } catch (e) {

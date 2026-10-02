@@ -436,11 +436,80 @@ def run_news_refresh(trigger="manual"):
         except Exception as e:
             log.warning(f"[NewsWarning] scan FAIL: {e}")
         msg = f"News refreshed: {total} tickers, {with_news} with recent news"
+        fetch_status.update({"message": "News: Gemini checking today's headlines..."})
+        try:
+            nc = run_news_check(trigger)
+            msg += f" · Gemini: {nc['counts']['negative']} negative today" if nc["status"] == "ok" else " · Gemini check FAILED"
+        except Exception as e:
+            log.error(f"[NewsCheck] FAIL: {e}")
+            msg += " · Gemini check FAILED"
         fetch_status = {"running": False, "message": msg, "operation": None, "current": total, "total": total, "current_ticker": ""}
         log.info(f"=== News Refresh Complete [{trigger}]: {msg} ===")
     except Exception as e:
         log.error(f"News refresh FAIL: {e}")
         fetch_status = {"running": False, "message": f"News refresh FAIL: {e}", "operation": None}
+
+
+# ═══════════════════════════ GEMINI NEWS CHECK ═══════════════════════════
+# After every news refresh, one batched Gemini call judges TODAY's headlines
+# for every TradeAI holding and candidate (news_check.py). The latest run is
+# shown in a popup that stays up until dismissed; every run is kept in the
+# history file so the flags can later be checked against what prices did.
+NEWS_CHECK_PATH = "output/news_check.json"
+NEWS_CHECK_HISTORY_PATH = "output/news_check_history.json"
+NEWS_CHECK_ALERT_SEVERITY = 4  # phone/in-app alert at this severity and above
+
+
+def _news_check_roles():
+    roles = {i["ticker"]: "candidate" for i in load_json(TRADE_AI_CANDIDATES_PATH, {}).get("identified", []) if i.get("ticker")}
+    roles.update({t: "held" for t in load_trades_ai().get("holdings", {})})
+    return roles
+
+
+def run_news_check(trigger="manual"):
+    from news_check import run_check
+    from config import GEMINI_API_KEY
+    rec = run_check(_news_check_roles(), load_json(NEWS_PATH, {}), GEMINI_API_KEY, TZ, trigger)
+    rec["acked"] = False
+    save_json(NEWS_CHECK_PATH, rec)
+    hist = load_json(NEWS_CHECK_HISTORY_PATH, {"runs": []})
+    hist["runs"] = (hist.get("runs", []) + [{k: v for k, v in rec.items() if k != "acked"}])[-300:]
+    save_json(NEWS_CHECK_HISTORY_PATH, hist)
+    c = rec["counts"]
+    log.info(f"[NewsCheck] [{trigger}] {rec['status']} | negative:{c['negative']} clear:{c['clear']} "
+             f"no-news:{c['no_news']} error:{c['error']} | gemini called:{rec['geminiCalled']}"
+             + (f" | {rec['error']}" if rec.get("error") else ""))
+    send = globals().get("_send_alert")  # alerts exist in the US app only
+    if send:
+        for r in rec["tickers"]:
+            if r["state"] == "negative" and r["severity"] >= NEWS_CHECK_ALERT_SEVERITY:
+                send("news", f"⚠ {r['ticker']} negative news (severity {r['severity']}/5)",
+                     f"{'HELD' if r['role'] == 'held' else 'Candidate'} · {r['category']} — {r['reason']}",
+                     priority=4, tags=["warning"])
+    return rec
+
+
+def _news_check_map():
+    """Today's negative verdicts from the latest run: {ticker: {severity, category}}."""
+    rec = load_json(NEWS_CHECK_PATH, {})
+    if rec.get("date") != datetime.now(TZ).strftime("%Y-%m-%d"):
+        return {}
+    return {r["ticker"]: {"severity": r["severity"], "category": r["category"]}
+            for r in rec.get("tickers", []) if r.get("state") == "negative"}
+
+
+@app.route("/news/check")
+def news_check_latest():
+    return jsonify(load_json(NEWS_CHECK_PATH, {}))
+
+
+@app.route("/news/check/ack", methods=["POST"])
+def news_check_ack():
+    rec = load_json(NEWS_CHECK_PATH, {})
+    if rec and rec.get("runId") == (request.get_json(silent=True) or {}).get("runId"):
+        rec["acked"] = True
+        save_json(NEWS_CHECK_PATH, rec)
+    return jsonify({"status": "ok"})
 
 
 # ═══════════════════════════ OPTIONS HISTORY ═══════════════════════════
@@ -4184,6 +4253,7 @@ def get_tradeai():
         "aiAnalyzedAt":       candidates.get("aiAnalyzedAt"),
         "newsTsMap":          news_ts_map,
         "newsCountMap":       news_count_map,
+        "newsCheckMap":       _news_check_map(),
         "signalFcMap":        signal_fc_map,
         "rollbackProposal":   load_json(ROLLBACK_PROPOSAL_PATH, {"status": "none"}),
         "tuningProposal":     load_json(TUNING_PROPOSAL_PATH, {"status": "none"}),
