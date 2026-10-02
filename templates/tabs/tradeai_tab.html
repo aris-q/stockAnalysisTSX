@@ -829,6 +829,60 @@ async function runWeightBacktestNow(btn) {
   }
 }
 
+function renderLossReviewSection(lr) {
+  lr = lr || {};
+  const rows = lr.reviews || [];
+  const causes = lr.causes || {};
+  const causeCol = {'company news': 'var(--down)', 'sector': '#f97316', 'market': '#60a5fa', 'no news (technical)': '#a78bfa'};
+  const total = Object.values(causes).reduce((a, c) => a + c.count, 0);
+  const chips = ['company news', 'sector', 'market', 'no news (technical)'].map(k => {
+    const c = causes[k] || {count: 0, lossPct: 0};
+    return `<div style="flex:1 1 150px;border:1px solid var(--border);border-radius:8px;padding:8px 10px">
+        <div style="font-size:13px;color:${causeCol[k]};font-weight:700;letter-spacing:1px">${k.toUpperCase()}</div>
+        <div style="font-family:'DM Mono',monospace;font-size:20px;font-weight:800">${c.count}${total ? `<span style="font-size:14px;color:var(--muted)"> · ${Math.round(100 * c.count / total)}%</span>` : ''}</div>
+        <div style="font-size:13px;color:var(--muted)">summed loss ${c.lossPct.toFixed(1)}%</div></div>`;
+  }).join('');
+  const last = lr.lastRun ? `last run ${_escNews(lr.lastRun.at)} · ${lr.lastRun.reviewed ?? 0} reviewed${lr.lastRun.failed ? ' · ' + lr.lastRun.failed + ' failed' : ''}${lr.lastRun.note ? ' · ' + _escNews(lr.lastRun.note) : ''}` : 'not run yet';
+  const body = rows.map(r => {
+    const col = causeCol[r.cause] || 'var(--muted)';
+    const flagged = new Set(r.flagged || []);
+    const heads = (r.headlines || []).filter((h, i) => flagged.has(i + 1)).map(h =>
+      `<div style="font-size:14px">· ${h.url ? `<a href="${_escNews(h.url)}" target="_blank" rel="noopener" style="color:var(--text)">${_escNews(h.title)}</a>` : _escNews(h.title)} <span style="color:var(--muted);font-size:13px">${_escNews(h.provider)} · ${_escNews(h.time)}</span></div>`).join('');
+    return `<tr style="vertical-align:top">
+        <td style="white-space:nowrap"><b>${_escNews(r.ticker)}</b><div style="font-size:13px;color:var(--muted)">${_escNews((r.sellDate || '').slice(0, 10))} · ${_escNews(r.bucket || '')}</div></td>
+        <td style="text-align:right;color:var(--down);font-family:'DM Mono',monospace">${r.gainLossPct != null ? r.gainLossPct.toFixed(2) + '%' : '—'}</td>
+        <td style="text-align:right;font-family:'DM Mono',monospace">${r.indexReturnPct != null ? r.indexReturnPct.toFixed(2) + '%' : '—'}</td>
+        <td><b style="color:${col}">${_escNews(r.cause || 'not reviewed')}</b>${r.confidence ? `<span style="color:var(--muted);font-size:13px"> · ${_escNews(r.confidence)}</span>` : ''}
+          <div style="font-size:15px">${_escNews(r.reason)}</div>${heads}</td></tr>`;
+  }).join('');
+  return `<div class="trade-section">
+    <div class="trade-section-header" style="cursor:pointer" onclick="const b=document.getElementById('lossReviewBody');const open=b.style.display!=='none';b.style.display=open?'none':'block';this.querySelector('.lr-arrow').textContent=open?'▸':'▾';">
+      <div>
+        <div class="trade-section-title"><span class="lr-arrow">▸</span> 📉 LOSS REVIEW (Gemini)</div>
+        <div class="trade-section-sub">Why each losing trade lost — company news, sector, market, or no news (signal failed) · ${rows.length} reviewed · ${last}</div>
+      </div>
+      <button class="btn" onclick="event.stopPropagation();runLossReview(this)" title="Review losing trades closed in the last 7 days that have no verdict yet (also runs daily after the close)">▶ RUN NOW</button>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px">${chips}</div>
+    <div id="lossReviewBody" style="display:none">
+      ${rows.length ? `<table class="trade-account-table" style="width:100%"><thead><tr><th>TICKER</th><th style="text-align:right">TRADE</th><th style="text-align:right">INDEX</th><th>CAUSE</th></tr></thead><tbody>${body}</tbody></table>`
+        : '<div style="color:var(--muted);font-size:15px;padding:6px 0">No losing trades reviewed yet.</div>'}
+    </div>
+  </div>`;
+}
+
+async function runLossReview(btn) {
+  const orig = btn.textContent; btn.disabled = true; btn.textContent = '⏳ REVIEWING...';
+  try {
+    const d = await fetch('/news/loss_review/run', {method: 'POST'}).then(r => r.json());
+    if (d.error) alert('Loss review failed: ' + d.error);
+    await loadTradeAI(true);
+  } catch (e) {
+    alert('Loss review failed: ' + e.message);
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
 function renderWeightBacktestSection(wb) {
   const header = (subtitle, extra) => `<div class="trade-section-header">
       <div>
@@ -1185,6 +1239,7 @@ function renderTradeAI(data) {
       ⏳ Reset queued — will auto dream-scan → identify → analyze → buy-in $${Number(data.resetPending.targetBalance).toLocaleString()} at the next Recommend window (10am/11am ET).
     </div>` : ''}
     ${newsWarningBanner}
+    ${marketRiskBanner(data.marketRisk)}
     ${benchmarkStrip}
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden">
       <table class="trade-account-table">
@@ -1215,6 +1270,8 @@ function renderTradeAI(data) {
       </div>
     </div>
   </div>
+
+  ${renderLossReviewSection(data.lossReviews)}
 
   ${renderWeightBacktestSection(data.weightBacktest)}
 

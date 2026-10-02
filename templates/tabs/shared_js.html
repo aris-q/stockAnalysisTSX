@@ -178,8 +178,33 @@ let _ncShownRunId = null;
 function newsCheckBadge(ticker, map) {
   const r = (map || {})[ticker];
   if (!r) return '';
-  return ` <span onclick="event.stopPropagation();openNewsCheck('${String(ticker).replace(/'/g, "\\'")}')" title="Gemini: negative news today — ${_escNews(r.category)} (severity ${r.severity}/5). Click for details."`
+  const safe = String(ticker).replace(/'/g, "\\'");
+  const deal = r.deal ? ` <span onclick="event.stopPropagation();openNewsCheck('${safe}')" title="Gemini: takeover/merger news — ${_escNews(r.dealNote || '')}. A pending buyout usually caps the upside near the deal price." style="cursor:pointer;font-size:13px;font-weight:800;padding:2px 6px;border-radius:4px;background:#a78bfa;color:#111;white-space:nowrap">🔒 DEAL</span>` : '';
+  if (!r.negative) return deal;
+  return deal + ` <span onclick="event.stopPropagation();openNewsCheck('${String(ticker).replace(/'/g, "\\'")}')" title="Gemini: negative news today — ${_escNews(r.category)} (severity ${r.severity}/5). Click for details."`
     + ` style="cursor:pointer;font-size:13px;font-weight:800;padding:2px 6px;border-radius:4px;background:var(--down);color:#fff;white-space:nowrap">⚠ ALERT ${r.severity}</span>`;
+}
+
+function _ncMarketHtml(m) {
+  if (!m) return '';
+  const col = m.riskLevel === 'high' ? 'var(--down)' : m.riskLevel === 'elevated' ? '#fbbf24' : 'var(--up)';
+  if (m.status !== 'ok') return `<div style="border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:12px;font-size:15px;color:var(--muted)">🌐 Market risk read unavailable: ${_escNews(m.error)}</div>`;
+  const flagged = new Set(m.flagged || []);
+  const heads = (m.headlines || []).map((h, i) => ({h, i})).filter(x => flagged.has(x.i + 1))
+    .map(({h}) => `<div style="font-size:14px;margin-left:4px">· ${h.url ? `<a href="${_escNews(h.url)}" target="_blank" rel="noopener" style="color:var(--text)">${_escNews(h.title)}</a>` : _escNews(h.title)} <span style="color:var(--muted);font-size:13px">${_escNews(h.provider)} · ${h.time}</span></div>`).join('');
+  const ev = (m.events || []).map(e => `<li style="margin:2px 0"><b>${_escNews(e.event)}</b>${e.when ? ` <span style="color:var(--muted)">(${_escNews(e.when)})</span>` : ''} — ${_escNews(e.impact)}</li>`).join('');
+  return `<div style="border:1px solid ${col};border-left:5px solid ${col};border-radius:6px;padding:8px 12px;margin-bottom:14px">
+      <div style="font-weight:800;font-size:16px">🌐 MARKET RISK TODAY: <span style="color:${col}">${_escNews((m.riskLevel || '?').toUpperCase())}</span>
+      <span style="font-weight:400;color:var(--muted);font-size:13px"> · read at ${_escNews(m.asOf)} from ${(m.headlines || []).length} market headlines</span></div>
+      <div style="font-size:15px;margin:4px 0">${_escNews(m.summary)}</div>
+      ${ev ? `<ul style="margin:4px 0 4px 18px;padding:0;font-size:15px">${ev}</ul>` : ''}${heads}</div>`;
+}
+
+function marketRiskBanner(m) {
+  if (!m || m.status !== 'ok' || !m.riskLevel) return '';
+  const col = m.riskLevel === 'high' ? 'var(--down)' : m.riskLevel === 'elevated' ? '#fbbf24' : 'var(--up)';
+  return `<div onclick="openNewsCheck()" title="Gemini's read of today's market-wide headlines — click for events" style="cursor:pointer;border:1px solid ${col};border-radius:8px;padding:6px 12px;margin-bottom:10px;font-size:15px">
+      🌐 Market risk today: <b style="color:${col}">${_escNews(m.riskLevel.toUpperCase())}</b> — ${_escNews(m.summary)} <span style="color:var(--muted);font-size:13px">(${(m.events || []).length} event${(m.events || []).length === 1 ? '' : 's'} · click)</span></div>`;
 }
 
 function _ncModal() {
@@ -227,22 +252,26 @@ function _renderNewsCheck(rec, scrollTo) {
   const m = _ncModal();
   const c = rec.counts || {};
   document.getElementById('newsCheckSub').textContent =
-    `${rec.runAt || ''} · ${rec.trigger === 'scheduler' ? 'scheduled' : 'manual'} run · today's headlines only · ${rec.geminiCalled ? rec.model : 'Gemini not called (no news today)'}`;
+    `${rec.runAt || ''} · ${rec.trigger === 'scheduler' ? 'scheduled' : 'manual'} run · headlines ${rec.window || 'today'} · ${rec.geminiCalled ? rec.model : 'Gemini not called (no news today)'}`;
   const rows = rec.tickers || [];
   const group = (state, title, color, block) => {
     const g = rows.filter(r => r.state === state);
     return `<div style="margin-bottom:12px"><div style="font-size:14px;font-weight:700;letter-spacing:1px;color:${color};margin-bottom:6px">${title} (${g.length})</div>`
       + (g.length ? (block ? g.map(_ncRowHtml).join('') : `<div>${g.map(_ncRowHtml).join('')}</div>`) : '<div style="color:var(--muted);font-size:15px">none</div>') + '</div>';
   };
-  let html = '';
+  let html = _ncMarketHtml(rec.market);
   if (rec.status === 'error') html += `<div style="border:1px solid var(--down);color:var(--down);border-radius:6px;padding:8px 10px;margin-bottom:12px;font-size:15px">Gemini analysis failed: ${_escNews(rec.error)}</div>`;
   html += `<div style="font-size:16px;margin-bottom:12px">${c.negative ? `<b style="color:var(--down)">⚠️ ${c.negative} ticker${c.negative === 1 ? '' : 's'} with negative news today</b>` : '<b style="color:var(--up)">✓ No negative news today</b>'}
       <span style="color:var(--muted)"> · ${c.clear || 0} with news, nothing negative · ${c.no_news || 0} with no news today${c.error ? ' · ' + c.error + ' not analysed' : ''}</span></div>`;
   html += group('negative', '⚠️ NEGATIVE NEWS TODAY', 'var(--down)', true);
+  const deals = rows.filter(r => r.deal);
+  if (deals.length) html += `<div style="margin-bottom:12px"><div style="font-size:14px;font-weight:700;letter-spacing:1px;color:#a78bfa;margin-bottom:6px">🔒 TAKEOVER / MERGER (${deals.length})</div>`
+    + deals.map(r => `<div style="border:1px solid #a78bfa;border-radius:6px;padding:6px 10px;margin-bottom:6px;font-size:15px"><b>${_escNews(r.ticker)}</b> <span style="font-size:12px;color:var(--muted)">${r.role === 'held' ? 'HELD' : 'CANDIDATE'}</span> — ${_escNews(r.dealNote || r.reason)}`
+      + (r.role === 'held' ? '' : ' <span style="color:#a78bfa">· upside likely capped near the deal price</span>') + '</div>').join('') + '</div>';
   if (c.error) html += group('error', 'NOT ANALYSED', 'var(--down)', false);
   html += group('clear', '✓ NO NEGATIVE NEWS TODAY', 'var(--up)', false);
   html += group('no_news', 'NO NEWS TODAY', 'var(--muted)', false);
-  html += '<div style="font-size:13px;color:var(--muted)">Headline-only judgement — flags only, nothing is bought or sold on it.</div>';
+  html += '<div style="font-size:13px;color:var(--muted)">Headline-only judgement — flags only, nothing is bought or sold on it. Before 09:30 the window reaches back to the previous close, so overnight news is included.</div>';
   document.getElementById('newsCheckBody').innerHTML = html;
   m.dataset.runId = rec.runId || '';
   m.style.display = 'flex';

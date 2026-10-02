@@ -458,6 +458,7 @@ def run_news_refresh(trigger="manual"):
 NEWS_CHECK_PATH = "output/news_check.json"
 NEWS_CHECK_HISTORY_PATH = "output/news_check_history.json"
 NEWS_CHECK_ALERT_SEVERITY = 4  # phone/in-app alert at this severity and above
+MARKET_NEWS_QUERIES = ["TSX", "Bank of Canada", "Canadian economy", "stock market", "Federal Reserve", "tariffs"]  # Yahoo searches for the morning market-risk read
 
 
 def _news_check_roles():
@@ -467,17 +468,30 @@ def _news_check_roles():
 
 
 def run_news_check(trigger="manual"):
-    from news_check import run_check
+    from news_check import run_check, market_risk
     from config import GEMINI_API_KEY
+    prev = load_json(NEWS_CHECK_PATH, {})
     rec = run_check(_news_check_roles(), load_json(NEWS_PATH, {}), GEMINI_API_KEY, TZ, trigger)
+    # Market read: once a day — the first run (normally 09:20); later runs carry it forward.
+    pm = prev.get("market") or {}
+    if pm.get("date") == rec["date"] and pm.get("status") == "ok":
+        rec["market"] = pm
+    else:
+        fetch_status.update({"message": "News: Gemini reading today's market risk..."})
+        rec["market"] = market_risk(GEMINI_API_KEY, MARKET_NEWS_QUERIES, TZ)
+        m = rec["market"]
+        log.info(f"[MarketRisk] {m['status']} | {m.get('riskLevel')} | {m.get('summary') or m.get('error')}")
+        send = globals().get("_send_alert")
+        if send and m.get("riskLevel") == "high":
+            send("news", "🌐 Market risk HIGH today", m.get("summary") or "", priority=4, tags=["warning"])
     rec["acked"] = False
     save_json(NEWS_CHECK_PATH, rec)
     hist = load_json(NEWS_CHECK_HISTORY_PATH, {"runs": []})
     hist["runs"] = (hist.get("runs", []) + [{k: v for k, v in rec.items() if k != "acked"}])[-300:]
     save_json(NEWS_CHECK_HISTORY_PATH, hist)
     c = rec["counts"]
-    log.info(f"[NewsCheck] [{trigger}] {rec['status']} | negative:{c['negative']} clear:{c['clear']} "
-             f"no-news:{c['no_news']} error:{c['error']} | gemini called:{rec['geminiCalled']}"
+    log.info(f"[NewsCheck] [{trigger}] {rec['status']} | window {rec['window']} | negative:{c['negative']} deal:{c['deal']} "
+             f"clear:{c['clear']} no-news:{c['no_news']} error:{c['error']} | gemini called:{rec['geminiCalled']}"
              + (f" | {rec['error']}" if rec.get("error") else ""))
     send = globals().get("_send_alert")  # alerts exist in the US app only
     if send:
@@ -490,12 +504,75 @@ def run_news_check(trigger="manual"):
 
 
 def _news_check_map():
-    """Today's negative verdicts from the latest run: {ticker: {severity, category}}."""
+    """Today's flags from the latest run: {ticker: {negative, severity, category, deal, dealNote}}."""
     rec = load_json(NEWS_CHECK_PATH, {})
     if rec.get("date") != datetime.now(TZ).strftime("%Y-%m-%d"):
         return {}
-    return {r["ticker"]: {"severity": r["severity"], "category": r["category"]}
-            for r in rec.get("tickers", []) if r.get("state") == "negative"}
+    return {r["ticker"]: {"negative": r.get("state") == "negative", "severity": r["severity"], "category": r["category"],
+                          "deal": r.get("deal", False), "dealNote": r.get("dealNote", "")}
+            for r in rec.get("tickers", []) if r.get("state") == "negative" or r.get("deal")}
+
+
+def _market_risk_today():
+    m = load_json(NEWS_CHECK_PATH, {}).get("market") or {}
+    return m if m.get("date") == datetime.now(TZ).strftime("%Y-%m-%d") else None
+
+
+# ── Loss review: after the close, Gemini tags why each losing trade lost ──
+LOSS_REVIEWS_PATH = "output/loss_reviews.json"
+LOSS_REVIEW_LOOKBACK_DAYS = 7  # headlines are only stored for ~7 days
+
+
+def run_loss_review(trigger="manual"):
+    """Review losing trades closed in the last LOSS_REVIEW_LOOKBACK_DAYS that
+    don't have a verdict yet — one Gemini call for all of them."""
+    from news_check import review_losses
+    from config import GEMINI_API_KEY
+    db = load_json(LOSS_REVIEWS_PATH, {"reviews": []})
+    done = {r["key"] for r in db.get("reviews", []) if r.get("cause")}
+    cutoff = (datetime.now(TZ) - timedelta(days=LOSS_REVIEW_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    todo = []
+    for o in load_json(TRADE_OUTCOMES_PATH, {"outcomes": []}).get("outcomes", []):
+        key = f"{o.get('ticker')}|{o.get('sellDate')}"
+        if (o.get("gainLossPct") or 0) < 0 and (o.get("sellDate") or "")[:10] >= cutoff and key not in done:
+            todo.append({**o, "key": key})
+    todo = todo[-25:]
+    if not todo:
+        db["lastRun"] = {"at": ts(), "trigger": trigger, "status": "ok", "reviewed": 0, "note": "no unreviewed losing trades"}
+        save_json(LOSS_REVIEWS_PATH, db)
+        log.info(f"[LossReview] [{trigger}] nothing to review")
+        return db["lastRun"]
+    out = review_losses(todo, load_json(NEWS_PATH, {}), load_json(NEWS_CHECK_HISTORY_PATH, {"runs": []}).get("runs", []),
+                        GEMINI_API_KEY, TZ)
+    keep = [r for r in db.get("reviews", []) if r["key"] not in out]
+    db["reviews"] = (keep + list(out.values()))[-500:]
+    ok = sum(1 for r in out.values() if r.get("cause"))
+    db["lastRun"] = {"at": ts(), "trigger": trigger, "status": "ok" if ok == len(out) else "partial",
+                     "reviewed": ok, "failed": len(out) - ok}
+    save_json(LOSS_REVIEWS_PATH, db)
+    log.info(f"[LossReview] [{trigger}] reviewed {ok}/{len(out)} losing trades")
+    return db["lastRun"]
+
+
+def _loss_reviews_payload():
+    db = load_json(LOSS_REVIEWS_PATH, {"reviews": []})
+    rows = sorted(db.get("reviews", []), key=lambda r: r.get("sellDate") or "", reverse=True)
+    causes = {}
+    for r in rows:
+        if r.get("cause"):
+            c = causes.setdefault(r["cause"], {"count": 0, "lossPct": 0.0})
+            c["count"] += 1
+            c["lossPct"] = round(c["lossPct"] + (r.get("gainLossPct") or 0), 2)
+    return {"reviews": rows[:100], "causes": causes, "lastRun": db.get("lastRun")}
+
+
+@app.route("/news/loss_review/run", methods=["POST"])
+def loss_review_run():
+    try:
+        return jsonify(run_loss_review("manual"))
+    except Exception as e:
+        log.error(f"[LossReview] FAIL: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/news/check")
@@ -4254,6 +4331,8 @@ def get_tradeai():
         "newsTsMap":          news_ts_map,
         "newsCountMap":       news_count_map,
         "newsCheckMap":       _news_check_map(),
+        "marketRisk":         _market_risk_today(),
+        "lossReviews":        _loss_reviews_payload(),
         "signalFcMap":        signal_fc_map,
         "rollbackProposal":   load_json(ROLLBACK_PROPOSAL_PATH, {"status": "none"}),
         "tuningProposal":     load_json(TUNING_PROPOSAL_PATH, {"status": "none"}),
@@ -5341,6 +5420,7 @@ SCHEDULER_DEFAULTS = {
     "dreamTime":        "13:30",
     "accountTrackerTime": "17:04",  # daily, after close — portfolio value vs TSX/TSX 60
     "weightBacktestTime": "17:06",  # daily — dream/AI weighting backtest over shadow history
+    "lossReviewTime":   "16:20",  # daily, after the close — Gemini tags why each losing trade lost
     "optionsTime":      "17:15",  # daily, after the close — end-of-day options volume/OI (via US-listed twin) for every ticker ever bought or simulated
     "newsTimes":        ["09:20", "11:47", "14:47"],  # the only scheduled news fetch — before the open (catches the ~53% published after close/overnight), then just before the 12:00 and 15:00 Recommends; :47 avoids the 5-min sell checks
     "tuningTime":       "16:15",  # Friday only — weekly missed-gainer tuning check
@@ -5469,6 +5549,9 @@ def _scheduler_loop():
             if hhmm == cfg.get("accountTrackerTime"):
                 slots.append((f"accountTracker-{hhmm}", "accountTracker",
                               [("account-tracker", _update_account_tracker)]))
+            if hhmm == cfg.get("lossReviewTime"):
+                slots.append((f"lossReview-{hhmm}", "lossReview",
+                              [("loss-review", lambda: run_loss_review("scheduler"))]))
             if hhmm == cfg.get("optionsTime") and not early_close:
                 slots.append((f"options-{hhmm}", "optionsSnapshot",
                               [("options-snapshot", lambda: run_options_snapshot("scheduler"))]))
@@ -5522,6 +5605,8 @@ def admin_scheduler():
                 saved["dreamTime"] = norm_time(body["dreamTime"])
             if "accountTrackerTime" in body:
                 saved["accountTrackerTime"] = norm_time(body["accountTrackerTime"])
+            if "lossReviewTime" in body:
+                saved["lossReviewTime"] = norm_time(body["lossReviewTime"])
             if "optionsTime" in body:
                 saved["optionsTime"] = norm_time(body["optionsTime"])
             if "newsTimes" in body:
