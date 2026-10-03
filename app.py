@@ -2936,7 +2936,8 @@ SCORING_DEFAULTS = {
     # position that never had a chance. Expressed as a fraction of
     # sellThresholds.dailyDropStop so it scales with that setting.
     "entryGuards": {
-        "maxAlreadyDownPctOfDailyDropStop": 0.5
+        "maxAlreadyDownPctOfDailyDropStop": 0.5,
+        "maxAboveMA20Pct": 10.0   # skip buys more than this % above the 20-day average (0 = off); see _overextension_block
     },
     "selfLearning": {
         "autoRollback": True,
@@ -3232,6 +3233,23 @@ def _effective_stop_loss_pct(ticker, details, sell_cfg):
     if atr_pct is None:
         return hard_cap
     return min(multiplier * atr_pct, hard_cap)
+
+
+def _overextension_block(ticker, price, details, entry_guards):
+    """MA20 entry filter (v11, 2026-10-02): skip a buy whose price is more
+    than entryGuards.maxAboveMA20Pct (default 10) above its 20-day average.
+    Evidence: in the 07-08→10-02 replay with the live sell rules, the
+    v10-style ranking made +2.4% (SPY +3.8%); skipping candidates >10%
+    above MA20 made +11.1%, and the filter helped every ranking tested.
+    Returns None when the buy may go ahead, else the skip reason."""
+    limit = float(entry_guards.get("maxAboveMA20Pct", 10))
+    ma20 = (details.get(ticker) or {}).get("ma20")
+    if limit <= 0 or not ma20 or not price:
+        return None
+    above = (price / ma20 - 1) * 100
+    if above <= limit:
+        return None
+    return f"{above:.1f}% above its 20-day average ${ma20:.2f} — over the {limit:g}% entry limit (stretched stocks lagged)"
 
 
 def _reentry_block(ticker, price, transactions, pm):
@@ -4133,6 +4151,11 @@ def run_tradeai_recommend():
             if reentry_block:
                 log.info(f"TradeAI QUALIFY skip (re-entry): {ticker} | {reentry_block}")
                 skip_reasons.append({"ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"), "reason": reentry_block})
+                continue
+            stretched = _overextension_block(ticker, live_prices.get(ticker) or s.get("price"), details, ENTRY_GUARDS)
+            if stretched:
+                log.info(f"TradeAI QUALIFY skip (MA20 filter): {ticker} | {stretched}")
+                skip_reasons.append({"ticker": ticker, "bucket": s.get("bucket"), "composite": s.get("composite"), "reason": stretched})
                 continue
             if s.get("buySignal") == "Avoid":
                 log.info(f"TradeAI QUALIFY skip (AI says Avoid): {ticker}")
@@ -5858,8 +5881,9 @@ def _migrate_reentry_rule_version():
         bump_recommend_version(
             [f"Re-entry rule: within {pm['rotationCooldownTradingDays']} trading days of a sale — gain exit: re-buy allowed; "
              f"loss exit: re-buy only at >= {pm['reentryAfterLossMinAbovePct']:g}% above the price paid "
-             f"(was: any sale blocked re-entry for the whole window)"],
-            label="Re-entry rule: loss exits need +10% over price paid to re-buy within a week",
+             f"(was: any sale blocked re-entry for the whole window)",
+             f"MA20 entry filter: skip buys more than {cfg['entryGuards']['maxAboveMA20Pct']:g}% above the 20-day average"],
+            label="Re-entry rule + MA20 entry filter",
             config_snapshot=cfg, code_change=True)
     except Exception as e:
         log.error(f"[RecVersion] re-entry rule version migration FAIL: {e}")
