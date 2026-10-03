@@ -180,8 +180,10 @@ function newsCheckBadge(ticker, map) {
   if (!r) return '';
   const safe = String(ticker).replace(/'/g, "\\'");
   const deal = r.deal ? ` <span onclick="event.stopPropagation();openNewsCheck('${safe}')" title="Gemini: takeover/merger news — ${_escNews(r.dealNote || '')}. A pending buyout usually caps the upside near the deal price." style="cursor:pointer;font-size:13px;font-weight:800;padding:2px 6px;border-radius:4px;background:#a78bfa;color:#111;white-space:nowrap">🔒 DEAL</span>` : '';
-  if (!r.negative) return deal;
-  return deal + ` <span onclick="event.stopPropagation();openNewsCheck('${String(ticker).replace(/'/g, "\\'")}')" title="Gemini: negative news today — ${_escNews(r.category)} (severity ${r.severity}/5). Click for details."`
+  const rev = /reverse/i.test(r.splitNote || '');
+  const split = r.split ? ` <span onclick="event.stopPropagation();openNewsCheck('${safe}')" title="Stock split: ${_escNews(r.splitNote || '')}" style="cursor:pointer;font-size:13px;font-weight:800;padding:2px 6px;border-radius:4px;background:${rev ? 'var(--down)' : 'var(--up)'};color:#111;white-space:nowrap">${rev ? '⚠ REV SPLIT' : '✂️ SPLIT'}</span>` : '';
+  if (!r.negative) return deal + split;
+  return deal + split + ` <span onclick="event.stopPropagation();openNewsCheck('${String(ticker).replace(/'/g, "\\'")}')" title="Gemini: negative news today — ${_escNews(r.category)} (severity ${r.severity}/5). Click for details."`
     + ` style="cursor:pointer;font-size:13px;font-weight:800;padding:2px 6px;border-radius:4px;background:var(--down);color:#fff;white-space:nowrap">⚠ ALERT ${r.severity}</span>`;
 }
 
@@ -193,6 +195,37 @@ function buyVerdictBadge(ticker, held) {
   const tip = `Gemini on this buy: ${r.verdict.toUpperCase()} — ${r.thesis}${(r.risks || []).length ? ' · Risks: ' + r.risks.join('; ') : ''}`;
   return ` <span onclick="event.stopPropagation();const s=document.getElementById('buyReviewSection');if(s)s.scrollIntoView({behavior:'smooth'})" title="${_escNews(tip)}"`
     + ` style="cursor:pointer;font-size:13px;font-weight:800;padding:2px 6px;border-radius:4px;border:1px solid ${cfg[1]};color:${cfg[1]};white-space:nowrap">${cfg[0]} ${r.verdict.toUpperCase()}</span>`;
+}
+
+function _ncEventsHtml(rec) {
+  const tk = (rec.takeovers || []), sn = (rec.splitNews || []), sc = (rec.splitCalendar || []);
+  if (!tk.length && !sn.length && !sc.length) return '';
+  const who = e => e.role === 'held' ? '<b style="color:var(--accent)">HELD</b>' : e.role ? '<b style="color:var(--accent)">CANDIDATE</b>'
+    : e.inUniverse ? `in your universe · Dream ${e.dream ?? '?'}` : '<span style="color:var(--muted)">not in your universe</span>';
+  const links = e => (e.headlines || []).slice(0, 2).map(h => h.url ? `<a href="${_escNews(h.url)}" target="_blank" rel="noopener" style="color:var(--muted);font-size:13px">${_escNews(h.title)}</a>` : '').filter(Boolean).join(' · ');
+  const stageCol = s => ({agreed: 'var(--up)', bid: '#fbbf24', talks: '#fbbf24', rumor: 'var(--muted)', completed: 'var(--muted)'}[s] || 'var(--muted)');
+  let html = `<div style="border:1px solid #a78bfa;border-left:5px solid #a78bfa;border-radius:6px;padding:8px 12px;margin-bottom:14px">
+    <div style="font-weight:800;font-size:16px;margin-bottom:6px">📣 TAKEOVERS &amp; STOCK SPLITS <span style="font-weight:400;color:var(--muted);font-size:13px">· market-wide · flags only</span></div>`;
+  if (tk.length) {
+    html += '<div style="font-size:14px;font-weight:700;letter-spacing:1px;color:#a78bfa;margin:4px 0">🔒 TAKEOVER TARGETS</div>'
+      + tk.map(e => `<div style="font-size:15px;margin:3px 0"><b>${_escNews(e.ticker || '?')}</b> ${_escNews(e.company)}
+          <span style="font-weight:700;color:${stageCol(e.stage)}"> ${_escNews((e.stage || '?').toUpperCase())}</span>
+          ${e.acquirer ? ' · by ' + _escNews(e.acquirer) : ''}${e.pricePerShare ? ' · ' + _escNews(e.pricePerShare) : ''}${e.premium ? ' (' + _escNews(e.premium) + ' premium)' : ''}
+          · ${who(e)}<div style="font-size:13px;color:var(--muted)">${_escNews(e.note)} ${links(e)}</div></div>`).join('')
+      + '<div style="font-size:13px;color:var(--muted);margin-bottom:6px">Agreed deals usually jump at the announcement and then trade near the deal price; the upside is mostly in the rumour/talks stage, with the risk the deal never comes.</div>';
+  }
+  const splits = [...sn.map(e => ({...e, src: 'news'})), ...sc.filter(c => !sn.some(n => n.ticker && n.ticker === c.ticker)).map(e => ({...e, src: 'calendar'}))];
+  const main = splits.filter(e => !e.otc), otc = splits.filter(e => e.otc);
+  const row = e => `<div style="font-size:15px;margin:3px 0">${e.kind === 'reverse' ? '<span style="color:var(--down);font-weight:800">⚠ REVERSE</span>' : '<span style="color:var(--up);font-weight:800">✂️ FORWARD</span>'}
+      <b>${_escNews(e.ticker || '?')}</b> ${_escNews(e.company)} · ${_escNews(e.ratio)}${(e.payDate || e.date) ? ' · ' + _escNews(e.payDate || e.date) : ''}
+      · ${who(e)} <span style="color:var(--muted);font-size:13px">(${e.src})</span>${e.src === 'news' && links(e) ? `<div style="font-size:13px">${links(e)}</div>` : ''}</div>`;
+  if (splits.length) {
+    html += '<div style="font-size:14px;font-weight:700;letter-spacing:1px;color:#a78bfa;margin:8px 0 4px">✂️ STOCK SPLITS</div>'
+      + (main.length ? main.map(row).join('') : '<div style="font-size:14px;color:var(--muted)">none on regular listings</div>')
+      + (otc.length ? `<div style="margin-top:4px"><span style="cursor:pointer;color:var(--accent);font-size:14px" onclick="const b=this.nextElementSibling;const o=b.style.display!=='none';b.style.display=o?'none':'block';this.textContent=(o?'▸':'▾')+' ${otc.length} on OTC / foreign listings'">▸ ${otc.length} on OTC / foreign listings</span><div style="display:none">${otc.map(row).join('')}</div></div>` : '')
+      + '<div style="font-size:13px;color:var(--muted);margin-top:4px">Reverse splits are mostly struggling small companies — a warning, not an opportunity.</div>';
+  }
+  return html + '</div>';
 }
 
 function _ncMarketHtml(m) {
@@ -269,7 +302,7 @@ function _renderNewsCheck(rec, scrollTo) {
     return `<div style="margin-bottom:12px"><div style="font-size:14px;font-weight:700;letter-spacing:1px;color:${color};margin-bottom:6px">${title} (${g.length})</div>`
       + (g.length ? (block ? g.map(_ncRowHtml).join('') : `<div>${g.map(_ncRowHtml).join('')}</div>`) : '<div style="color:var(--muted);font-size:15px">none</div>') + '</div>';
   };
-  let html = _ncMarketHtml(rec.market);
+  let html = _ncMarketHtml(rec.market) + _ncEventsHtml(rec);
   if (rec.status === 'error') html += `<div style="border:1px solid var(--down);color:var(--down);border-radius:6px;padding:8px 10px;margin-bottom:12px;font-size:15px">Gemini analysis failed: ${_escNews(rec.error)}</div>`;
   html += `<div style="font-size:16px;margin-bottom:12px">${c.negative ? `<b style="color:var(--down)">⚠️ ${c.negative} ticker${c.negative === 1 ? '' : 's'} with negative news today</b>` : '<b style="color:var(--up)">✓ No negative news today</b>'}
       <span style="color:var(--muted)"> · ${c.clear || 0} with news, nothing negative · ${c.no_news || 0} with no news today${c.error ? ' · ' + c.error + ' not analysed' : ''}</span></div>`;

@@ -518,7 +518,55 @@ def _gemini_allow(job, scheduled):
 NEWS_CHECK_PATH = "output/news_check.json"
 NEWS_CHECK_HISTORY_PATH = "output/news_check_history.json"
 NEWS_CHECK_ALERT_SEVERITY = 4  # phone/in-app alert at this severity and above
+EVENT_NEWS_QUERIES = ["plan of arrangement", "merger agreement", "to acquire", "takeover bid", "buyout offer", "TSX acquisition", "in talks to acquire", "stock split", "announces stock split"]  # takeover + split headlines, last ~30h
+SPLIT_MARKET = "TSX"  # which listings the split calendar keeps
 MARKET_NEWS_QUERIES = ["TSX", "Bank of Canada", "Canadian economy", "stock market", "Federal Reserve", "tariffs"]  # Yahoo searches for the morning market-risk read
+
+
+
+CORP_EVENTS_PATH = "output/corporate_events.json"
+
+
+def _is_otc_foreign(t):
+    """5-letter US symbols ending F/Y are OTC foreign listings/ADRs (e.g. TOELF,
+    TOPPY) — rarely tradeable for this account; shown collapsed."""
+    return SPLIT_MARKET == "US" and len(t) == 5 and t[-1] in "FY"
+
+
+def _annotate_events(rec):
+    """Tag takeover/split events with Dream universe membership + score and
+    whether the account holds it or has it as a candidate; log them all."""
+    universe = {c["ticker"]: c.get("score") for c in load_json(DREAM_PATH, {}).get("candidates", []) if c.get("ticker")}
+    roles = _news_check_roles()
+    lists = [("takeover", rec.get("takeovers") or []), ("splitNews", rec.get("splitNews") or []),
+             ("splitCalendar", rec.get("splitCalendar") or [])]
+    log_db = load_json(CORP_EVENTS_PATH, {"events": []})
+    seen = {(e["type"], e["ticker"], e.get("detail")) for e in log_db["events"]}
+    for typ, items in lists:
+        for e in items:
+            t = e.get("ticker") or ""
+            e.update(inUniverse=t in universe, dream=universe.get(t), role=roles.get(t), otc=_is_otc_foreign(t))
+            detail = e.get("stage") if typ == "takeover" else e.get("ratio")
+            if t and (typ, t, detail) not in seen:
+                seen.add((typ, t, detail))
+                log_db["events"].append({"type": typ, "ticker": t, "detail": detail, "firstSeen": rec["runAt"],
+                                         "company": e.get("company"), "kind": e.get("kind"), "inUniverse": e["inUniverse"],
+                                         "dream": e["dream"], "acquirer": e.get("acquirer"), "pricePerShare": e.get("pricePerShare"),
+                                         "payDate": e.get("payDate") or e.get("date")})
+    log_db["events"] = log_db["events"][-2000:]
+    save_json(CORP_EVENTS_PATH, log_db)
+    send = globals().get("_send_alert")
+    if send:
+        for e in rec.get("takeovers") or []:
+            if e.get("role") or e.get("inUniverse"):
+                send("news", f"🔒 Takeover news: {e['ticker'] or e['company']} ({e.get('stage') or '?'})",
+                     f"{'HELD · ' if e.get('role') == 'held' else 'Candidate · ' if e.get('role') else ''}{e.get('acquirer') or ''} {e.get('pricePerShare') or ''} — {e.get('note') or ''}",
+                     priority=4, tags=["moneybag"])
+        for e in (rec.get("splitNews") or []) + (rec.get("splitCalendar") or []):
+            if e.get("role") or (e.get("inUniverse") and e.get("kind") == "forward"):
+                send("news", f"✂️ Stock split: {e['ticker']} {e.get('ratio') or ''} ({e.get('kind') or '?'})",
+                     f"{'HELD · ' if e.get('role') == 'held' else 'Candidate · ' if e.get('role') else ''}{e.get('company') or ''} {e.get('payDate') or e.get('date') or ''}",
+                     priority=3, tags=["scissors"])
 
 
 def _news_check_roles():
@@ -528,7 +576,7 @@ def _news_check_roles():
 
 
 def run_news_check(trigger="manual"):
-    from news_check import run_check, fetch_market_headlines
+    from news_check import run_check, fetch_market_headlines, fetch_split_calendar
     from config import GEMINI_API_KEY
     prev = load_json(NEWS_CHECK_PATH, {})
     today = datetime.now(TZ).strftime("%Y-%m-%d")
@@ -536,7 +584,21 @@ def run_news_check(trigger="manual"):
     pm = prev.get("market") or {}
     have_market = pm.get("date") == today and pm.get("status") == "ok"
     mkt_heads = None if have_market else fetch_market_headlines(MARKET_NEWS_QUERIES, TZ)
-    rec = run_check(_news_check_roles(), load_json(NEWS_PATH, {}), GEMINI_API_KEY, TZ, trigger, market_headlines=mkt_heads)
+    evt_heads = fetch_market_headlines(EVENT_NEWS_QUERIES, TZ, max_age_h=30, limit=40)
+    rec = run_check(_news_check_roles(), load_json(NEWS_PATH, {}), GEMINI_API_KEY, TZ, trigger,
+                    market_headlines=mkt_heads, event_headlines=evt_heads)
+    # Split calendar: once a day, carried forward like the market read.
+    if prev.get("splitCalendarDate") == today:
+        rec["splitCalendar"] = prev.get("splitCalendar") or []
+    else:
+        try:
+            rec["splitCalendar"] = fetch_split_calendar(TZ, SPLIT_MARKET)
+        except Exception as e:
+            log.warning(f"[Splits] calendar FAIL: {e}")
+            rec["splitCalendar"] = []
+    rec["splitCalendarDate"] = today
+    _annotate_events(rec)
+    log.info(f"[Events] takeovers:{len(rec['takeovers'])} split news:{len(rec['splitNews'])} split calendar:{len(rec['splitCalendar'])}")
     if have_market:
         rec["market"] = pm
     else:
@@ -570,9 +632,21 @@ def _news_check_map():
     rec = load_json(NEWS_CHECK_PATH, {})
     if rec.get("date") != datetime.now(TZ).strftime("%Y-%m-%d"):
         return {}
-    return {r["ticker"]: {"negative": r.get("state") == "negative", "severity": r["severity"], "category": r["category"],
-                          "deal": r.get("deal", False), "dealNote": r.get("dealNote", "")}
-            for r in rec.get("tickers", []) if r.get("state") == "negative" or r.get("deal")}
+    out = {r["ticker"]: {"negative": r.get("state") == "negative", "severity": r["severity"], "category": r["category"],
+                         "deal": r.get("deal", False), "dealNote": r.get("dealNote", ""),
+                         "split": bool(r.get("split")), "splitNote": r.get("splitNote", "")}
+           for r in rec.get("tickers", []) if r.get("state") == "negative" or r.get("deal") or r.get("split")}
+    # market-wide events about a held/candidate ticker light up its badges too
+    blank = {"negative": False, "severity": 0, "category": "none", "deal": False, "dealNote": "", "split": False, "splitNote": ""}
+    for e in rec.get("takeovers") or []:
+        if e.get("role") and e.get("ticker"):
+            m = out.setdefault(e["ticker"], dict(blank)); m["deal"] = True
+            m["dealNote"] = m["dealNote"] or f"{e.get('stage', '')} — {e.get('acquirer', '')} {e.get('pricePerShare', '')}".strip()
+    for e in (rec.get("splitNews") or []) + (rec.get("splitCalendar") or []):
+        if e.get("role") and e.get("ticker"):
+            m = out.setdefault(e["ticker"], dict(blank)); m["split"] = True
+            m["splitNote"] = m["splitNote"] or f"{e.get('kind', '')} {e.get('ratio', '')} {e.get('payDate') or e.get('date') or ''}".strip()
+    return out
 
 
 def _market_risk_today():

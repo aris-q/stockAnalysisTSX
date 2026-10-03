@@ -12,6 +12,9 @@ the rest of the app's Gemini use stays disabled in ai_summary._call_gemini).
    risk (Fed, CPI, tariffs). No call of its own.
 3. review_buys — after the last Recommend (15:10): a second opinion on each
    of today's purchases (agree / caution / avoid). Flags only.
+5. Corporate events — splits from Yahoo's split calendar (exact ratios and
+   dates, no Gemini) and takeovers from market-wide M&A headlines, which
+   the news-check call itself extracts (no extra Gemini call).
 4. review_losses — after the close: tags each losing trade's cause
    (company news / sector / market / no news = technical) from the
    headlines seen while it was held plus its return vs the index.
@@ -48,11 +51,19 @@ For EVERY ticker given, decide:
 4. headlines: the numbers of the headline(s) the verdict is based on ([] if none).
 5. reason: <= 20 words.
 6. confidence: low / medium / high (low when a headline is ambiguous).
+8. split: true if a headline says THIS company announced a stock split (forward or reverse); splitNote: <= 12 words (ratio, forward/reverse, date if stated), "" if none.
 7. deal: true if a headline says THIS company agreed to be acquired, received a takeover bid/offer, is in merger talks as the target, or has a pending merger. Acquiring another company is NOT a deal for this purpose. dealNote: <= 15 words (acquirer, price per share if stated, status), "" if no deal.
 
 Rules: a price move by itself ("stock falls", "slips", "down 12% this quarter", "underperforms") is NOT negative news — severity 0 unless the headline names a company-specific cause from the list above; an investor's short position or bearish opinion piece is at most severity 1; ignore listicles and "stocks to watch" pieces; ignore headlines that mention the ticker but are really about another company; count a repeated story once; do not predict prices.
 
-Reply with JSON only: {"results":[{"ticker":"...","negative":true|false,"severity":0,"category":"...","headlines":[1],"reason":"...","confidence":"...","deal":false,"dealNote":""}]} with one entry per ticker given."""
+Reply with JSON only: {"results":[{"ticker":"...","negative":true|false,"severity":0,"category":"...","headlines":[1],"reason":"...","confidence":"...","deal":false,"dealNote":"","split":false,"splitNote":""}]} with one entry per ticker given."""
+
+EVENT_ADDON = """
+
+ALSO, separately: you get MARKET-WIDE merger/acquisition and stock-split headlines (numbered E1, E2, ..., each with the tickers Yahoo tagged). List every company that is the TARGET of a takeover: agreed acquisition, takeover bid/offer, merger where it is acquired, or reported talks/exploring a sale. Skip acquirers, skip completed deals more than a few days old, skip asset/division sales.
+Per target: {"ticker": "<target's ticker from the tags if clear, else ''>", "company": "...", "acquirer": "...", "pricePerShare": "<as stated, else ''>", "premium": "<as stated, else ''>", "stage": "rumor"|"talks"|"bid"|"agreed"|"completed", "headlines": [E-numbers as integers, without the E], "note": "<= 15 words"}
+Add them to the same JSON object as "takeovers": [...] ([] if none).
+ALSO list every company in those headlines that ANNOUNCED a stock split: {"ticker": "...", "company": "...", "kind": "forward"|"reverse", "ratio": "e.g. 10-for-1 or 1-for-20", "date": "<effective/record date if stated, else ''>", "headlines": [E-numbers]} as "splits": [...] ([] if none)."""
 
 MARKET_ADDON = """
 
@@ -217,7 +228,7 @@ def headlines_since(articles, start, tz, end=None):
     return out[:MAX_HEADLINES_PER_TICKER]
 
 
-def run_check(roles, news_db, api_key, tz, trigger, market_headlines=None):
+def run_check(roles, news_db, api_key, tz, trigger, market_headlines=None, event_headlines=None):
     """roles: {ticker: "held"|"candidate"}. market_headlines (optional, from
     fetch_market_headlines) adds the day's market-risk read to the SAME call.
     Returns the full result record (rec["market"] set when asked)."""
@@ -229,7 +240,7 @@ def run_check(roles, news_db, api_key, tz, trigger, market_headlines=None):
     news = {t: headlines_since((news_db.get(t) or {}).get("articles"), start, tz) for t in roles}
     rows = {t: {"ticker": t, "role": roles[t], "newsCount": len(news[t]), "headlines": news[t],
                 "state": "no_news" if not news[t] else "error", "severity": 0, "category": "none",
-                "reason": "", "confidence": "", "flagged": [], "deal": False, "dealNote": ""}
+                "reason": "", "confidence": "", "flagged": [], "deal": False, "dealNote": "", "split": False, "splitNote": ""}
             for t in roles}
     with_news = [t for t in roles if news[t]]
     market = None
@@ -240,7 +251,9 @@ def run_check(roles, news_db, api_key, tz, trigger, market_headlines=None):
             market.update(status="error", error="no market headlines found")
         rec["market"] = market
     want_market = bool(market and market_headlines)
-    if with_news or want_market:
+    want_events = bool(event_headlines)
+    rec["takeovers"], rec["splitNews"] = [], []
+    if with_news or want_market or want_events:
         if not api_key:
             rec.update(status="error", error="GEMINI_API_KEY is not set — add it to the .env file next to app.py and restart")
             if market:
@@ -255,9 +268,13 @@ def run_check(roles, news_db, api_key, tz, trigger, market_headlines=None):
             if want_market:
                 lines.append("\n\nMARKET-WIDE headlines:")
                 lines += [f"  M{i}. [{h['time']} ET, {h['provider']}] {h['title']}" for i, h in enumerate(market_headlines, 1)]
+            if want_events:
+                lines.append("\n\nM&A headlines:")
+                lines += [f"  E{i}. [{h['time']} ET, {h['provider']}] {h['title']} (tags: {', '.join(h.get('tickers') or []) or 'none'})"
+                          for i, h in enumerate(event_headlines, 1)]
             try:
                 rec["geminiCalled"] = True
-                out = call_gemini_json(api_key, NEWS_PROMPT + (MARKET_ADDON if want_market else ""),
+                out = call_gemini_json(api_key, NEWS_PROMPT + (MARKET_ADDON if want_market else "") + (EVENT_ADDON if want_events else ""),
                                        f"Now: {rec['runAt']}. Window: headlines {window_label}. Tickers and headlines:" + "\n".join(lines))
                 if want_market:
                     m = out.get("market") or {}
@@ -267,6 +284,25 @@ def run_check(roles, news_db, api_key, tz, trigger, market_headlines=None):
                                   flagged=[i for i in (m.get("headlines") or []) if isinstance(i, int) and 1 <= i <= len(market_headlines)])
                     if not market["riskLevel"]:
                         market.update(status="error", error="Gemini returned no market read")
+                if want_events:
+                    for e in out.get("takeovers") or []:
+                        if not isinstance(e, dict) or not (e.get("ticker") or e.get("company")):
+                            continue
+                        idx = [i for i in (e.get("headlines") or []) if isinstance(i, int) and 1 <= i <= len(event_headlines)]
+                        rec["takeovers"].append({
+                            "ticker": str(e.get("ticker") or "").upper(), "company": e.get("company") or "",
+                            "acquirer": e.get("acquirer") or "", "pricePerShare": e.get("pricePerShare") or "",
+                            "premium": e.get("premium") or "", "stage": str(e.get("stage") or "").lower(),
+                            "note": e.get("note") or "", "headlines": [event_headlines[i - 1] for i in idx]})
+                    for e in out.get("splits") or []:
+                        if not isinstance(e, dict) or not (e.get("ticker") or e.get("company")):
+                            continue
+                        idx = [i for i in (e.get("headlines") or []) if isinstance(i, int) and 1 <= i <= len(event_headlines)]
+                        kind = str(e.get("kind") or "").lower()
+                        rec["splitNews"].append({
+                            "ticker": str(e.get("ticker") or "").upper(), "company": e.get("company") or "",
+                            "kind": kind if kind in ("forward", "reverse") else "", "ratio": e.get("ratio") or "",
+                            "date": e.get("date") or "", "headlines": [event_headlines[i - 1] for i in idx]})
                 for r in out.get("results", []):
                     row = rows.get(str(r.get("ticker", "")).upper()) or rows.get(r.get("ticker"))
                     if not row or not row["newsCount"]:
@@ -278,7 +314,8 @@ def run_check(roles, news_db, api_key, tz, trigger, market_headlines=None):
                     row.update(state="negative" if neg else "clear", severity=sev if neg else 0,
                                category=cat, reason=r.get("reason") or "",
                                confidence=r.get("confidence") or "", flagged=idx,
-                               deal=bool(r.get("deal")), dealNote=(r.get("dealNote") or "") if r.get("deal") else "")
+                               deal=bool(r.get("deal")), dealNote=(r.get("dealNote") or "") if r.get("deal") else "",
+                               split=bool(r.get("split")), splitNote=(r.get("splitNote") or "") if r.get("split") else "")
                 for t in with_news:
                     if rows[t]["state"] == "error":
                         rows[t]["reason"] = "Gemini returned no verdict for this ticker"
@@ -298,23 +335,69 @@ def run_check(roles, news_db, api_key, tz, trigger, market_headlines=None):
     return rec
 
 
-def fetch_market_headlines(queries, tz):
-    """Market-wide headlines from the last MARKET_HEADLINE_MAX_AGE_H hours (Yahoo search)."""
+def fetch_market_headlines(queries, tz, max_age_h=MARKET_HEADLINE_MAX_AGE_H, limit=MAX_MARKET_HEADLINES):
+    """Market-wide headlines from the last max_age_h hours (Yahoo search),
+    with the tickers Yahoo tagged on each."""
     import yfinance as yf
     seen, items = set(), []
     for q in queries:
         try:
             for i in yf.Search(q, news_count=10).news or []:
                 t = i.get("providerPublishTime")
-                if not t or i.get("link") in seen or (time.time() - t) / 3600 > MARKET_HEADLINE_MAX_AGE_H:
+                if not t or i.get("link") in seen or (time.time() - t) / 3600 > max_age_h:
                     continue
                 seen.add(i.get("link"))
                 items.append((t, {"title": i.get("title", ""), "url": i.get("link", ""), "provider": i.get("publisher", ""),
-                                  "time": datetime.fromtimestamp(t, tz).strftime("%m-%d %H:%M")}))
+                                  "time": datetime.fromtimestamp(t, tz).strftime("%m-%d %H:%M"),
+                                  "tickers": [x for x in (i.get("relatedTickers") or []) if "=" not in x][:6]}))
         except Exception as e:
             log.warning(f"[MarketRisk] search FAIL: {q} | {e}")
     items.sort(key=lambda x: x[0], reverse=True)
-    return [h for _, h in items[:MAX_MARKET_HEADLINES]]
+    return [h for _, h in items[:limit]]
+
+
+def fetch_split_calendar(tz, market="US", back_days=7, ahead_days=60):
+    """Announced stock splits from Yahoo's split calendar (exact ratio and
+    pay date). market "US": plain symbols (BRK-B style allowed); "TSX": .TO.
+    Forward split (e.g. 2-for-1) vs reverse (1-for-20): reverse splits are
+    mostly distressed small caps — a warning, not an opportunity."""
+    import yfinance as yf
+    from datetime import date
+    cal, out, offset = yf.Calendars(), [], 0
+    start, end = date.today() - timedelta(days=back_days), date.today() + timedelta(days=ahead_days)
+    while offset < 1000:
+        df = cal.get_splits_calendar(start=start, end=end, limit=100, offset=offset)
+        if df is None or df.empty:
+            break
+        for sym, r in df.iterrows():
+            keep = sym.endswith(".TO") if market == "TSX" else "." not in sym
+            if not keep:
+                continue
+            old, new = r.get("Old Share Worth"), r.get("Share Worth")
+            try:
+                old, new = float(old), float(new)
+            except (TypeError, ValueError):
+                continue
+            if not old or not new or old == new:
+                continue
+            fwd = new > old
+            fmt = lambda x: f"{x:g}"
+            pay = r.get("Payable On")
+            out.append({"ticker": sym, "company": r.get("Company") or "", "kind": "forward" if fwd else "reverse",
+                        "ratio": f"{fmt(new / old if fwd else 1)}-for-{fmt(1 if fwd else old / new)}",
+                        "payDate": pd_date(pay), "optionable": bool(r.get("Optionable"))})
+        if len(df) < 100:
+            break
+        offset += 100
+    out.sort(key=lambda x: x["payDate"] or "")
+    return out
+
+
+def pd_date(x):
+    try:
+        return x.strftime("%Y-%m-%d")
+    except Exception:
+        return str(x)[:10] if x else None
 
 
 def review_losses(trades, news_db, check_runs, api_key, tz):
