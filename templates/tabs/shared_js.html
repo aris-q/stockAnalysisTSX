@@ -297,10 +297,18 @@ function _renderNewsCheck(rec, scrollTo) {
   document.getElementById('newsCheckSub').textContent =
     `${rec.runAt || ''} · ${rec.trigger === 'scheduler' ? 'scheduled' : 'manual'} run · headlines ${rec.window || 'today'} · ${rec.geminiCalled ? rec.model : 'Gemini not called (no news today)'}${rec.usage ? ` · Gemini today ${rec.usage.used}/${rec.usage.cap}` : ''}`;
   const rows = rec.tickers || [];
-  const group = (state, title, color, block) => {
+  // collapsed: the quiet groups (nothing negative / no news) stay one line
+  // with an expand toggle, so the popup opens on warnings and events.
+  const group = (state, title, color, block, collapsed) => {
     const g = rows.filter(r => r.state === state);
-    return `<div style="margin-bottom:12px"><div style="font-size:14px;font-weight:700;letter-spacing:1px;color:${color};margin-bottom:6px">${title} (${g.length})</div>`
-      + (g.length ? (block ? g.map(_ncRowHtml).join('') : `<div>${g.map(_ncRowHtml).join('')}</div>`) : '<div style="color:var(--muted);font-size:15px">none</div>') + '</div>';
+    const body = g.length ? (block ? g.map(_ncRowHtml).join('') : `<div>${g.map(_ncRowHtml).join('')}</div>`) : '<div style="color:var(--muted);font-size:15px">none</div>';
+    if (collapsed) {
+      if (!g.length) return '';
+      return `<div style="margin-bottom:8px"><div onclick="const b=this.nextElementSibling;const o=b.style.display!=='none';b.style.display=o?'none':'block';this.querySelector('.nc-arrow').textContent=o?'▸':'▾'"`
+        + ` style="cursor:pointer;font-size:14px;font-weight:700;letter-spacing:1px;color:${color}"><span class="nc-arrow">▸</span> ${title} (${g.length}) <span style="font-weight:400;color:var(--muted)">— click to show</span></div>`
+        + `<div class="nc-collapsed" style="display:none;margin-top:6px">${body}</div></div>`;
+    }
+    return `<div style="margin-bottom:12px"><div style="font-size:14px;font-weight:700;letter-spacing:1px;color:${color};margin-bottom:6px">${title} (${g.length})</div>` + body + '</div>';
   };
   let html = _ncMarketHtml(rec.market) + _ncEventsHtml(rec);
   if (rec.status === 'error') html += `<div style="border:1px solid var(--down);color:var(--down);border-radius:6px;padding:8px 10px;margin-bottom:12px;font-size:15px">Gemini analysis failed: ${_escNews(rec.error)}</div>`;
@@ -312,13 +320,18 @@ function _renderNewsCheck(rec, scrollTo) {
     + deals.map(r => `<div style="border:1px solid #a78bfa;border-radius:6px;padding:6px 10px;margin-bottom:6px;font-size:15px"><b>${_escNews(r.ticker)}</b> <span style="font-size:12px;color:var(--muted)">${r.role === 'held' ? 'HELD' : 'CANDIDATE'}</span> — ${_escNews(r.dealNote || r.reason)}`
       + (r.role === 'held' ? '' : ' <span style="color:#a78bfa">· upside likely capped near the deal price</span>') + '</div>').join('') + '</div>';
   if (c.error) html += group('error', 'NOT ANALYSED', 'var(--down)', false);
-  html += group('clear', '✓ NO NEGATIVE NEWS TODAY', 'var(--up)', false);
-  html += group('no_news', 'NO NEWS TODAY', 'var(--muted)', false);
+  html += group('clear', '✓ NO NEGATIVE NEWS TODAY', 'var(--up)', false, true);
+  html += group('no_news', 'NO NEWS TODAY', 'var(--muted)', false, true);
   html += '<div style="font-size:13px;color:var(--muted)">Headline-only judgement — flags only, nothing is bought or sold on it. Before 09:30 the window reaches back to the previous close, so overnight news is included.</div>';
   document.getElementById('newsCheckBody').innerHTML = html;
   m.dataset.runId = rec.runId || '';
   m.style.display = 'flex';
-  if (scrollTo) { const el = document.getElementById('nc-' + scrollTo); if (el && el.scrollIntoView) el.scrollIntoView({block: 'center'}); }
+  if (scrollTo) {
+    const el = document.getElementById('nc-' + scrollTo);
+    const box = el && el.closest('.nc-collapsed');
+    if (box) { box.style.display = 'block'; const a = box.previousElementSibling.querySelector('.nc-arrow'); if (a) a.textContent = '▾'; }
+    if (el && el.scrollIntoView) el.scrollIntoView({block: 'center'});
+  }
 }
 
 async function checkNewsCheck() {
