@@ -3004,6 +3004,17 @@ SCORING_DEFAULTS = {
         "change30dThreshold": 25.0,
         "penalty": -15
     },
+    # Size bonus (built 2026-10-02, OFF until set in the Scoring Matrix —
+    # task list #9, planned v12). US evidence: only >$200B names beat SPY
+    # more often than not (53% at 20d vs 18-29% for every smaller size);
+    # replay of v10-style + MA20 filter: +11.1% → +17.7% with +5 mega /
+    # +2.5 large. Bonus the giants, don't penalise small caps (that hurt).
+    "sizeBonus": {
+        "megaCapMin": 200e9,
+        "megaBonus": 0,
+        "largeCapMin": 50e9,
+        "largeBonus": 0
+    },
     # Qualify-stage guard: refuse to buy a ticker that's already deep into
     # a bad day — buying at, say, -7% intraday just to get stopped out by
     # the daily-drop stop an hour later wastes the buy+sell slippage for a
@@ -3869,6 +3880,7 @@ def run_tradeai_recommend():
         BKT_SC          = cfg.get("breakoutScore", {})
         SD_PENALTY      = cfg.get("sectorDiversity", {}).get("penalty", -15)
         OVEREXT_CFG     = cfg.get("overextension", {})
+        SIZE_CFG        = cfg.get("sizeBonus", {})
         ENTRY_GUARDS    = cfg.get("entryGuards", {})
         pm              = cfg.get("purchaseMatrix", {})
         max_slots       = int(pm.get("slots", 5))
@@ -4009,7 +4021,11 @@ def run_tradeai_recommend():
                 log.info(f"[Overextension] {ticker} RSI:{rsi} change30d:{change_30d}% Accelerating → {overextension_penalty} pts")
 
             # ── Breakout score + sector penalty (all buckets) ─────────────────
-            composite = composite + breakout_score + sector_penalty + insider_bonus + overextension_penalty
+            mcap = detail.get("marketCap") or 0
+            size_bonus = (float(SIZE_CFG.get("megaBonus", 0)) if mcap >= float(SIZE_CFG.get("megaCapMin", 200e9))
+                          else float(SIZE_CFG.get("largeBonus", 0)) if mcap >= float(SIZE_CFG.get("largeCapMin", 50e9)) else 0)
+
+            composite = composite + breakout_score + sector_penalty + insider_bonus + overextension_penalty + size_bonus
 
             # ── Signal Forecast Boost ─────────────────────────────────────────
             signal_boost = 0
@@ -4041,7 +4057,7 @@ def run_tradeai_recommend():
                 f"traj:{trajectory_bonus} stage:{stage_bonus} "
                 f"vol:{volume_bonus} analyst:{analyst_bonus} news:{news_bonus} "
                 f"breakout:{breakout_score} sector_pen:{sector_penalty} insider:{insider_bonus} "
-                f"overext:{overextension_penalty} "
+                f"overext:{overextension_penalty} size:{size_bonus} "
                 f"fc_dir:{signal_fc_direction} fc_return:{signal_fc_return}% fc_boost:{signal_boost} "
                 f"composite:{composite}"
             )
@@ -4060,6 +4076,7 @@ def run_tradeai_recommend():
                 "breakoutScore": breakout_score,
                 "sectorPenalty": sector_penalty,
                 "overextensionPenalty": overextension_penalty,
+                "sizeBonus": size_bonus,
                 "composite": composite,
                 "hasAI": ai.get("aiScore") is not None,
                 "signalFcDirection": signal_fc_direction,
