@@ -75,8 +75,11 @@
 
     /* WATCHLIST FORM */
     .watchlist-bar {
-      padding: 16px 32px;
-      border-bottom: 1px solid var(--border);
+      padding: 12px 16px;
+      margin-bottom: 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
       display: flex;
       align-items: center;
       gap: 12px;
@@ -1123,47 +1126,6 @@
   <div class="log-panel-body" id="logBody">Loading...</div>
 </div>
 
-<div class="watchlist-bar" id="watchlistBar">
-  {% for ticker in watchlist %}
-  <span class="ticker-tag" data-ticker="{{ ticker }}">
-    {{ ticker }}
-    <span class="holding-badge" style="display:none;font-size:9px;color:var(--accent2);margin-left:2px">🤖</span>
-    <a class="remove-link" href="/remove/{{ ticker }}" style="color:var(--down);text-decoration:none;font-size:11px;margin-left:4px">✕</a>
-  </span>
-  {% endfor %}
-  <form class="add-form" method="POST" action="/add">
-    <input name="ticker" placeholder="ADD TICKER" maxlength="8" />
-    <button type="submit" class="btn">+ ADD</button>
-  </form>
-</div>
-
-<script>
-(function() {
-  function applyHoldingLocks(holdingTickers) {
-    const held = new Set(holdingTickers);
-    document.querySelectorAll('#watchlistBar .ticker-tag').forEach(tag => {
-      const ticker = tag.dataset.ticker;
-      const badge = tag.querySelector('.holding-badge');
-      const removeLink = tag.querySelector('.remove-link');
-      if (held.has(ticker)) {
-        if (badge) badge.style.display = 'inline';
-        if (removeLink) { removeLink.style.display = 'none'; }
-        tag.title = 'Held by TradeAI — cannot remove manually';
-      } else {
-        if (badge) badge.style.display = 'none';
-        if (removeLink) removeLink.style.display = 'inline';
-      }
-    });
-    console.log('[WatchlistBar] holding locks applied | held:', [...held]);
-  }
-
-  fetch('/api/holding-tickers')
-    .then(r => r.json())
-    .then(d => applyHoldingLocks(d.holdingTickers || []))
-    .catch(e => console.error('[WatchlistBar] holding-tickers FAIL:', e));
-})();
-</script>
-
 <div class="tabs" id="mainTabs">
   <div class="tab active" onclick="showTab('watchlist', this)" data-tab="watchlist">WATCHLIST</div>
   <div class="tab" onclick="showTab('macro', this);loadMacro();" data-tab="macro">MACRO</div>
@@ -1177,6 +1139,47 @@
 <div class="content">
 
   <div class="tab-panel active" id="tab-watchlist">
+    <div class="watchlist-bar" id="watchlistBar">
+      {% for ticker in watchlist %}
+      <span class="ticker-tag" data-ticker="{{ ticker }}">
+        {{ ticker }}
+        <span class="holding-badge" style="display:none;font-size:9px;color:var(--accent2);margin-left:2px">🤖</span>
+        <a class="remove-link" href="/remove/{{ ticker }}" style="color:var(--down);text-decoration:none;font-size:11px;margin-left:4px">✕</a>
+      </span>
+      {% endfor %}
+      <form class="add-form" method="POST" action="/add">
+        <input name="ticker" placeholder="ADD TICKER" maxlength="8" />
+        <button type="submit" class="btn">+ ADD</button>
+      </form>
+    </div>
+
+    <script>
+    (function() {
+      function applyHoldingLocks(holdingTickers) {
+        const held = new Set(holdingTickers);
+        document.querySelectorAll('#watchlistBar .ticker-tag').forEach(tag => {
+          const ticker = tag.dataset.ticker;
+          const badge = tag.querySelector('.holding-badge');
+          const removeLink = tag.querySelector('.remove-link');
+          if (held.has(ticker)) {
+            if (badge) badge.style.display = 'inline';
+            if (removeLink) { removeLink.style.display = 'none'; }
+            tag.title = 'Held by TradeAI — cannot remove manually';
+          } else {
+            if (badge) badge.style.display = 'none';
+            if (removeLink) removeLink.style.display = 'inline';
+          }
+        });
+        console.log('[WatchlistBar] holding locks applied | held:', [...held]);
+      }
+
+      fetch('/api/holding-tickers')
+        .then(r => r.json())
+        .then(d => applyHoldingLocks(d.holdingTickers || []))
+        .catch(e => console.error('[WatchlistBar] holding-tickers FAIL:', e));
+    })();
+    </script>
+
     <div id="priceRefreshBar" style="display:none;align-items:center;gap:12px;margin-bottom:20px;padding:12px 16px;background:rgba(200,241,53,0.08);border:1px solid rgba(200,241,53,0.3);border-radius:8px;">
       <span style="font-family:'Syne',sans-serif;font-weight:700;color:var(--warn);font-size:13px;">⚡ UPDATING ALL PRICES...</span>
     </div>
