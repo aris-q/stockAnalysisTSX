@@ -1098,23 +1098,31 @@ def _macro_risk_signal():
     fed_chg = (indicators.get("fed_rate") or {}).get("change")
     fed_hiking = fed_chg is not None and fed_chg >= 0.05
 
-    risk_off = inverted or headline_bearish or payrolls_negative or unemployment_spiking or inflation_reaccelerating or fed_hiking
-
-    reasons = []
-    if inverted:
-        reasons.append(f"yield curve inverted ({yc}%)")
-    if headline_bearish:
-        reasons.append(f"{neg} bearish vs {pos} bullish macro headline keyword hits")
-    if payrolls_negative:
-        reasons.append(f"Nonfarm Payrolls fell {payrolls}k m/m — outright job losses")
-    if unemployment_spiking:
-        reasons.append(f"Unemployment rate jumped +{unemp_chg}pt m/m")
+    # Only the triggers enabled in regime.macroGateTriggers set riskOff;
+    # the rest are still reported, tagged "watch only" (see SCORING_DEFAULTS).
+    enabled = (load_scoring_config().get("regime") or {}).get("macroGateTriggers") or {}
     if inflation_reaccelerating:
         which = "CPI" if (cpi_chg is not None and cpi_chg >= 0.3) else "Core PCE"
         chg = cpi_chg if which == "CPI" else pce_chg
-        reasons.append(f"{which} YoY reaccelerating (+{chg}pt vs last month)")
-    if fed_hiking:
-        reasons.append(f"Fed Funds Rate rose +{fed_chg}pt m/m — tightening")
+    triggers = [
+        ("yieldCurveInverted",  inverted,                 lambda: f"yield curve inverted ({yc}%)"),
+        ("headlinesBearish",    headline_bearish,         lambda: f"{neg} bearish vs {pos} bullish macro headline keyword hits"),
+        ("payrollsNegative",    payrolls_negative,        lambda: f"Nonfarm Payrolls fell {payrolls}k m/m — outright job losses"),
+        ("unemploymentSpiking", unemployment_spiking,     lambda: f"Unemployment rate jumped +{unemp_chg}pt m/m"),
+        ("inflationReaccel",    inflation_reaccelerating, lambda: f"{which} YoY reaccelerating (+{chg}pt vs last month)"),
+        ("fedHiking",           fed_hiking,               lambda: f"Fed Funds Rate rose +{fed_chg}pt m/m — tightening"),
+    ]
+    risk_off = False
+    reasons = []
+    watch_only = []
+    for key, fired, text in triggers:
+        if not fired:
+            continue
+        if enabled.get(key, True):
+            risk_off = True
+            reasons.append(text())
+        else:
+            watch_only.append(text())
     if not risk_off and headline_bullish:
         reasons.append(f"{pos} bullish vs {neg} bearish macro headline keyword hits")
 
@@ -1123,7 +1131,7 @@ def _macro_risk_signal():
     return {
         "riskOff": risk_off, "signal": signal,
         "yieldCurve": yc, "negHits": neg, "posHits": pos,
-        "reasons": reasons, "macroFetchedAt": macro.get("fetchedAt"),
+        "reasons": reasons, "watchOnly": watch_only, "macroFetchedAt": macro.get("fetchedAt"),
     }
 
 
@@ -2984,6 +2992,21 @@ SCORING_DEFAULTS = {
     "regime": {
         "vixNoBuyAbove": 30,
         "macroRiskGateEnabled": True,
+        # Which _macro_risk_signal triggers actually block buys (2026-11-07,
+        # same change as stock-analysis). Backtest 1990-2026 on ^GSPTSE (FRED
+        # monthly, cash when gated): all triggers on = gated ~56% of months,
+        # CAGR 1.5-3.0% vs 6.1% always-in; jobs-only (payrolls /
+        # unemployment) gated ~20%, CAGR 5.0-5.3%. Adding CPI back to
+        # jobs-only lowered CAGR to 4.4-4.6%. Triggers set False still show
+        # on the MACRO badge as "watch only", they just don't stop buys.
+        "macroGateTriggers": {
+            "payrollsNegative":    True,
+            "unemploymentSpiking": True,
+            "inflationReaccel":    False,
+            "fedHiking":           False,
+            "yieldCurveInverted":  False,
+            "headlinesBearish":    False
+        },
         "trendFilterEnabled": True,
         "trendFilterTicker": "SPY",
         "trendFilterDays": 200,
@@ -5981,6 +6004,31 @@ def _migrate_reentry_rule_version():
 
 
 _migrate_reentry_rule_version()
+
+
+def _migrate_macro_gate_version():
+    """One-time (2026-11-07): the macro gate now blocks buys only on the jobs
+    triggers (regime.macroGateTriggers) — Fed-hike / CPI / yield-curve /
+    headline triggers become watch-only. Own Recommend version, keyed on the
+    latest snapshot not yet having macroGateTriggers."""
+    try:
+        last = load_recommend_versions()["versions"][-1]
+        if "macroGateTriggers" in ((last.get("configSnapshot") or {}).get("regime") or {}):
+            return
+        cfg = load_scoring_config()  # fills the new defaults in
+        save_json(SCORING_CONFIG_PATH, cfg)
+        bump_recommend_version(
+            ["Macro gate blocks new buys only on job losses (payrolls < 0) or an unemployment jump (+0.3pt m/m)",
+             "Fed-hike, CPI/Core PCE, yield-curve and headline triggers now watch-only (shown on the MACRO badge, don't block buys)",
+             "Why: 1990-2026 backtest on the TSX index — all triggers gated ~56% of months (CAGR 1.5-3.0% vs 6.1%); jobs-only ~20% (CAGR 5.0-5.3%)",
+             "VIX, trend and FOMC gates unchanged; re-entry rule and MA20 filter unchanged"],
+            label="Macro gate: jobs triggers only",
+            config_snapshot=cfg, code_change=True)
+    except Exception as e:
+        log.error(f"[RecVersion] macro gate version migration FAIL: {e}")
+
+
+_migrate_macro_gate_version()
 
 _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
 _scheduler_thread.start()

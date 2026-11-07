@@ -719,6 +719,10 @@ function toggleTradeSection(bodyId, arrowId) {
   if (arrow) arrow.textContent = opening ? '▾ collapse' : '▸ expand';
 }
 
+// Macro-gate triggers the 1990-2026 backtest found no edge in (off by
+// default, watch-only). The jobs triggers stay on regardless of this field.
+const MACRO_STRICT_KEYS = ['inflationReaccel', 'fedHiking', 'yieldCurveInverted', 'headlinesBearish'];
+
 async function toggleScoringMatrix() {
   const body = document.getElementById('scoringMatrixBody');
   const arrow = document.getElementById('scoringMatrixArrow');
@@ -742,6 +746,7 @@ async function toggleScoringMatrix() {
         ${field('matrixEarnings', 'Earnings blackout days', pm.earningsBlackoutDays ?? 3)}
         ${field('matrixRotationGap', 'Rotation score advantage', pm.rotationMinScoreGap ?? 15)}
         ${field('matrixRotationCooldown', 'Re-entry cooldown (trading days)', pm.rotationCooldownTradingDays ?? 5)}
+        ${field('matrixMacroStrict', 'Macro gate: also block on Fed hike / CPI / yield curve / headlines (1 = on, 0 = off)', MACRO_STRICT_KEYS.some(k => cfg.regime?.macroGateTriggers?.[k]) ? 1 : 0)}
       </div>
       <div><div style="font-size:15px;letter-spacing:1px;color:var(--accent);margin-bottom:8px">BUCKET WEIGHTS</div>
         ${field('matrixMomentumDream', 'Momentum Dream', weights.Momentum?.dream ?? .15)}
@@ -782,6 +787,11 @@ async function saveScoringMatrix() {
     pm.minBuyComposite = number('matrixMinBuy'); pm.slots = number('matrixSlots');
     pm.maxDeployPct = number('matrixDeploy'); pm.earningsBlackoutDays = number('matrixEarnings');
     pm.rotationMinScoreGap = number('matrixRotationGap'); pm.rotationCooldownTradingDays = number('matrixRotationCooldown');
+    const macroStrict = number('matrixMacroStrict');
+    if (macroStrict !== 0 && macroStrict !== 1) throw new Error('Macro gate field must be 1 or 0');
+    const regime = cfg.regime || (cfg.regime = {});
+    const triggers = regime.macroGateTriggers || (regime.macroGateTriggers = {});
+    MACRO_STRICT_KEYS.forEach(k => { triggers[k] = macroStrict === 1; });
     weights.Momentum.dream = number('matrixMomentumDream'); weights.Momentum.ai = number('matrixMomentumRule');
     weights.Reversal.dream = number('matrixReversalDream'); weights.Reversal.ai = number('matrixReversalRule');
     weights.SmartMoney.dream = number('matrixSmartDream'); weights.SmartMoney.ai = number('matrixSmartRule');
@@ -1056,8 +1066,10 @@ function renderTradeAI(data) {
     riskOn:  { c: 'var(--up)',   bg: 'rgba(74,222,128,0.12)',  icon: '📈', label: 'RISK-ON' },
     neutral: { c: 'var(--muted)',bg: 'transparent',            icon: '•',  label: 'NEUTRAL' },
   }[macroSignal.signal || 'neutral'];
-  const macroBadgeTitle = (macroSignal.reasons && macroSignal.reasons.length
-    ? macroSignal.reasons.join('; ')
+  const macroWatch = (macroSignal.watchOnly || []).map(r => r + ' (watch only — not blocking buys)');
+  const macroLines = [...(macroSignal.reasons || []), ...macroWatch];
+  const macroBadgeTitle = (macroLines.length
+    ? macroLines.join('; ')
     : 'No notable macro signal — click to view Macro tab').replace(/"/g, '&quot;');
   const macroBadge = `
     <button onclick="goToMacroTab()" title="${macroBadgeTitle}" style="display:flex;align-items:center;gap:5px;font-size:15px;font-weight:700;padding:5px 10px;border-radius:6px;border:1px solid ${macroBadgeStyle.c};background:${macroBadgeStyle.bg};color:${macroBadgeStyle.c};cursor:pointer;font-family:'DM Mono',monospace;white-space:nowrap">
