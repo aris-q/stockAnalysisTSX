@@ -934,6 +934,60 @@ def fetch_sp500_tickers():
     return sp500
 
 
+# ── REDDIT BUZZ ───────────────────────────────────────────────────────────────
+# Same sources as stock-analysis/fetcher.py (US forums). Canadian subreddits
+# need Reddit API approval, so TSX shows the US view as stats only.
+
+APEWISDOM_URL = "https://apewisdom.io/api/v1.0/filter/all-stocks/page/{page}"
+TRADESTIE_URL = "https://tradestie.com/api/v1/apps/reddit"
+
+def fetch_reddit_buzz(pages=2):
+    """Most-mentioned tickers across the Reddit stock forums (WallStreetBets,
+    r/stocks, r/investing, ...) from ApeWisdom — free, no key. ~100 rows a
+    page, ranked by mentions over the last 24h, each with the previous 24h's
+    count to compare against. Returns [] on failure (caller keeps the last
+    good pull)."""
+    rows = []
+    for page in range(1, pages + 1):
+        try:
+            r = requests.get(APEWISDOM_URL.format(page=page), timeout=15)
+            r.raise_for_status()
+            for x in r.json().get("results", []):
+                mentions = int(x.get("mentions") or 0)
+                prev = int(x.get("mentions_24h_ago") or 0)
+                rows.append({
+                    "rank": x.get("rank"), "ticker": (x.get("ticker") or "").upper(),
+                    "name": (x.get("name") or "").replace("&amp;", "&"),
+                    "mentions": mentions, "mentions24hAgo": prev,
+                    "mentionsChangePct": round((mentions - prev) / prev * 100, 1) if prev else None,
+                    "upvotes": int(x.get("upvotes") or 0),
+                    "rank24hAgo": x.get("rank_24h_ago"),
+                })
+        except Exception as e:
+            log.warning(f"[Reddit] ApeWisdom page {page} FAIL: {e}")
+            break
+    log.info(f"[Reddit] ApeWisdom OK: {len(rows)} tickers")
+    return rows
+
+
+def fetch_wsb_sentiment():
+    """WallStreetBets bullish/bearish read for its top ~50 tickers (Tradestie,
+    free, no key). Rough — it matches words, so e.g. "AI" shows up as a
+    ticker. Display only. Returns {ticker: {"sentiment", "score", "comments"}}."""
+    try:
+        r = requests.get(TRADESTIE_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        out = {(x.get("ticker") or "").upper(): {"sentiment": x.get("sentiment"),
+                                                  "score": x.get("sentiment_score"),
+                                                  "comments": x.get("no_of_comments")}
+               for x in r.json()}
+        log.info(f"[Reddit] Tradestie OK: {len(out)} tickers")
+        return out
+    except Exception as e:
+        log.warning(f"[Reddit] Tradestie FAIL: {e}")
+        return {}
+
+
 def fetch_tsx60_tickers():
     """Fetch TSX 60 components — hardcoded as they rarely change."""
     tsx60 = [

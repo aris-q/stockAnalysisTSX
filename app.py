@@ -1,6 +1,6 @@
 from flask import Flask, render_template, request, redirect, jsonify, make_response
-import json, os, logging, threading, time, hashlib, statistics
-from config import WATCHLIST, OUTPUT_PATH, NEWS_PATH, WATCHLIST_PATH, TRADES_AI_PATH, TRADE_AI_CANDIDATES_PATH
+import json, os, logging, threading, time, hashlib, statistics, re
+from config import WATCHLIST, OUTPUT_PATH, NEWS_PATH, WATCHLIST_PATH, TRADES_AI_PATH, TRADE_AI_CANDIDATES_PATH, REDDIT_BUZZ_PATH, REDDIT_HISTORY_PATH, REDDIT_STATS_PATH
 try:
     from config import FRED_API_KEY, NEWSAPI_KEY, MACRO_PATH
 except ImportError:
@@ -47,7 +47,7 @@ def _epoch_for_date(date_str, epochs):
         else:
             break
     return matched
-from fetcher import fetch_yfinance, fetch_daily_gainers, fetch_news, fetch_price_only, fetch_macro_data, fetch_dream_candidates, fetch_trade_detail, fetch_ticker_news, fetch_live_prices, fetch_prev_closes, fetch_index_trend_signal, _next_fomc_date, FOMC_MEETING_DATES
+from fetcher import fetch_yfinance, fetch_daily_gainers, fetch_news, fetch_price_only, fetch_macro_data, fetch_dream_candidates, fetch_trade_detail, fetch_ticker_news, fetch_live_prices, fetch_prev_closes, fetch_index_trend_signal, _next_fomc_date, FOMC_MEETING_DATES, fetch_reddit_buzz, fetch_wsb_sentiment
 from compute import process_watchlist
 from ai_summary import generate_summary, generate_recommendations, generate_followup
 from refresh_manager import check_what_needs_refresh, now, hours_since
@@ -5739,6 +5739,189 @@ ET = ZoneInfo("America/New_York")
 SCHEDULER_CONFIG_PATH = "output/scheduler_config.json"
 SCHEDULER_STATE_PATH  = "output/scheduler_state.json"
 
+# ═══════════════════════════ REDDIT STATS (no trading) ═════════════════
+# US Reddit buzz (ApeWisdom), stats only (2026-11-13). Canadian subreddits
+# need Reddit API approval since Nov 2025, and US Reddit barely mentions
+# TSX names (2-4 a day, 2-13 mentions), so this tracks the US forums and
+# measures how each day's "rising" names did afterwards vs SPY — the same
+# rising rule the stock-analysis Reddit paper account buys on, so these
+# stats double as a check on that account's picks.
+REDDIT_RULES = {
+    "topN":                 100,   # "on Reddit's radar" = among the 100 most-mentioned tickers
+    "minMentions":          20,
+    "minMentionsChangePct": 50,    # rising fast: at least +50% mentions vs the previous 24h
+    "horizons":             [1, 5, 10],  # trading days after the snapshot day's close
+}
+_REDDIT_FUND_WORDS = ("ETF", " TRUST", " FUND", "PROSHARES", "DIREXION", "ISHARES", "SPDR", "INVESCO QQQ", "VANGUARD")
+
+
+def _reddit_is_fund(row):
+    name = " " + (row.get("name") or "").upper()
+    return any(w in name for w in _REDDIT_FUND_WORDS)
+
+
+def _reddit_rising(rows):
+    """Same rule as the stock-analysis Reddit account: top N by mentions,
+    enough mentions, rising fast vs the previous 24h, not a fund."""
+    rr = REDDIT_RULES
+    return [r for r in rows[:rr["topN"]]
+            if not _reddit_is_fund(r) and r["mentions"] >= rr["minMentions"]
+            and r.get("mentionsChangePct") is not None and r["mentionsChangePct"] >= rr["minMentionsChangePct"]]
+
+
+def _refresh_reddit_buzz():
+    """Pull ApeWisdom (+ Tradestie WSB mood), keep the last good pull if the
+    source is down, and store one snapshot per day (overwritten through the
+    day, so each date keeps its latest read) with that day's rising list."""
+    buzz = load_json(REDDIT_BUZZ_PATH, {})
+    rows = fetch_reddit_buzz()
+    if not rows:
+        log.warning("[Reddit] no fresh buzz — keeping the last good pull")
+        return buzz
+    buzz.update(rows=rows, fetchedAt=ts())
+    sentiment = fetch_wsb_sentiment()
+    if sentiment:
+        buzz["sentiment"] = sentiment
+    save_json(REDDIT_BUZZ_PATH, buzz)
+    try:
+        hist = load_json(REDDIT_HISTORY_PATH, {"snapshots": []})
+        today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+        snaps = [s for s in hist.get("snapshots", []) if s.get("date") != today_str]
+        snaps.append({"date": today_str, "takenAt": ts(),
+                      "rising": [r["ticker"] for r in _reddit_rising(rows)],
+                      "top": [r["ticker"] for r in rows[:REDDIT_RULES["topN"]] if not _reddit_is_fund(r)],
+                      "rows": [{k: r[k] for k in ("rank", "ticker", "mentions", "mentions24hAgo", "upvotes")} for r in rows]})
+        hist["snapshots"] = snaps
+        save_json(REDDIT_HISTORY_PATH, hist)
+    except Exception as e:
+        log.warning(f"[Reddit] history save FAIL: {e}")
+    return buzz
+
+
+def _reddit_group_stats(rets):
+    """n / average / median / average vs SPY / % that beat SPY for a list of
+    (return, spy_return) pairs."""
+    if not rets:
+        return {"n": 0}
+    r = [a for a, _ in rets]
+    x = [a - b for a, b in rets]
+    return {"n": len(rets), "avgPct": round(statistics.mean(r), 2), "medianPct": round(statistics.median(r), 2),
+            "avgVsSpyPct": round(statistics.mean(x), 2), "beatSpyPct": round(sum(v > 0 for v in x) / len(x) * 100)}
+
+
+def compute_reddit_stats():
+    """For every saved day: return of that day's rising names from the
+    snapshot day's close to 1/5/10 trading days later, vs SPY over the same
+    days. "All top 100" (non-fund) is the baseline — rising only adds
+    something if it beats that. Cached in REDDIT_STATS_PATH."""
+    import yfinance as yf
+    snaps = load_json(REDDIT_HISTORY_PATH, {"snapshots": []}).get("snapshots", [])
+    if not snaps:
+        return {}
+    tickers = sorted({t for s in snaps for t in s.get("top", [])} | {"SPY"})
+    start = (datetime.strptime(min(s["date"] for s in snaps), "%Y-%m-%d") - timedelta(days=5)).strftime("%Y-%m-%d")
+    closes = yf.download(tickers, start=start, progress=False, auto_adjust=True, threads=True)["Close"]
+    days = [d.strftime("%Y-%m-%d") for d in closes.index]
+
+    def ret(t, i, h):
+        if t not in closes or i + h >= len(days):
+            return None
+        a, b = closes[t].iloc[i], closes[t].iloc[i + h]
+        if a != a or b != b or not a:   # NaN or zero
+            return None
+        return (b / a - 1) * 100
+
+    groups = {"rising": {h: [] for h in REDDIT_RULES["horizons"]}, "top": {h: [] for h in REDDIT_RULES["horizons"]}}
+    per_day = []
+    for s in sorted(snaps, key=lambda s: s["date"]):
+        if s["date"] not in days:
+            continue   # weekend/holiday snapshot — no close that day
+        i = days.index(s["date"])
+        day_rows = []
+        for t in s.get("rising", []):
+            row = {"ticker": t}
+            for h in REDDIT_RULES["horizons"]:
+                r, spy = ret(t, i, h), ret("SPY", i, h)
+                if r is not None and spy is not None:
+                    groups["rising"][h].append((r, spy))
+                    row[f"vsSpy{h}d"] = round(r - spy, 2)
+            day_rows.append(row)
+        for t in s.get("top", []):
+            for h in REDDIT_RULES["horizons"]:
+                r, spy = ret(t, i, h), ret("SPY", i, h)
+                if r is not None and spy is not None:
+                    groups["top"][h].append((r, spy))
+        per_day.append({"date": s["date"], "rising": day_rows})
+
+    stats = {
+        "computedAt": ts(),
+        "days": len(per_day),
+        "summary": {g: {f"{h}d": _reddit_group_stats(v) for h, v in hs.items()} for g, hs in groups.items()},
+        "perDay": per_day,
+    }
+    save_json(REDDIT_STATS_PATH, stats)
+    log.info(f"[Reddit] stats computed | days:{len(per_day)} rising-1d n:{stats['summary']['rising']['1d']['n']}")
+    return stats
+
+
+def _sched_reddit_stats():
+    try:
+        compute_reddit_stats()
+    except Exception as e:
+        log.error(f"[Reddit] stats FAIL: {e}", exc_info=True)
+
+
+def _reddit_tsx_matches(rows):
+    """US Reddit tickers that are the same company as a TSX Composite name
+    (same symbol AND overlapping company-name words — "NA" on US Reddit is
+    Nano Labs, not National Bank). Returns {us_ticker: tsx_ticker}."""
+    from fetcher import fetch_tsx_composite_tickers
+    tsx = set(fetch_tsx_composite_tickers())
+    names = {c["ticker"]: (c.get("name") or "") for c in load_json(DREAM_PATH, {}).get("candidates", [])}
+    stop = {"inc", "corp", "the", "ltd", "group", "company", "limited", "trust", "holdings", "co", "cls"}
+    words = lambda s: {w for w in re.findall(r"[a-z]+", s.lower()) if len(w) > 2 and w not in stop}
+    out = {}
+    for r in rows:
+        tsx_t = r["ticker"].replace(".", "-") + ".TO"
+        if tsx_t in tsx and words(names.get(tsx_t, "")) & words(r.get("name") or ""):
+            out[r["ticker"]] = tsx_t
+    return out
+
+
+@app.route("/reddit", methods=["GET"])
+def get_reddit():
+    buzz = load_json(REDDIT_BUZZ_PATH, {})
+    rows = buzz.get("rows", [])
+    rising = {r["ticker"] for r in _reddit_rising(rows)}
+    tsx_match = _reddit_tsx_matches(rows)
+    held = set(load_trades_ai().get("holdings", {}))
+    sentiment = buzz.get("sentiment", {})
+    table = [{**r, "isFund": _reddit_is_fund(r), "rising": r["ticker"] in rising,
+              "tsxTicker": tsx_match.get(r["ticker"]), "heldTsx": tsx_match.get(r["ticker"]) in held,
+              "sentiment": sentiment.get(r["ticker"])} for r in rows[:50]]
+    return jsonify({
+        "buzz": table,
+        "risingCount": len(rising),
+        "tsxMentioned": [{"us": u, "tsx": t, "mentions": next(r["mentions"] for r in rows if r["ticker"] == u)} for u, t in tsx_match.items()],
+        "fetchedAt": buzz.get("fetchedAt"),
+        "historyDays": len(load_json(REDDIT_HISTORY_PATH, {"snapshots": []}).get("snapshots", [])),
+        "stats": load_json(REDDIT_STATS_PATH, {}),
+        "rules": REDDIT_RULES,
+    })
+
+
+@app.route("/reddit/refresh", methods=["POST"])
+def reddit_refresh():
+    """Pull fresh Reddit counts, then recompute the stats."""
+    try:
+        buzz = _refresh_reddit_buzz()
+        stats = compute_reddit_stats()
+        return jsonify({"status": "ok", "count": len(buzz.get("rows", [])), "statsDays": stats.get("days", 0)})
+    except Exception as e:
+        log.error(f"[Reddit] refresh FAIL: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 SCHEDULER_DEFAULTS = {
     "enabled": True,
     "sellCheckHours":   [9, 10, 11],
@@ -5755,6 +5938,7 @@ SCHEDULER_DEFAULTS = {
     "optionsTime":      "17:15",  # daily, after the close — end-of-day options volume/OI (via US-listed twin) for every ticker ever bought or simulated
     "newsTimes":        ["09:20", "11:47", "14:47"],  # the only scheduled news fetch — before the open (catches the ~53% published after close/overnight), then just before the 12:00 and 15:00 Recommends; :47 avoids the 5-min sell checks
     "tuningTime":       "16:15",  # Friday only — weekly missed-gainer tuning check
+    "redditStatsTime":  "16:30",  # daily, after the close — final rising-names stats on closing prices (the Reddit pull + stats also run in every hourly Recommend slot)
     "marketHolidays": [
         "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
         "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
@@ -5873,7 +6057,9 @@ def _scheduler_loop():
                     slots.append((f"recommend-{hhmm}", "hourlyRecommend",
                                   [("price-refresh", run_tradeai_price_refresh),
                                    ("rule-assess", run_tradeai_analyze),
-                                   ("recommend", run_tradeai_recommend)]))
+                                   ("recommend", run_tradeai_recommend),
+                                   ("reddit-buzz", _refresh_reddit_buzz),
+                                   ("reddit-stats", _sched_reddit_stats)]))
             if hhmm == cfg.get("macroTime"):
                 slots.append((f"macro-{hhmm}", "macroRefresh",
                               [("macro-refresh", run_macro_refresh)]))
@@ -5903,6 +6089,9 @@ def _scheduler_loop():
                                ("identify", run_tradeai_identify),
                                ("fetch", run_tradeai_fetch),
                                ("rule-assess", run_tradeai_analyze)]))
+            if hhmm == cfg.get("redditStatsTime"):
+                slots.append((f"redditStats-{hhmm}", "redditStats",
+                              [("reddit-stats", _sched_reddit_stats)]))
             if hhmm == cfg.get("tuningTime") and now_et.weekday() == 4:  # Friday
                 slots.append((f"tuning-{today}", "tuningCheck",
                               [("tuning-analysis", _sched_tuning_check)]))

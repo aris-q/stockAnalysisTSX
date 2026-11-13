@@ -1132,6 +1132,7 @@
   <div class="tab" onclick="showTab('admin', this)" data-tab="admin">ADMIN</div>
   <div class="tab" onclick="showTab('dream', this);loadDream();" data-tab="dream">🌟 DREAM</div>
   <div class="tab" onclick="showTab('tradeai', this);loadTradeAI(true);" data-tab="tradeai">🤖 TRADEAI</div>
+  <div class="tab" onclick="showTab('reddit', this);loadReddit(true);" data-tab="reddit">🗣️ REDDIT</div>
   <div class="tab" onclick="showTab('valsummary', this);loadValSummary();" data-tab="valsummary">📈 VAL SUMMARY</div>
   <div class="tab" onclick="showTab('signal', this);loadSignal();" data-tab="signal">✅ VALIDATION</div>
 </div>
@@ -1206,6 +1207,10 @@
     <div id="tradeaiContent"><div class="loading">Click the 🤖 TRADEAI tab to load AI simulation...</div></div>
   </div>
 
+  <div class="tab-panel" id="tab-reddit">
+    <div id="redditContent"><div class="loading">Click the 🗣️ REDDIT tab to load Reddit stats...</div></div>
+  </div>
+
   <div class="tab-panel" id="tab-valsummary">
     <div id="valSummaryContent"><div class="loading">Click the 📈 VAL SUMMARY tab to load the version summary...</div></div>
   </div>
@@ -1231,6 +1236,7 @@
 {% include 'tabs/dream_tab.html' %}
 {% include 'tabs/admin_tab.html' %}
 {% include 'tabs/tradeai_tab.html' %}
+{% include 'tabs/reddit_tab.html' %}
 {% include 'tabs/valsummary_tab.html' %}
 {% include 'tabs/signal_tab.html' %}
 

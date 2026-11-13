@@ -65,6 +65,13 @@ TRADES_PATH  = "output/trades.json"
 TRADE_CANDIDATES_PATH = "output/trade_candidates.json"
 TRADES_AI_PATH = "output/trades_ai.json"
 TRADE_AI_CANDIDATES_PATH = "output/trade_ai_candidates.json"
+# Reddit stats (2026-11-13) — US Reddit buzz (ApeWisdom), stats only, no
+# trading. Canadian forums need Reddit API approval (Responsible Builder
+# Policy, Nov 2025), so this tracks the US forums the stock-analysis
+# Reddit account trades on.
+REDDIT_BUZZ_PATH = "output/reddit_buzz.json"         # latest pull
+REDDIT_HISTORY_PATH = "output/reddit_history.json"   # one snapshot per day (with that day's rising list)
+REDDIT_STATS_PATH = "output/reddit_stats.json"       # forward returns of each day's rising names vs SPY
 OLLAMA_URL   = "http://localhost:11434"
 # OLLAMA_MODEL = "gemma2:9b"
 OLLAMA_MODEL = "phi3:mini"

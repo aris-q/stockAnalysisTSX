@@ -1,0 +1,162 @@
+<script>
+  {%- raw %}
+// ── REDDIT (stats only) ──────────────────────────────────────────────────
+// US Reddit buzz (ApeWisdom) with no trading: the top-50 list, the TSX
+// companies US Reddit mentions, and how each day's "rising" names did
+// afterwards vs SPY. Rising = the stock-analysis Reddit account's buy rule,
+// so these stats also check that account's picks. Canadian subreddits need
+// Reddit API approval, so they aren't covered.
+let redditLoaded = false;
+
+function _redditEsc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+function _redditPct(v, digits) {
+  return v == null ? '—' : (v >= 0 ? '+' : '') + Number(v).toFixed(digits ?? 2) + '%';
+}
+function _redditColor(v) {
+  return v > 0 ? 'var(--up)' : (v < 0 ? 'var(--down)' : 'var(--muted)');
+}
+
+async function loadReddit(force) {
+  if (redditLoaded && !force) return;
+  const el = document.getElementById('redditContent');
+  if (!el) return;
+  if (!redditLoaded) el.innerHTML = '<div class="loading">Loading Reddit stats...</div>';
+  try {
+    const data = await fetch('/reddit?t=' + Date.now(), {cache: 'no-store'}).then(r => r.json());
+    el.innerHTML = renderReddit(data);
+    redditLoaded = true;
+    console.log('[Reddit] loaded | buzz:' + (data.buzz || []).length + ' days:' + data.historyDays);
+  } catch (e) {
+    el.innerHTML = '<span style="color:var(--down)">Could not load Reddit stats.</span>';
+    console.error('[Reddit] load FAIL:', e);
+  }
+}
+
+async function refreshReddit(btn) {
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ REFRESHING...';
+  try {
+    const r = await fetch('/reddit/refresh', {method: 'POST'}).then(res => res.json());
+    if (r.error) throw new Error(r.error);
+    await loadReddit(true);
+    console.log('[Reddit] refreshed | ' + r.count + ' tickers, ' + r.statsDays + ' days of stats');
+  } catch (e) {
+    alert('Reddit refresh did not complete: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
+function _redditSection(id, emoji, title, sub, bodyHtml, open) {
+  return `<div class="trade-section">
+    <div class="trade-section-header" onclick="toggleTradeSection('${id}Body','${id}Arrow')" style="cursor:pointer;user-select:none">
+      <div>
+        <div class="trade-section-title">${emoji} ${title}</div>
+        <div class="trade-section-sub">${sub}</div>
+      </div>
+      <span id="${id}Arrow" style="color:var(--muted);font-size:17px">${open ? '▾ collapse' : '▸ expand'}</span>
+    </div>
+    <div id="${id}Body" style="display:${open ? 'block' : 'none'}">${bodyHtml}</div>
+  </div>`;
+}
+
+function renderReddit(data) {
+  const esc = _redditEsc;
+  const rules = data.rules || {};
+  const stats = data.stats || {};
+  const th = (label, right) => `<th style="padding:7px 10px;text-align:${right ? 'right' : 'left'}">${label}</th>`;
+  const tableOpen = `<div style="overflow-x:auto"><table class="trade-account-table" style="background:var(--surface);border:1px solid var(--border);border-radius:8px">`;
+  const horizons = rules.horizons || [1, 5, 10];
+
+  // ── Does "rising" beat SPY? ───────────────────────────────────────────
+  const sum = stats.summary || {};
+  const groupRow = (label, g) => {
+    const cells = horizons.map(h => {
+      const s = (g || {})[h + 'd'] || {};
+      if (!s.n) return `<td style="text-align:right;color:var(--muted)">—</td><td></td>`;
+      return `<td style="text-align:right;color:${_redditColor(s.avgVsSpyPct)};font-weight:700">${_redditPct(s.avgVsSpyPct)}</td>
+              <td style="text-align:right;color:var(--muted)">${s.beatSpyPct}% · n ${s.n}</td>`;
+    }).join('');
+    return `<tr><td style="font-weight:700">${label}</td>${cells}</tr>`;
+  };
+  const statsBody = stats.days
+    ? `${tableOpen}<thead><tr>${th('GROUP')}${horizons.map(h => th(h + ' DAY' + (h > 1 ? 'S' : '') + ' VS SPY', 1) + th('BEAT SPY', 1)).join('')}</tr></thead>
+       <tbody>${groupRow('🔥 Rising names', sum.rising)}${groupRow('All top ' + (rules.topN ?? 100) + ' (baseline)', sum.top)}</tbody></table></div>
+       <div style="font-size:15px;color:var(--muted);margin-top:8px">Return from the close on the day a name was flagged to 1/5/10 trading days later, minus SPY over the same days. "Rising" only adds something if it beats the baseline. ${stats.days} day(s) so far — the 10-day column fills in after two weeks. Computed ${esc(stats.computedAt || '')}.</div>`
+    : `<div style="color:var(--muted);padding:12px 0">No stats yet — they start after the first daily snapshot has at least one trading day behind it.</div>`;
+
+  // ── Per-day rising names ──────────────────────────────────────────────
+  const perDay = (stats.perDay || []).slice().reverse();
+  const dayRows = perDay.flatMap(d => (d.rising || []).map((r, i) => `<tr>
+      <td style="color:var(--muted)">${i === 0 ? d.date : ''}</td>
+      <td style="font-weight:700">${r.ticker}</td>
+      ${horizons.map(h => `<td style="text-align:right;color:${_redditColor(r['vsSpy' + h + 'd'])}">${_redditPct(r['vsSpy' + h + 'd'])}</td>`).join('')}
+    </tr>`)).join('');
+  const dayCount = perDay.reduce((n, d) => n + (d.rising || []).length, 0);
+  const dayBody = dayRows
+    ? `${tableOpen}<thead><tr>${th('FLAGGED')}${th('TICKER')}${horizons.map(h => th(h + 'D VS SPY', 1)).join('')}</tr></thead><tbody>${dayRows}</tbody></table></div>`
+    : `<div style="color:var(--muted);padding:12px 0">Nothing flagged yet.</div>`;
+
+  // ── TSX companies US Reddit mentions ──────────────────────────────────
+  const tsx = data.tsxMentioned || [];
+  const tsxBody = tsx.length
+    ? `<div style="display:flex;gap:8px;flex-wrap:wrap">${tsx.map(t => `<span style="font-size:16px;padding:4px 10px;border-radius:6px;border:1px solid var(--accent);color:var(--accent)">${t.tsx} · ${t.mentions} mentions</span>`).join('')}</div>`
+    : `<div style="color:var(--muted);padding:8px 0">No TSX Composite companies in today's top 200.</div>`;
+
+  // ── Top 50 ────────────────────────────────────────────────────────────
+  const buzz = data.buzz || [];
+  const tag = (txt, color) => `<span style="font-size:15px;padding:1px 6px;border-radius:4px;border:1px solid ${color};color:${color};margin-right:4px;white-space:nowrap">${txt}</span>`;
+  const buzzRows = buzz.map(r => {
+    const s = r.sentiment;
+    const mood = s ? `<span style="color:${s.sentiment === 'Bullish' ? 'var(--up)' : 'var(--down)'}">${esc(s.sentiment)}</span>` : '—';
+    const tags = [
+      r.rising ? tag('🔥 RISING', 'var(--warn)') : '',
+      r.isFund ? tag('FUND', 'var(--muted)') : '',
+      r.tsxTicker ? tag('ON TSX ' + r.tsxTicker, 'var(--accent)') : '',
+      r.heldTsx ? tag('HELD', 'var(--accent2)') : '',
+    ].join('');
+    return `<tr>
+      <td style="text-align:right;color:var(--muted)">${r.rank}</td>
+      <td style="font-weight:700">${r.ticker}</td>
+      <td style="color:var(--muted)">${esc(r.name)}</td>
+      <td style="text-align:right">${r.mentions}</td>
+      <td style="text-align:right;color:${_redditColor(r.mentionsChangePct)}">${_redditPct(r.mentionsChangePct, 0)}</td>
+      <td style="text-align:right">${r.upvotes}</td>
+      <td>${mood}</td>
+      <td>${tags}</td>
+    </tr>`;
+  }).join('');
+  const buzzBody = buzz.length
+    ? `${tableOpen}<thead><tr>${th('#', 1)}${th('TICKER')}${th('NAME')}${th('MENTIONS', 1)}${th('VS PREVIOUS 24H', 1)}${th('UPVOTES', 1)}${th('WSB MOOD')}${th('TAGS')}</tr></thead><tbody>${buzzRows}</tbody></table></div>
+       <div style="font-size:15px;color:var(--muted);margin-top:8px">Mentions = last 24 hours across the US Reddit stock forums (ApeWisdom). Some "tickers" are ordinary words (HR, IT, YOU, ALL…). WSB mood is rough, display only.</div>`
+    : `<div style="color:var(--muted);padding:12px 0">No Reddit data yet. Press 🔄 REFRESH REDDIT.</div>`;
+
+  return `
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+    <div>
+      <div style="font-family:'Syne',sans-serif;font-weight:800;font-size:18px">🗣️ REDDIT — STATS ONLY</div>
+      <div style="font-size:16px;color:var(--muted);margin-top:2px;max-width:900px">
+        What the US Reddit stock forums are talking about, and whether stocks suddenly rising there go on to beat SPY.
+        Rising = top ${rules.topN ?? 100} most-mentioned, at least ${rules.minMentions ?? 20} mentions, up ${rules.minMentionsChangePct ?? 50}%+ vs the previous 24 hours, no funds
+        (the US app's Reddit account buys on the same rule). No trading here.
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="refreshReddit(this)">🔄 REFRESH REDDIT</button>
+      <button class="btn" onclick="loadReddit(true)">↻ RELOAD</button>
+    </div>
+  </div>
+  <div style="font-size:15px;color:var(--muted);margin-bottom:12px">Reddit data as of ${esc(data.fetchedAt || 'never')} · ${data.historyDays ?? 0} day(s) of history saved · ${data.risingCount ?? 0} rising today · refreshes with every hourly price refresh, final stats at 4:30 PM</div>
+
+  ${_redditSection('redditStats', '📊', 'DOES "RISING" BEAT SPY?', 'Average return vs SPY after a name was flagged, and how often it beat SPY', statsBody, true)}
+  ${_redditSection('redditTsx', '🍁', 'TSX COMPANIES ON US REDDIT', 'TSX Composite companies (same company, not just the same symbol) in today\'s top 200', tsxBody, true)}
+  ${_redditSection('redditDays', '🗓️', 'RISING NAMES BY DAY', dayCount + ' flagged names, newest first, with their return vs SPY', dayBody, dayCount <= 15)}
+  ${_redditSection('redditBuzz', '🔥', 'REDDIT BUZZ — TOP 50', 'Most-mentioned stocks right now', buzzBody, false)}
+  `;
+}
+  {%- endraw %}
+</script>
